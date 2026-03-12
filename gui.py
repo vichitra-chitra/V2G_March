@@ -1,786 +1,192 @@
 #!/usr/bin/env python3
 """
-S.KOe COOL — V2G Optimisation Web GUI
-Schmitz Cargobull AG | 2025
-
-Flask-based parameter panel — works in GitHub Codespaces, devcontainers,
-and any environment without a display server.
-
-Run:  python gui.py
-Then open the forwarded port (default 5000) in your browser.
+S.KOe COOL — V2G Web GUI
+Flask front-end that calls v2g_optimisation functions directly
+(bypasses interactive input() prompts).
 """
 
-from __future__ import annotations
+import os
 import sys
-import io
 import json
-import queue
-import threading
-import importlib
+import time
 import traceback
+import threading
+import queue
 from pathlib import Path
-from flask import Flask, render_template_string, request, jsonify, Response, stream_with_context
+
+from flask import (
+    Flask, render_template_string, request,
+    jsonify, Response, send_from_directory,
+)
+
+# ── Make sure our script is importable ──────────────────────────
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import numpy as np
+import Prototype2optimization as v2g_mod
 
 app = Flask(__name__)
 
-# ── Shared state ──────────────────────────────────────────────────────────────
-_log_queue: queue.Queue = queue.Queue()
-_running   = threading.Event()
-
-
-def _enqueue(text: str):
-    _log_queue.put(text)
-
-
-class _QueueStream(io.TextIOBase):
-    def write(self, s: str) -> int:
-        if s:
-            _enqueue(s)
-        return len(s)
-    def flush(self):
-        pass
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  HTML TEMPLATE
-# ═══════════════════════════════════════════════════════════════════════════════
-
-HTML = r"""
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>S.KOe COOL — V2G Optimisation</title>
-<style>
-  /* ── Reset & base ── */
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  :root {
-    --bg:        #1E2127;
-    --panel:     #282C34;
-    --card:      #2E3440;
-    --input-bg:  #3B4252;
-    --border:    #434C5E;
-    --text:      #ECEFF4;
-    --muted:     #7B8290;
-    --accent:    #88C0D0;
-    --accent2:   #A3BE8C;
-    --warn:      #EBCB8B;
-    --error:     #BF616A;
-    --btn:       #5E81AC;
-    --btn-hover: #6E91BC;
-    --btn-reset: #4C566A;
-  }
-  body {
-    font-family: 'Segoe UI', system-ui, sans-serif;
-    background: var(--bg);
-    color: var(--text);
-    height: 100vh;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-  }
-
-  /* ── Banner ── */
-  header {
-    background: var(--btn);
-    padding: 12px 24px;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    flex-shrink: 0;
-  }
-  header h1 { font-size: 1.15rem; font-weight: 700; color: #fff; }
-  header span { font-size: 0.82rem; color: #BCD0E8; }
-
-  /* ── Main layout ── */
-  .main {
-    display: flex;
-    flex: 1;
-    overflow: hidden;
-  }
-
-  /* ── Left param panel ── */
-  .params {
-    width: 480px;
-    min-width: 380px;
-    background: var(--bg);
-    overflow-y: auto;
-    padding: 16px 16px 80px;
-    flex-shrink: 0;
-    border-right: 1px solid var(--border);
-  }
-
-  /* ── Right log panel ── */
-  .log-panel {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    background: var(--panel);
-    min-width: 0;
-  }
-  .log-header {
-    padding: 10px 16px;
-    color: var(--accent);
-    font-weight: 700;
-    font-size: 0.95rem;
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    flex-shrink: 0;
-  }
-  #log {
-    flex: 1;
-    overflow-y: auto;
-    background: #13151A;
-    color: #D8DEE9;
-    font-family: 'Consolas', 'Fira Code', monospace;
-    font-size: 0.82rem;
-    padding: 12px 16px;
-    white-space: pre-wrap;
-    word-break: break-word;
-  }
-
-  /* ── Section headers ── */
-  .section-header {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    color: var(--accent);
-    font-size: 0.9rem;
-    font-weight: 700;
-    padding: 14px 0 6px;
-  }
-  .section-header::after {
-    content: '';
-    flex: 1;
-    height: 1px;
-    background: var(--border);
-  }
-
-  /* ── Cards ── */
-  .card {
-    background: var(--card);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 10px 14px;
-    margin-bottom: 8px;
-  }
-
-  /* ── Param rows ── */
-  .param-row {
-    display: flex;
-    align-items: center;
-    padding: 5px 0;
-    gap: 8px;
-  }
-  .param-row label {
-    flex: 1;
-    font-size: 0.875rem;
-    color: #B0BAC8;
-    cursor: default;
-  }
-  .param-row input {
-    width: 110px;
-    background: var(--input-bg);
-    border: 1px solid var(--border);
-    border-radius: 5px;
-    color: var(--text);
-    font-family: 'Consolas', monospace;
-    font-size: 0.875rem;
-    padding: 4px 8px;
-    outline: none;
-    transition: border-color 0.15s;
-  }
-  .param-row input:focus {
-    border-color: var(--accent);
-  }
-  .param-row input.error {
-    border-color: var(--error);
-  }
-  .param-row .unit {
-    width: 52px;
-    color: var(--muted);
-    font-size: 0.8rem;
-  }
-
-  /* CSV row */
-  .csv-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 5px 0;
-  }
-  .csv-row label { font-size: 0.875rem; color: #B0BAC8; white-space: nowrap; }
-  .csv-row input[type="text"] {
-    flex: 1;
-    background: var(--input-bg);
-    border: 1px solid var(--border);
-    border-radius: 5px;
-    color: var(--text);
-    font-family: 'Consolas', monospace;
-    font-size: 0.8rem;
-    padding: 4px 8px;
-    outline: none;
-  }
-  .csv-row input[type="text"]:focus { border-color: var(--accent); }
-
-  /* ── Derived display ── */
-  .derived-row {
-    display: flex;
-    justify-content: space-between;
-    padding: 4px 0;
-    font-size: 0.85rem;
-  }
-  .derived-row .d-key { color: var(--muted); }
-  .derived-row .d-val { color: var(--accent2); font-family: 'Consolas', monospace; font-weight: 700; }
-
-  /* ── Tooltip ── */
-  [data-tip] { position: relative; cursor: help; }
-  [data-tip]:hover::after {
-    content: attr(data-tip);
-    position: absolute;
-    left: 50%; bottom: calc(100% + 6px);
-    transform: translateX(-50%);
-    background: #2E3440;
-    color: #ECEFF4;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 6px 10px;
-    font-size: 0.78rem;
-    white-space: normal;
-    width: 240px;
-    z-index: 999;
-    pointer-events: none;
-    line-height: 1.4;
-  }
-
-  /* ── Bottom button bar ── */
-  .btn-bar {
-    position: fixed;
-    bottom: 0;
-    left: 0;
-    width: 480px;
-    background: var(--bg);
-    border-top: 1px solid var(--border);
-    padding: 10px 16px;
-    display: flex;
-    gap: 10px;
-    align-items: center;
-    z-index: 100;
-  }
-  button {
-    padding: 8px 20px;
-    border: none;
-    border-radius: 6px;
-    font-size: 0.9rem;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background 0.15s, opacity 0.15s;
-  }
-  #btn-run {
-    background: var(--btn);
-    color: #fff;
-    flex: 1;
-  }
-  #btn-run:hover:not(:disabled) { background: var(--btn-hover); }
-  #btn-run:disabled { opacity: 0.55; cursor: not-allowed; }
-  #btn-reset {
-    background: var(--btn-reset);
-    color: var(--text);
-  }
-  #btn-reset:hover { background: #5C6A80; }
-  #btn-clear {
-    background: var(--btn-reset);
-    color: var(--text);
-  }
-  #btn-clear:hover { background: #5C6A80; }
-  .status {
-    margin-left: auto;
-    font-size: 0.82rem;
-    color: var(--accent2);
-    white-space: nowrap;
-  }
-
-  /* ── Validation banner ── */
-  #err-banner {
-    display: none;
-    background: #3B1B1B;
-    border: 1px solid var(--error);
-    color: var(--error);
-    border-radius: 6px;
-    padding: 8px 14px;
-    font-size: 0.85rem;
-    margin-bottom: 8px;
-  }
-
-  /* ── Log colours ── */
-  .log-info    { color: #88C0D0; }
-  .log-success { color: #A3BE8C; }
-  .log-warn    { color: #EBCB8B; }
-  .log-error   { color: #BF616A; }
-
-  /* scrollbar */
-  ::-webkit-scrollbar { width: 6px; height: 6px; }
-  ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
-</style>
-</head>
-<body>
-
-<!-- Banner -->
-<header>
-  <h1>⚡ S.KOe COOL &nbsp;—&nbsp; V2G Optimisation Control Panel</h1>
-  <span>Schmitz Cargobull AG &nbsp;·&nbsp; 2025</span>
-</header>
-
-<div class="main">
-
-  <!-- ═══ LEFT: Parameters ═══ -->
-  <div class="params" id="params-panel">
-
-    <div id="err-banner"></div>
-
-    <!-- CSV -->
-    <div class="section-header">📂 Price Data</div>
-    <div class="card">
-      <div class="csv-row">
-        <label for="csv_path">CSV file path</label>
-        <input type="text" id="csv_path" value="2025_Electricity_Price.csv">
-      </div>
-    </div>
-
-    <!-- Battery -->
-    <div class="section-header">🔋 Battery Parameters</div>
-    <div class="card" id="card-battery"></div>
-
-    <!-- Power -->
-    <div class="section-header">⚡ Power Limits</div>
-    <div class="card" id="card-power"></div>
-
-    <!-- Efficiency -->
-    <div class="section-header">⚙️ Efficiency</div>
-    <div class="card" id="card-eff"></div>
-
-    <!-- Economics -->
-    <div class="section-header">💶 Economics</div>
-    <div class="card" id="card-econ"></div>
-
-    <!-- Grid -->
-    <div class="section-header">🔌 Grid Connection <span style="font-weight:400;color:var(--muted);font-size:0.8rem">(0 = unlimited)</span></div>
-    <div class="card" id="card-grid"></div>
-
-    <!-- Simulation -->
-    <div class="section-header">🕐 Simulation Settings</div>
-    <div class="card" id="card-sim"></div>
-
-    <!-- Derived -->
-    <div class="section-header">📐 Derived Values <span style="font-weight:400;color:var(--muted);font-size:0.8rem">(auto)</span></div>
-    <div class="card" id="card-derived">
-      <div class="derived-row"><span class="d-key">E_min (kWh)</span><span class="d-val" id="d-emin">—</span></div>
-      <div class="derived-row"><span class="d-key">E_max (kWh)</span><span class="d-val" id="d-emax">—</span></div>
-      <div class="derived-row"><span class="d-key">Round-trip efficiency</span><span class="d-val" id="d-rt">—</span></div>
-      <div class="derived-row"><span class="d-key">p_c_max (kW)</span><span class="d-val" id="d-pc">—</span></div>
-      <div class="derived-row"><span class="d-key">p_d_max (kW)</span><span class="d-val" id="d-pd">—</span></div>
-    </div>
-
-  </div><!-- /params -->
-
-  <!-- ═══ RIGHT: Log ═══ -->
-  <div class="log-panel">
-    <div class="log-header">
-      <span>📋 Console Output</span>
-      <span id="log-status" style="color:var(--accent2);font-size:0.82rem;font-weight:400">Ready</span>
-    </div>
-    <div id="log">  S.KOe COOL V2G Optimisation GUI — web edition.
-  Edit parameters on the left, then click RUN OPTIMISATION.
-
-</div>
-  </div>
-
-</div><!-- /main -->
-
-<!-- Button bar -->
-<div class="btn-bar">
-  <button id="btn-run"   onclick="runOpt()">▶&nbsp; RUN OPTIMISATION</button>
-  <button id="btn-reset" onclick="resetDefaults()">↺&nbsp; Reset</button>
-  <button id="btn-clear" onclick="clearLog()">✕&nbsp; Clear Log</button>
-  <span class="status" id="status-txt">Ready</span>
-</div>
-
-<script>
-// ── Parameter definitions ─────────────────────────────────────────────────
-const PARAMS = {
-  battery: [
-    { key:"battery_capacity_kWh", label:"Total capacity",    unit:"kWh",  default:70.0,  tip:"Total physical battery nameplate capacity in kWh." },
-    { key:"usable_capacity_kWh",  label:"Usable capacity",   unit:"kWh",  default:60.0,  tip:"Energy window for charge/discharge (SoC 20–100%)." },
-    { key:"soc_min_pct",          label:"SoC minimum",       unit:"%",    default:20.0,  tip:"Minimum SoC % — cold-chain safety floor." },
-    { key:"soc_max_pct",          label:"SoC maximum",       unit:"%",    default:100.0, tip:"Maximum SoC % — 100% = full charge at departure." },
-  ],
-  power: [
-    { key:"charge_power_kW",    label:"Max charge power",  unit:"kW", default:22.0, tip:"Maximum AC charging power (ISO 15118 limit)." },
-    { key:"discharge_power_kW", label:"Max V2G discharge", unit:"kW", default:22.0, tip:"Maximum V2G discharge power (ISO 15118-2)." },
-  ],
-  eff: [
-    { key:"eta_charge",    label:"Charge efficiency η_c",    unit:"—", default:0.92, tip:"One-way AC→DC efficiency. Typical: 0.92." },
-    { key:"eta_discharge", label:"Discharge efficiency η_d", unit:"—", default:0.92, tip:"One-way DC→AC efficiency. Typical: 0.92." },
-  ],
-  econ: [
-    { key:"deg_cost_eur_kwh", label:"Degradation cost", unit:"€/kWh", default:0.02, tip:"Battery wear cost in €/kWh cycled. LFP default: 0.02." },
-  ],
-  grid: [
-    { key:"depot_connection_kVA",  label:"Depot connection",  unit:"kVA", default:0.0, tip:"Depot grid connection limit in kVA. 0 = no limit." },
-    { key:"transformer_limit_kVA", label:"Transformer limit", unit:"kVA", default:0.0, tip:"Depot transformer limit in kVA. 0 = no limit." },
-  ],
-  sim: [
-    { key:"dt_h",         label:"Time step",    unit:"h", default:0.25, tip:"Slot length in hours. 0.25 = 15-minute resolution." },
-    { key:"n_slots",      label:"Slots per 24h",unit:"—", default:96,   tip:"96 = 4 slots/hour × 24 hours." },
-    { key:"soc_init_pct", label:"Arrival SoC",  unit:"%", default:45.0, tip:"Trailer arrival State-of-Charge. Typically 45%." },
-  ],
-};
-
-// ── Build input rows ───────────────────────────────────────────────────────
-function buildCard(cardId, params) {
-  const card = document.getElementById(cardId);
-  params.forEach(p => {
-    const row = document.createElement('div');
-    row.className = 'param-row';
-    row.innerHTML = `
-      <label for="${p.key}" data-tip="${p.tip}">${p.label}</label>
-      <input type="number" id="${p.key}" value="${p.default}"
-             step="any" oninput="updateDerived()">
-      <span class="unit">${p.unit}</span>`;
-    card.appendChild(row);
-  });
-}
-
-buildCard('card-battery', PARAMS.battery);
-buildCard('card-power',   PARAMS.power);
-buildCard('card-eff',     PARAMS.eff);
-buildCard('card-econ',    PARAMS.econ);
-buildCard('card-grid',    PARAMS.grid);
-buildCard('card-sim',     PARAMS.sim);
-
-// ── Derived values ─────────────────────────────────────────────────────────
-function updateDerived() {
-  const g = id => { const el = document.getElementById(id); return el ? parseFloat(el.value) : NaN; };
-  const usable  = g('usable_capacity_kWh');
-  const socMin  = g('soc_min_pct');
-  const socMax  = g('soc_max_pct');
-  const etaC    = g('eta_charge');
-  const etaD    = g('eta_discharge');
-  const pc      = g('charge_power_kW');
-  const pd      = g('discharge_power_kW');
-  const depKva  = g('depot_connection_kVA');
-  const traKva  = g('transformer_limit_kVA');
-
-  const set = (id, v) => { const el = document.getElementById(id); if(el) el.textContent = v; };
-
-  if (isNaN(usable)||isNaN(socMin)||isNaN(socMax)) return;
-  set('d-emin', (usable * socMin / 100).toFixed(2) + ' kWh');
-  set('d-emax', (usable * socMax / 100).toFixed(2) + ' kWh');
-  set('d-rt',   isNaN(etaC)||isNaN(etaD) ? '—' : (etaC*etaD*100).toFixed(1) + ' %');
-
-  const limits = [depKva, traKva].filter(v => !isNaN(v) && v > 0).map(v => v * 0.95);
-  const cap    = limits.length ? Math.min(...limits) : Infinity;
-  set('d-pc', isNaN(pc) ? '—' : (cap===Infinity ? pc.toFixed(1) : Math.min(pc,cap).toFixed(1)) + ' kW');
-  set('d-pd', isNaN(pd) ? '—' : (cap===Infinity ? pd.toFixed(1) : Math.min(pd,cap).toFixed(1)) + ' kW');
-}
-updateDerived();
-
-// ── Reset ──────────────────────────────────────────────────────────────────
-function resetDefaults() {
-  Object.values(PARAMS).flat().forEach(p => {
-    const el = document.getElementById(p.key);
-    if (el) el.value = p.default;
-  });
-  document.getElementById('csv_path').value = '2025_Electricity_Price.csv';
-  updateDerived();
-  hideBanner();
-}
-
-// ── Log helpers ────────────────────────────────────────────────────────────
-function clearLog() {
-  document.getElementById('log').textContent = '';
-}
-
-function appendLog(text) {
-  const el = document.getElementById('log');
-  el.textContent += text;
-  el.scrollTop = el.scrollHeight;
-}
-
-// ── Validation banner ──────────────────────────────────────────────────────
-function showBanner(msg) {
-  const b = document.getElementById('err-banner');
-  b.textContent = '⚠  ' + msg;
-  b.style.display = 'block';
-}
-function hideBanner() {
-  document.getElementById('err-banner').style.display = 'none';
-}
-
-// ── Collect values ─────────────────────────────────────────────────────────
-function collectValues() {
-  const vals = {};
-  Object.values(PARAMS).flat().forEach(p => {
-    const el = document.getElementById(p.key);
-    vals[p.key] = el ? el.value : String(p.default);
-  });
-  vals['csv_path'] = document.getElementById('csv_path').value.trim();
-  return vals;
-}
-
-// ── Client-side validation ─────────────────────────────────────────────────
-function validate(v) {
-  const num = k => { const n = parseFloat(v[k]); return isNaN(n) ? null : n; };
-  const checks = [
-    [num('soc_min_pct') >= num('soc_max_pct'), 'SoC minimum must be less than SoC maximum.'],
-    [!(num('eta_charge')>0 && num('eta_charge')<=1), 'Charge efficiency must be between 0 and 1.'],
-    [!(num('eta_discharge')>0 && num('eta_discharge')<=1), 'Discharge efficiency must be between 0 and 1.'],
-    [!v['csv_path'], 'CSV file path cannot be empty.'],
-  ];
-  for (const [fail, msg] of checks) if (fail) return msg;
-  return null;
-}
-
-// ── RUN ────────────────────────────────────────────────────────────────────
-function setStatus(txt, color) {
-  const s = document.getElementById('status-txt');
-  const l = document.getElementById('log-status');
-  s.textContent = l.textContent = txt;
-  s.style.color = l.style.color = color;
-}
-
-async function runOpt() {
-  hideBanner();
-  const vals = collectValues();
-  const err  = validate(vals);
-  if (err) { showBanner(err); return; }
-
-  const btn = document.getElementById('btn-run');
-  btn.disabled = true;
-  btn.textContent = '⏳  Running…';
-  setStatus('Running…', '#EBCB8B');
-  clearLog();
-
-  // POST params, then stream log via EventSource
-  const res = await fetch('/run', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(vals),
-  });
-
-  if (!res.ok) {
-    showBanner('Server error starting run.');
-    btn.disabled = false;
-    btn.textContent = '▶  RUN OPTIMISATION';
-    setStatus('Error', '#BF616A');
-    return;
-  }
-
-  // Stream log
-  const es = new EventSource('/stream');
-  es.onmessage = e => {
-    if (e.data === '__DONE__') {
-      es.close();
-      btn.disabled = false;
-      btn.textContent = '▶  RUN OPTIMISATION';
-      setStatus('Completed ✓', '#A3BE8C');
-    } else if (e.data === '__ERROR__') {
-      es.close();
-      btn.disabled = false;
-      btn.textContent = '▶  RUN OPTIMISATION';
-      setStatus('Error ✗', '#BF616A');
-    } else {
-      appendLog(e.data + '\n');
-    }
-  };
-  es.onerror = () => {
-    es.close();
-    btn.disabled = false;
-    btn.textContent = '▶  RUN OPTIMISATION';
-    setStatus('Stream error', '#BF616A');
-  };
-}
-</script>
-</body>
-</html>
-"""
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  FLASK ROUTES
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@app.route("/")
-def index():
-    return render_template_string(HTML)
-
-
-@app.route("/run", methods=["POST"])
-def run_endpoint():
-    if _running.is_set():
-        return jsonify({"error": "Already running"}), 409
-
-    params = request.get_json(force=True)
-    thread = threading.Thread(target=_run_worker, args=(params,), daemon=True)
-    thread.start()
-    return jsonify({"status": "started"})
-
-
-@app.route("/stream")
-def stream():
-    def generate():
-        while True:
-            try:
-                msg = _log_queue.get(timeout=120)
-                if msg in ("__DONE__", "__ERROR__"):
-                    yield f"data: {msg}\n\n"
-                    break
-                # Escape newlines for SSE
-                for line in msg.splitlines(keepends=False):
-                    yield f"data: {line}\n\n"
-            except queue.Empty:
-                yield "data: \n\n"   # keep-alive
-    return Response(stream_with_context(generate()),
-                    mimetype="text/event-stream",
-                    headers={"Cache-Control": "no-cache",
-                             "X-Accel-Buffering": "no"})
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  OPTIMISATION WORKER
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _run_worker(params: dict):
-    _running.set()
-    old_out, old_err = sys.stdout, sys.stderr
-    stream_obj       = _QueueStream()
-    sys.stdout       = stream_obj
-    sys.stderr       = stream_obj
-
-    try:
-        _execute(params)
-        _enqueue("__DONE__")
-    except Exception:
-        traceback.print_exc()
-        _enqueue("__ERROR__")
-    finally:
-        sys.stdout = old_out
-        sys.stderr = old_err
-        _running.clear()
-
-
-def _execute(params: dict):
-    import numpy as np
-
-    script_dir = str(Path(__file__).parent.resolve())
-    if script_dir not in sys.path:
-        sys.path.insert(0, script_dir)
-
-    import Prototype1optimization_v2 as v2g_mod
-    importlib.reload(v2g_mod)
-
-    csv_path   = params["csv_path"]
-    soc_init   = float(params["soc_init_pct"])
-    soc_final  = 100.0
-
-    v2g = v2g_mod.V2GParams(
-        battery_capacity_kWh  = float(params["battery_capacity_kWh"]),
-        usable_capacity_kWh   = float(params["usable_capacity_kWh"]),
-        soc_min_pct           = float(params["soc_min_pct"]),
-        soc_max_pct           = float(params["soc_max_pct"]),
-        charge_power_kW       = float(params["charge_power_kW"]),
-        discharge_power_kW    = float(params["discharge_power_kW"]),
-        eta_charge            = float(params["eta_charge"]),
-        eta_discharge         = float(params["eta_discharge"]),
-        deg_cost_eur_kwh      = float(params["deg_cost_eur_kwh"]),
-        dt_h                  = float(params["dt_h"]),
-        n_slots               = int(params["n_slots"]),
-        depot_connection_kVA  = float(params["depot_connection_kVA"]),
-        transformer_limit_kVA = float(params["transformer_limit_kVA"]),
+# ── Global progress queue for SSE streaming ─────────────────────
+progress_queue: queue.Queue = queue.Queue()
+run_lock = threading.Lock()
+
+# ── Output folder ────────────────────────────────────────────────
+OUT_DIR = Path(__file__).parent / "output"
+OUT_DIR.mkdir(exist_ok=True)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  CORE: Run optimisation WITHOUT interactive input()
+# ═══════════════════════════════════════════════════════════════════
+
+def run_optimisation(
+    soc_init_pct: float = 45.0,
+    deg_cost: float = 0.02,
+    csv_path: str = "",
+) -> dict:
+    """
+    Runs the full 4-season V2G optimisation.
+    Sends progress messages via progress_queue.
+    Returns a summary dict.
+    """
+
+    def log(msg: str):
+        print(f"  [GUI] {msg}")
+        progress_queue.put(msg)
+
+    # ── Locate CSV ──────────────────────────────────────────────
+    if not csv_path:
+        candidates = [
+            Path(__file__).parent / "2025_Electricity_Price.csv",
+            Path("2025_Electricity_Price.csv"),
+        ]
+        for p in candidates:
+            if p.exists():
+                csv_path = str(p)
+                break
+        if not csv_path:
+            raise FileNotFoundError(
+                "2025_Electricity_Price.csv not found. "
+                "Place it in the same folder as gui.py."
+            )
+
+    log(f"CSV: {csv_path}")
+
+    # ── Build params (NO input() calls) ─────────────────────────
+    v2g = v2g_mod.V2GParams()
+    v2g.deg_cost_eur_kwh = deg_cost
+    soc_final_pct = 100.0
+
+    log(
+        f"Battery: {v2g.usable_capacity_kWh} kWh usable | "
+        f"SoC {v2g.soc_min_pct}-{v2g.soc_max_pct}% | "
+        f"deg={v2g.deg_cost_eur_kwh} EUR/kWh"
     )
+    log(f"Arrival SoC: {soc_init_pct}% | Departure SoC: {soc_final_pct}%")
 
-    print("=" * 65)
-    print("  S.KOe COOL — V2G Optimisation  (launched from Web GUI)")
-    print("=" * 65)
-    print(f"\n  Battery : {v2g.battery_capacity_kWh} kWh total | "
-          f"{v2g.usable_capacity_kWh} kWh usable")
-    print(f"  SoC     : {v2g.soc_min_pct:.0f}%–{v2g.soc_max_pct:.0f}%  "
-          f"(E_min={v2g.E_min:.1f} kWh, E_max={v2g.E_max:.1f} kWh)")
-    print(f"  Power   : charge {v2g.p_c_max:.0f} kW | discharge {v2g.p_d_max:.0f} kW")
-    print(f"  deg     : {v2g.deg_cost_eur_kwh:.4f} EUR/kWh cycled")
-    print(f"  Arrival SoC : {soc_init:.0f}%  |  Departure SoC : 100%")
-    print(f"  CSV     : {csv_path}\n")
+    # ── Generate reference cards ────────────────────────────────
+    log("Generating abbreviation legend...")
+    v2g_mod.generate_abbreviation_legend(str(OUT_DIR / "abbreviation_legend.png"))
 
-    print("  Generating reference cards...")
-    v2g_mod.generate_abbreviation_legend("abbreviation_legend.png")
-    v2g_mod.generate_equations_card("equations_reference.png")
+    log("Generating equations reference card...")
+    v2g_mod.generate_equations_card(str(OUT_DIR / "equations_reference.png"))
 
+    # ── Run all seasons ─────────────────────────────────────────
+    hours = np.arange(v2g.n_slots) * v2g.dt_h
     deg_values = v2g_mod.load_deg_sensitivity(v2g)
-    hours      = np.arange(v2g.n_slots) * v2g.dt_h
 
     all_season_results: dict = {}
-    annual_cost_milp    = 0.0
-    annual_v2g_milp     = 0.0
-    annual_savings_dumb = 0.0
+    season_summary: list = []
 
     DAY_TYPES = [
-        ("winter",         "DayTrip", 130, "Winter weekday  (Mon-Fri, Oct-Mar)"),
-        ("summer",         "DayTrip", 131, "Summer weekday  (Mon-Fri, Apr-Sep)"),
-        ("winter_weekend", "Weekend",  52, "Winter weekend  (Sat-Sun, Oct-Mar)"),
-        ("summer_weekend", "Weekend",  52, "Summer weekend  (Sat-Sun, Apr-Sep)"),
+        ("winter",         "DayTrip", 130, "Winter weekday (Mon-Fri, Oct-Mar)"),
+        ("summer",         "DayTrip", 131, "Summer weekday (Mon-Fri, Apr-Sep)"),
+        ("winter_weekend", "Weekend",  52, "Winter weekend (Sat-Sun, Oct-Mar)"),
+        ("summer_weekend", "Weekend",  52, "Summer weekend (Sat-Sun, Apr-Sep)"),
     ]
 
+    annual_cost_milp = 0.0
+    annual_v2g_milp = 0.0
+    annual_savings_dumb = 0.0
+
     for season, dwell_type, days_per_year, label in DAY_TYPES:
-        print(f"\n{'='*65}")
-        print(f"  {label}  ({days_per_year} days/year)")
-        print(f"{'='*65}")
+        log(f"━━━ {label} ({days_per_year} days/yr) ━━━")
 
         tru, plugged = v2g_mod.build_load_and_availability(v2g, dwell=dwell_type)
         buy, v2g_p, price_source = v2g_mod.load_prices_from_csv(
-            csv_path, v2g, season=season)
+            csv_path, v2g, season=season
+        )
 
+        # Roll for DayTrip (arrival at 17:00)
         if dwell_type == "DayTrip":
-            ROLL    = 68
+            ROLL = 68
             buy     = np.roll(buy,     -ROLL)
             v2g_p   = np.roll(v2g_p,   -ROLL)
             tru     = np.roll(tru,     -ROLL)
             plugged = np.roll(plugged, -ROLL)
 
-        print(f"  Prices: {price_source}")
-        print(f"  Buy range : {buy.min()*1000:.1f}–{buy.max()*1000:.1f} EUR/MWh  |  "
-              f"Plugged : {int(plugged.sum()*v2g.dt_h)}h/day")
+        log(f"  Buy: {buy.min()*1000:.1f}-{buy.max()*1000:.1f} EUR/MWh | "
+            f"Plugged: {int(plugged.sum()*v2g.dt_h)}h/day")
 
-        A = v2g_mod.run_dumb(
-            v2g, buy, v2g_p, tru, plugged, soc_init, soc_final)
-        B = v2g_mod.run_smart_no_v2g(
-            v2g, buy, v2g_p, tru, plugged, soc_init, soc_final)
-        C = v2g_mod.run_milp_day_ahead(
-            v2g, buy, v2g_p, tru, plugged, soc_init, soc_final)
-        D = v2g_mod.run_mpc_day_ahead(
-            v2g, buy, v2g_p, tru, plugged, soc_init, soc_final,
-            label="D - MPC perfect")
+        # ── Scenario A: Dumb ────────────────────────────────────
+        log(f"  Running A - Dumb...")
+        A = v2g_mod.run_dumb(v2g, buy, v2g_p, tru, plugged,
+                             soc_init_pct, soc_final_pct)
+
+        # ── Scenario B: Smart (no V2G) ──────────────────────────
+        log(f"  Running B - Smart (no V2G)...")
+        B = v2g_mod.run_smart_no_v2g(v2g, buy, v2g_p, tru, plugged,
+                                      soc_init_pct, soc_final_pct)
+
+        # ── Scenario C: MILP Day-Ahead ──────────────────────────
+        log(f"  Running C - MILP Day-Ahead...")
+        C = v2g_mod.run_milp_day_ahead(v2g, buy, v2g_p, tru, plugged,
+                                        soc_init_pct, soc_final_pct)
+
+        # ── Scenario D: MPC ─────────────────────────────────────
+        log(f"  Running D - MPC (96 solves)...")
+        D = v2g_mod.run_mpc_day_ahead(v2g, buy, v2g_p, tru, plugged,
+                                       soc_init_pct, soc_final_pct,
+                                       label="D - MPC perfect")
 
         results = {"A": A, "B": B, "C": C, "D": D}
-        deg_df  = v2g_mod.deg_sensitivity(
-            v2g, buy, v2g_p, tru, plugged, deg_values, soc_init, soc_final)
-
         all_season_results[season] = results
-        v2g_mod.print_report(v2g, results, deg_df,
-                              season=label, price_source=price_source)
 
+        # ── Degradation sensitivity ─────────────────────────────
+        log(f"  Running degradation sensitivity...")
+        deg_df = v2g_mod.deg_sensitivity(
+            v2g, buy, v2g_p, tru, plugged,
+            deg_values, soc_init_pct, soc_final_pct
+        )
+
+        # ── Plot ────────────────────────────────────────────────
+        out_png = str(OUT_DIR / f"results_{season}.png")
+        log(f"  Plotting -> results_{season}.png")
         v2g_mod.plot_all(v2g, hours, A, B, C, D, deg_df,
-                          season=label, out=f"results_{season}.png")
+                         season=label, out=out_png)
 
-        annual_cost_milp    += C.cost_eur_day        * days_per_year
-        annual_v2g_milp     += C.v2g_revenue_eur_day * days_per_year
+        # ── Collect KPIs ────────────────────────────────────────
+        ref = A.cost_eur_day
+        season_summary.append({
+            "season": label,
+            "days_per_year": days_per_year,
+            "A_cost": round(A.cost_eur_day, 4),
+            "B_cost": round(B.cost_eur_day, 4),
+            "C_cost": round(C.cost_eur_day, 4),
+            "D_cost": round(D.cost_eur_day, 4),
+            "C_v2g_rev": round(C.v2g_revenue_eur_day, 4),
+            "D_v2g_rev": round(D.v2g_revenue_eur_day, 4),
+            "C_v2g_kwh": round(C.v2g_export_kwh_day, 2),
+            "C_savings_vs_A": round(ref - C.cost_eur_day, 4),
+        })
+
+        annual_cost_milp += C.cost_eur_day * days_per_year
+        annual_v2g_milp += C.v2g_revenue_eur_day * days_per_year
         annual_savings_dumb += (A.cost_eur_day - C.cost_eur_day) * days_per_year
 
-    print("\n  Generating additional analysis graphs...")
-    tru_w, _ = v2g_mod.build_load_and_availability(v2g, dwell="Extended")
+    # ── Additional analysis plot ────────────────────────────────
+    log("Generating additional analysis graphs...")
     buy_w, v2g_p_w, _ = v2g_mod.load_prices_from_csv(csv_path, v2g, season="winter")
     v2g_mod.plot_additional_analysis(
         v2g, hours,
@@ -788,33 +194,554 @@ def _execute(params: dict):
         all_season_results["winter"]["B"],
         all_season_results["winter"]["C"],
         all_season_results["winter"]["D"],
-        buy_w, v2g_p_w, all_season_results, csv_path,
-        out="additional_analysis.png",
+        buy_w, v2g_p_w,
+        all_season_results,
+        csv_path,
+        out=str(OUT_DIR / "additional_analysis.png"),
     )
 
-    print(f"\n{'='*65}")
-    print(f"  ANNUAL SUMMARY — Single Trailer (Scenario C MILP)")
-    print(f"{'='*65}")
-    print(f"  Annual energy cost  : EUR {annual_cost_milp:>8,.0f} / year")
-    print(f"  Annual V2G revenue  : EUR {annual_v2g_milp:>8,.0f} / year")
-    print(f"  Annual savings vs A : EUR {annual_savings_dumb:>8,.0f} / year")
-    print(f"\n  All output PNG files saved to working directory.")
-    print(f"    abbreviation_legend.png")
-    print(f"    equations_reference.png")
-    print(f"    results_winter.png")
-    print(f"    results_summer.png")
-    print(f"    results_winter_weekend.png")
-    print(f"    results_summer_weekend.png")
-    print(f"    additional_analysis.png")
+    summary = {
+        "annual_cost_milp": round(annual_cost_milp, 0),
+        "annual_v2g_revenue": round(annual_v2g_milp, 0),
+        "annual_savings_vs_dumb": round(annual_savings_dumb, 0),
+        "seasons": season_summary,
+        "images": [
+            "abbreviation_legend.png",
+            "equations_reference.png",
+            "results_winter.png",
+            "results_summer.png",
+            "results_winter_weekend.png",
+            "results_summer_weekend.png",
+            "additional_analysis.png",
+        ],
+    }
+
+    log(f"✓ DONE — Annual savings vs Dumb: EUR{annual_savings_dumb:,.0f}/yr")
+    log("__DONE__")
+    return summary
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+#  FLASK ROUTES
+# ═══════════════════════════════════════════════════════════════════
+
+@app.route("/")
+def index():
+    return render_template_string(HTML_PAGE)
+
+
+@app.route("/run", methods=["POST"])
+def run():
+    """Start optimisation in a background thread."""
+    if run_lock.locked():
+        return jsonify({"error": "Optimisation already running"}), 409
+
+    data = request.get_json(silent=True) or {}
+    soc_init = float(data.get("soc_init", 45))
+    deg_cost = float(data.get("deg_cost", 0.02))
+
+    # Validate
+    if not (20 <= soc_init <= 100):
+        return jsonify({"error": "SoC must be 20-100%"}), 400
+    if not (0 <= deg_cost <= 1):
+        return jsonify({"error": "Degradation cost must be 0-1 EUR/kWh"}), 400
+
+    # Clear old messages
+    while not progress_queue.empty():
+        try:
+            progress_queue.get_nowait()
+        except queue.Empty:
+            break
+
+    def worker():
+        with run_lock:
+            try:
+                result = run_optimisation(
+                    soc_init_pct=soc_init,
+                    deg_cost=deg_cost,
+                )
+                progress_queue.put(json.dumps({
+                    "type": "result",
+                    "data": result,
+                }))
+            except Exception as e:
+                tb = traceback.format_exc()
+                print(f"  [GUI ERROR]\n{tb}")
+                progress_queue.put(json.dumps({
+                    "type": "error",
+                    "message": str(e),
+                    "traceback": tb,
+                }))
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    return jsonify({"status": "started"})
+
+
+@app.route("/stream")
+def stream():
+    """Server-Sent Events — streams progress messages to the browser."""
+    def generate():
+        while True:
+            try:
+                msg = progress_queue.get(timeout=120)
+            except queue.Empty:
+                yield "data: {\"type\": \"error\", \"message\": \"Timeout\"}\n\n"
+                return
+
+            # Check if it's a JSON result/error
+            if msg.startswith("{"):
+                yield f"data: {msg}\n\n"
+                return
+            elif msg == "__DONE__":
+                return
+            else:
+                payload = json.dumps({"type": "progress", "message": msg})
+                yield f"data: {payload}\n\n"
+
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.route("/output/<path:filename>")
+def output_file(filename):
+    """Serve generated PNG files."""
+    return send_from_directory(str(OUT_DIR), filename)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  HTML / JS FRONTEND (single-file, no templates needed)
+# ═══════════════════════════════════════════════════════════════════
+
+HTML_PAGE = r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>S.KOe COOL — V2G Optimisation</title>
+<style>
+  :root {
+    --bg: #f4f6fb;
+    --card: #ffffff;
+    --primary: #1a237e;
+    --accent: #00bcd4;
+    --danger: #e53935;
+    --success: #43a047;
+    --text: #212121;
+    --muted: #78909c;
+    --border: #e0e0e0;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+  }
+  .header {
+    background: linear-gradient(135deg, var(--primary), #0d47a1);
+    color: white;
+    padding: 24px 32px;
+    text-align: center;
+  }
+  .header h1 { font-size: 1.8rem; margin-bottom: 4px; }
+  .header p { opacity: 0.85; font-size: 0.95rem; }
+  .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
+  .grid { display: grid; grid-template-columns: 340px 1fr; gap: 24px; }
+
+  /* ── Controls Panel ── */
+  .panel {
+    background: var(--card);
+    border-radius: 12px;
+    padding: 24px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    border: 1px solid var(--border);
+  }
+  .panel h2 {
+    font-size: 1.1rem;
+    color: var(--primary);
+    margin-bottom: 16px;
+    padding-bottom: 8px;
+    border-bottom: 2px solid var(--accent);
+  }
+  .field { margin-bottom: 16px; }
+  .field label {
+    display: block;
+    font-weight: 600;
+    margin-bottom: 4px;
+    font-size: 0.9rem;
+    color: var(--primary);
+  }
+  .field .hint {
+    font-size: 0.78rem;
+    color: var(--muted);
+    margin-bottom: 4px;
+  }
+  .field input, .field select {
+    width: 100%;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 1rem;
+    transition: border-color 0.2s;
+  }
+  .field input:focus { border-color: var(--accent); outline: none; }
+  .btn {
+    display: block;
+    width: 100%;
+    padding: 14px;
+    border: none;
+    border-radius: 8px;
+    font-size: 1.05rem;
+    font-weight: 700;
+    cursor: pointer;
+    transition: all 0.2s;
+    margin-top: 8px;
+  }
+  .btn-run {
+    background: linear-gradient(135deg, var(--accent), #0097a7);
+    color: white;
+  }
+  .btn-run:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,188,212,0.4); }
+  .btn-run:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+
+  /* ── Progress Log ── */
+  .log-box {
+    background: #263238;
+    color: #e0e0e0;
+    border-radius: 8px;
+    padding: 16px;
+    font-family: 'Cascadia Code', 'Fira Code', monospace;
+    font-size: 0.82rem;
+    max-height: 220px;
+    overflow-y: auto;
+    margin-top: 16px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .log-box .log-ok { color: #69f0ae; }
+  .log-box .log-err { color: #ff5252; }
+  .log-box .log-info { color: #80deea; }
+
+  /* ── Results ── */
+  .results { display: none; }
+  .results.show { display: block; }
+  .results h2 {
+    font-size: 1.2rem;
+    color: var(--primary);
+    margin: 24px 0 12px;
+  }
+  .kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+  .kpi-card {
+    background: var(--card);
+    border-radius: 10px;
+    padding: 16px;
+    text-align: center;
+    border: 1px solid var(--border);
+    box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+  }
+  .kpi-card .kpi-value {
+    font-size: 1.5rem;
+    font-weight: 700;
+    color: var(--primary);
+  }
+  .kpi-card .kpi-label {
+    font-size: 0.82rem;
+    color: var(--muted);
+    margin-top: 4px;
+  }
+  .kpi-card.green .kpi-value { color: var(--success); }
+
+  /* ── Season table ── */
+  .season-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 12px 0 24px;
+    font-size: 0.88rem;
+  }
+  .season-table th {
+    background: var(--primary);
+    color: white;
+    padding: 10px 8px;
+    text-align: center;
+  }
+  .season-table td {
+    padding: 8px;
+    text-align: center;
+    border-bottom: 1px solid var(--border);
+  }
+  .season-table tr:hover { background: #e8eaf6; }
+
+  /* ── Image gallery ── */
+  .gallery { margin-top: 16px; }
+  .gallery img {
+    width: 100%;
+    max-width: 100%;
+    border-radius: 8px;
+    margin-bottom: 16px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+    cursor: pointer;
+    transition: transform 0.2s;
+  }
+  .gallery img:hover { transform: scale(1.01); }
+
+  /* ── Responsive ── */
+  @media (max-width: 900px) {
+    .grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>S.KOe COOL — V2G Optimisation Dashboard</h1>
+  <p>Day-Ahead MILP + Receding-Horizon MPC &nbsp;|&nbsp;
+     Schmitz Cargobull AG 2025 &nbsp;|&nbsp;
+     Binary Mutex &nbsp;|&nbsp; SoC 20–100%</p>
+</div>
+
+<div class="container">
+<div class="grid">
+
+  <!-- ─── LEFT: Controls ─── -->
+  <div>
+    <div class="panel">
+      <h2>⚙️ Parameters</h2>
+
+      <div class="field">
+        <label>Arrival SoC (%)</label>
+        <div class="hint">State of Charge when trailer arrives at depot (20–100)</div>
+        <input type="number" id="soc_init" value="45" min="20" max="100" step="1">
+      </div>
+
+      <div class="field">
+        <label>Degradation Cost (EUR/kWh)</label>
+        <div class="hint">Battery wear cost per kWh cycled (0 = ignore, 0.02 = default LFP)</div>
+        <input type="number" id="deg_cost" value="0.02" min="0" max="1" step="0.005">
+      </div>
+
+      <div class="field">
+        <label>Departure SoC</label>
+        <div class="hint">Fixed at 100% (cold-chain requirement)</div>
+        <input type="text" value="100% (fixed)" disabled
+               style="background:#f5f5f5; color:#999;">
+      </div>
+
+      <button class="btn btn-run" id="btnRun" onclick="startRun()">
+        ▶ Run Optimisation
+      </button>
+
+      <div class="log-box" id="logBox">Ready. Configure parameters and click Run.\n</div>
+    </div>
+  </div>
+
+  <!-- ─── RIGHT: Results ─── -->
+  <div>
+    <div class="panel results" id="resultsPanel">
+
+      <h2>📊 Annual Summary (Scenario C — MILP)</h2>
+      <div class="kpi-grid" id="kpiGrid"></div>
+
+      <h2>📋 Season Breakdown</h2>
+      <table class="season-table" id="seasonTable">
+        <thead>
+          <tr>
+            <th>Season</th><th>Days/yr</th>
+            <th>A Dumb<br>EUR/day</th>
+            <th>B Smart<br>EUR/day</th>
+            <th>C MILP<br>EUR/day</th>
+            <th>D MPC<br>EUR/day</th>
+            <th>C V2G Rev<br>EUR/day</th>
+            <th>C Savings<br>vs A</th>
+          </tr>
+        </thead>
+        <tbody id="seasonBody"></tbody>
+      </table>
+
+      <h2>📈 Generated Charts</h2>
+      <div class="gallery" id="gallery"></div>
+    </div>
+  </div>
+
+</div>
+</div>
+
+<script>
+const logBox   = document.getElementById("logBox");
+const btnRun   = document.getElementById("btnRun");
+const results  = document.getElementById("resultsPanel");
+const kpiGrid  = document.getElementById("kpiGrid");
+const seasonBody = document.getElementById("seasonBody");
+const gallery  = document.getElementById("gallery");
+
+function appendLog(msg, cls = "") {
+    const span = document.createElement("span");
+    span.className = cls;
+    span.textContent = msg + "\n";
+    logBox.appendChild(span);
+    logBox.scrollTop = logBox.scrollHeight;
+}
+
+function startRun() {
+    const socInit = parseFloat(document.getElementById("soc_init").value);
+    const degCost = parseFloat(document.getElementById("deg_cost").value);
+
+    if (isNaN(socInit) || socInit < 20 || socInit > 100) {
+        alert("Arrival SoC must be between 20 and 100.");
+        return;
+    }
+    if (isNaN(degCost) || degCost < 0 || degCost > 1) {
+        alert("Degradation cost must be between 0 and 1.");
+        return;
+    }
+
+    // Reset UI
+    logBox.innerHTML = "";
+    results.classList.remove("show");
+    kpiGrid.innerHTML = "";
+    seasonBody.innerHTML = "";
+    gallery.innerHTML = "";
+    btnRun.disabled = true;
+    btnRun.textContent = "⏳ Running...";
+
+    appendLog("Starting optimisation...", "log-info");
+    appendLog(`  SoC init: ${socInit}%  |  deg: ${degCost} EUR/kWh`, "log-info");
+    appendLog("");
+
+    // POST to start
+    fetch("/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ soc_init: socInit, deg_cost: degCost }),
+    })
+    .then(resp => {
+        if (!resp.ok) {
+            return resp.json().then(d => { throw new Error(d.error || "Server error"); });
+        }
+        return resp.json();
+    })
+    .then(() => {
+        // Open SSE stream
+        const evtSource = new EventSource("/stream");
+
+        evtSource.onmessage = function(event) {
+            try {
+                const data = JSON.parse(event.data);
+
+                if (data.type === "progress") {
+                    let cls = "log-info";
+                    if (data.message.includes("✓") || data.message.includes("DONE"))
+                        cls = "log-ok";
+                    if (data.message.includes("ERROR") || data.message.includes("WARN"))
+                        cls = "log-err";
+                    appendLog(data.message, cls);
+                }
+                else if (data.type === "result") {
+                    appendLog("\n✓ Optimisation complete!", "log-ok");
+                    evtSource.close();
+                    showResults(data.data);
+                    btnRun.disabled = false;
+                    btnRun.textContent = "▶ Run Optimisation";
+                }
+                else if (data.type === "error") {
+                    appendLog("\n✗ ERROR: " + data.message, "log-err");
+                    if (data.traceback) {
+                        appendLog(data.traceback, "log-err");
+                    }
+                    evtSource.close();
+                    btnRun.disabled = false;
+                    btnRun.textContent = "▶ Run Optimisation";
+                }
+            } catch (e) {
+                appendLog(event.data);
+            }
+        };
+
+        evtSource.onerror = function() {
+            evtSource.close();
+            appendLog("\n[Connection closed]", "log-info");
+            btnRun.disabled = false;
+            btnRun.textContent = "▶ Run Optimisation";
+        };
+    })
+    .catch(err => {
+        appendLog("✗ " + err.message, "log-err");
+        btnRun.disabled = false;
+        btnRun.textContent = "▶ Run Optimisation";
+    });
+}
+
+function showResults(data) {
+    results.classList.add("show");
+
+    // KPI cards
+    const kpis = [
+        { label: "Annual Cost (MILP)",        value: `€${Number(data.annual_cost_milp).toLocaleString()}`,  green: false },
+        { label: "Annual V2G Revenue",         value: `€${Number(data.annual_v2g_revenue).toLocaleString()}`, green: true },
+        { label: "Annual Savings vs Dumb",     value: `€${Number(data.annual_savings_vs_dumb).toLocaleString()}`, green: true },
+    ];
+    kpiGrid.innerHTML = kpis.map(k => `
+        <div class="kpi-card ${k.green ? 'green' : ''}">
+            <div class="kpi-value">${k.value}</div>
+            <div class="kpi-label">${k.label}</div>
+        </div>
+    `).join("");
+
+    // Season table
+    seasonBody.innerHTML = data.seasons.map(s => `
+        <tr>
+            <td><strong>${s.season}</strong></td>
+            <td>${s.days_per_year}</td>
+            <td>${s.A_cost.toFixed(4)}</td>
+            <td>${s.B_cost.toFixed(4)}</td>
+            <td>${s.C_cost.toFixed(4)}</td>
+            <td>${s.D_cost.toFixed(4)}</td>
+            <td>${s.C_v2g_rev.toFixed(4)}</td>
+            <td style="color: ${s.C_savings_vs_A > 0 ? '#43a047' : '#e53935'}">
+                ${s.C_savings_vs_A > 0 ? '+' : ''}${s.C_savings_vs_A.toFixed(4)}
+            </td>
+        </tr>
+    `).join("");
+
+    // Image gallery
+    const ts = Date.now();
+    gallery.innerHTML = data.images.map(img => `
+        <a href="/output/${img}?t=${ts}" target="_blank">
+            <img src="/output/${img}?t=${ts}" alt="${img}"
+                 loading="lazy"
+                 onerror="this.style.display='none'">
+        </a>
+    `).join("");
+
+    // Scroll to results
+    results.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+</script>
+
+</body>
+</html>
+"""
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  ENTRY POINT
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    port = 5000
-    print(f"\n  S.KOe COOL — V2G Web GUI")
-    print(f"  Open in browser: http://localhost:{port}")
-    print(f"  In Codespaces: use the 'Ports' tab to open the forwarded port.\n")
-    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+    print("\n  S.KOe COOL — V2G Web GUI")
+    print("  Open in browser: http://localhost:5000")
+    print("  In Codespaces: use the 'Ports' tab to open the forwarded port.\n")
+
+    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
