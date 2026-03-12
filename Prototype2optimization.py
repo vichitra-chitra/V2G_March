@@ -597,7 +597,6 @@ def _load_smard_csv(csv_path: str) -> pd.DataFrame:
         )
 
     col = "Germany/Luxembourg [EUR/MWh] Original resolutions"
-    # Also try the original EUR symbol version
     for possible_col in df.columns:
         if "Germany" in possible_col and "MWh" in possible_col:
             col = possible_col
@@ -704,18 +703,6 @@ def _solve_milp_window(
     E_fin:   float,
     deg:     float,
 ) -> tuple:
-    """
-    Solve MILP over one window of length W = len(buy) with TRUE binary mutex.
-
-    Decision variables (5W total):
-        x[0    .. W-1]  = P_c[t]   continuous  kW
-        x[W    .. 2W-1] = P_d[t]   continuous  kW
-        x[2W   .. 3W-1] = e[t]     continuous  kWh
-        x[3W   .. 4W-1] = z_c[t]   binary      {0,1}
-        x[4W   .. 5W-1] = z_d[t]   binary      {0,1}
-
-    Raises RuntimeError if solver fails (no heuristic fallback).
-    """
     from scipy.optimize import milp, LinearConstraint, Bounds
     from scipy.sparse import lil_matrix, csc_matrix
 
@@ -729,12 +716,10 @@ def _solve_milp_window(
     idx_zd = np.arange(4*W, 5 * W)
     nv     = 5 * W
 
-    # Cost vector
     c_vec         = np.zeros(nv)
     c_vec[idx_c]  =  buy   * dt + deg * dt
     c_vec[idx_d]  = -v2g_p * dt + deg * dt
 
-    # Variable bounds
     lb = np.zeros(nv)
     ub = np.full(nv, np.inf)
     ub[idx_c]  = v2g.p_c_max * plugged
@@ -744,19 +729,15 @@ def _solve_milp_window(
     lb[idx_zc] = 0.0;  ub[idx_zc] = 1.0
     lb[idx_zd] = 0.0;  ub[idx_zd] = 1.0
 
-    # Integrality: 0=continuous, 1=integer
     integrality = np.zeros(nv)
     integrality[idx_zc] = 1
     integrality[idx_zd] = 1
 
-    # Constraint matrix: W (SoC dynamics) + W (P_c<=p*z_c) + W (P_d<=p*z_d)
-    #                    + W (z_c+z_d<=1) + 1 (departure SoC) = 4W+1
     n_rows = 4 * W + 1
     A  = lil_matrix((n_rows, nv))
     lo = np.full(n_rows, -np.inf)
     hi = np.zeros(n_rows)
 
-    # (i) SoC dynamics
     for t in range(W):
         A[t, idx_e[t]]  =  1.0
         A[t, idx_c[t]]  = -v2g.eta_charge * dt
@@ -768,7 +749,6 @@ def _solve_milp_window(
             A[t, idx_e[t - 1]] = -1.0
         lo[t] = hi[t] = rhs
 
-    # (iv-a) P_c[t] <= p_c_max * z_c[t]
     for t in range(W):
         row = W + t
         A[row, idx_c[t]]  =  1.0
@@ -776,7 +756,6 @@ def _solve_milp_window(
         lo[row] = -np.inf
         hi[row] =  0.0
 
-    # (iv-b) P_d[t] <= p_d_max * z_d[t]
     for t in range(W):
         row = 2 * W + t
         A[row, idx_d[t]]  =  1.0
@@ -784,7 +763,6 @@ def _solve_milp_window(
         lo[row] = -np.inf
         hi[row] =  0.0
 
-    # (iv-c) z_c[t] + z_d[t] <= 1
     for t in range(W):
         row = 3 * W + t
         A[row, idx_zc[t]] = 1.0
@@ -792,7 +770,6 @@ def _solve_milp_window(
         lo[row] = -np.inf
         hi[row] =  1.0
 
-    # (v) Departure SoC
     A[4 * W, idx_e[W - 1]] = 1.0
     lo[4 * W] = E_fin
     hi[4 * W] = v2g.E_max
@@ -931,7 +908,6 @@ def run_mpc_day_ahead(
         pc_t = float(np.clip(P_c_w[0], 0.0, v2g.p_c_max * plugged[t]))
         pd_t = float(np.clip(P_d_w[0], 0.0, v2g.p_d_max * plugged[t]))
 
-        # Safety guard in case both are non-zero despite binary mutex
         if pc_t > 1e-6 and pd_t > 1e-6:
             if (v2g_day_ahead[t] - deg) > (buy_day_ahead[t] + deg):
                 pc_t = 0.0
@@ -1246,6 +1222,7 @@ def plot_all(
     plt.close()
     print(f"  Chart saved -> {out}")
 
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SECTION 10 – FULL YEAR SIMULATION & PLOTTING
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1256,10 +1233,6 @@ def run_full_year(
     soc_init_pct: float = 45.0,
     soc_final_pct: float = 100.0,
 ) -> pd.DataFrame:
-    """
-    Runs scenarios A, B, C, D for EVERY true day in the loaded dataset.
-    Returns a DataFrame with daily performance KPIs for accurate annual totals.
-    """
     df = _load_smard_csv(csv_path)
     df['date'] = df.index.date
     dates = df['date'].unique()
@@ -1271,7 +1244,7 @@ def run_full_year(
     for i, d in enumerate(dates):
         day_df = df[df['date'] == d]
         if len(day_df) != 96:
-            continue  # Skip incomplete days (e.g. DST changes or ends of dataset)
+            continue
 
         buy = day_df["price_eur_kwh"].values
         v2g_p = buy.copy()
@@ -1282,7 +1255,6 @@ def run_full_year(
 
         tru, plugged = build_load_and_availability(v2g, dwell=dwell)
 
-        # Align with 17:00 arrival logic for DayTrips
         if dwell == "DayTrip":
             ROLL = 68
             buy     = np.roll(buy, -ROLL)
@@ -1290,7 +1262,6 @@ def run_full_year(
             tru     = np.roll(tru, -ROLL)
             plugged = np.roll(plugged, -ROLL)
 
-        # Run all 4 scenarios for this specific day
         A = run_dumb(v2g, buy, v2g_p, tru, plugged, soc_init_pct, soc_final_pct)
         B = run_smart_no_v2g(v2g, buy, v2g_p, tru, plugged, soc_init_pct, soc_final_pct)
         C = run_milp_day_ahead(v2g, buy, v2g_p, tru, plugged, soc_init_pct, soc_final_pct)
@@ -1317,15 +1288,14 @@ def run_full_year(
 
 
 def plot_full_year_analysis(
-    df: pd.DataFrame, 
-    v2g: V2GParams, 
+    df: pd.DataFrame,
+    v2g: V2GParams,
     out: str = "full_year_analysis.png"
 ) -> None:
-    """Generates a 4-panel dashboard of true annual profitability."""
     fig = plt.figure(figsize=(24, 18))
     gs  = GridSpec(2, 2, figure=fig, hspace=0.3, wspace=0.25)
     fig.patch.set_facecolor("#F8F9FA")
-    
+
     fig.suptitle(
         "V2G Full-Year Profitability Analysis (True 365-Day Simulation)\n"
         f"SoC 20-100% | E_max = {v2g.E_max:.0f} kWh | deg = {v2g.deg_cost_eur_kwh:.3f} EUR/kWh",
@@ -1335,23 +1305,18 @@ def plot_full_year_analysis(
     df["Date"] = pd.to_datetime(df["Date"])
     dates = df["Date"]
 
-    # --- 1. Cumulative Net Cost ---
     ax1 = fig.add_subplot(gs[0, 0])
     ax1.plot(dates, df["Cost_A"].cumsum(), label="A - Dumb", color=COL["dumb"], lw=2.5)
     ax1.plot(dates, df["Cost_B"].cumsum(), label="B - Smart", color=COL["smart"], lw=2.5)
     ax1.plot(dates, df["Cost_C"].cumsum(), label="C - MILP", color=COL["milp"], lw=2.5)
     ax1.plot(dates, df["Cost_D"].cumsum(), label="D - MPC", color=COL["mpc"], lw=2.5, ls="--")
-    
     ax1.set_title("1. Cumulative Net Charging Cost Over Year", fontsize=14, fontweight="bold")
     ax1.set_ylabel("Cumulative Cost (EUR)", fontsize=11)
     ax1.grid(True, alpha=0.3)
     ax1.legend(fontsize=11)
-    
-    # Annotate final values
     ax1.text(dates.iloc[-1], df["Cost_A"].sum(), f"  €{df['Cost_A'].sum():,.0f}", color="#555", va="center", fontweight="bold")
     ax1.text(dates.iloc[-1], df["Cost_C"].sum(), f"  €{df['Cost_C'].sum():,.0f}", color=COL["milp"], va="center", fontweight="bold")
 
-    # --- 2. Monthly Savings vs A ---
     ax2 = fig.add_subplot(gs[0, 1])
     df["Sav_B"] = df["Cost_A"] - df["Cost_B"]
     df["Sav_C"] = df["Cost_A"] - df["Cost_C"]
@@ -1361,11 +1326,10 @@ def plot_full_year_analysis(
     months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
     x = np.arange(len(monthly))
     w = 0.25
-    
+
     ax2.bar(x - w, monthly["Sav_B"], width=w, label="B Savings (vs A)", color=COL["smart"], alpha=0.9)
     ax2.bar(x,     monthly["Sav_C"], width=w, label="C Savings (vs A)", color=COL["milp"], alpha=0.9)
     ax2.bar(x + w, monthly["Sav_D"], width=w, label="D Savings (vs A)", color=COL["mpc"], alpha=0.9)
-    
     ax2.set_xticks(x)
     ax2.set_xticklabels([months[i-1] for i in monthly.index], fontsize=10)
     ax2.set_title("2. Monthly Savings compared to Dumb Charging", fontsize=14, fontweight="bold")
@@ -1373,38 +1337,31 @@ def plot_full_year_analysis(
     ax2.grid(True, alpha=0.3, axis="y")
     ax2.legend(fontsize=11)
 
-    # --- 3. Daily Net Cost Distribution (Boxplot) ---
     ax3 = fig.add_subplot(gs[1, 0])
     box_data = [df["Cost_A"], df["Cost_B"], df["Cost_C"], df["Cost_D"]]
     bp = ax3.boxplot(box_data, patch_artist=True, labels=["A - Dumb", "B - Smart", "C - MILP", "D - MPC"])
-    
     colors = [COL["dumb"], COL["smart"], COL["milp"], COL["mpc"]]
     for patch, color in zip(bp['boxes'], colors):
         patch.set_facecolor(color)
         patch.set_alpha(0.75)
     for median in bp['medians']:
         median.set(color="black", linewidth=2)
-        
     ax3.set_title("3. Distribution of Daily Net Costs (Variance over 365 Days)", fontsize=14, fontweight="bold")
     ax3.set_ylabel("Daily Net Cost (EUR/day)", fontsize=11)
     ax3.grid(True, alpha=0.3, axis="y")
     ax3.axhline(0, color="#D32F2F", lw=1.5, ls="--", label="Zero Cost Line")
     ax3.legend(fontsize=10)
 
-    # --- 4. Daily V2G Revenue & Export over Time ---
     ax4 = fig.add_subplot(gs[1, 1])
     ax4_2 = ax4.twinx()
-    
     ax4.scatter(dates, df["Rev_C"], alpha=0.3, color=COL["milp"], s=20, label="Daily V2G Rev (MILP)")
     ax4.plot(dates, df["Rev_C"].rolling(14, center=True).mean(), color="#006064", lw=3, label="14-day Avg Rev")
     ax4_2.plot(dates, df["Export_C"].rolling(14, center=True).mean(), color="#2E7D32", lw=2, ls=":", label="14-day Avg Export (kWh)")
-
     ax4.set_title("4. Daily V2G Revenue & Grid Export (Scenario C - MILP)", fontsize=14, fontweight="bold")
     ax4.set_ylabel("Daily Revenue (EUR)", fontsize=11)
     ax4_2.set_ylabel("Daily Grid Export (kWh)", color="#2E7D32", fontsize=11)
     ax4_2.tick_params(axis="y", colors="#2E7D32")
     ax4.grid(True, alpha=0.3)
-    
     lines1, labels1 = ax4.get_legend_handles_labels()
     lines2, labels2 = ax4_2.get_legend_handles_labels()
     ax4.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=11)
@@ -1412,6 +1369,207 @@ def plot_full_year_analysis(
     plt.savefig(out, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close()
     print(f"  Full-year chart saved -> {out}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SECTION 10b – ADDITIONAL CROSS-SEASON ANALYSIS  (called by GUI)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def plot_additional_analysis(
+    v2g: V2GParams,
+    hours: np.ndarray,
+    A: V2GResult, B: V2GResult, C: V2GResult, D: V2GResult,
+    buy: np.ndarray,
+    v2g_p: np.ndarray,
+    all_season_results: dict,
+    csv_path: str,
+    out: str = "additional_analysis.png",
+) -> None:
+    """
+    4-panel cross-season summary chart generated by the GUI after all seasons run.
+
+    Panel 1 — Grouped bar: net cost EUR/day per scenario × season
+    Panel 2 — Grouped bar: annual savings (B, C, D vs A) by season
+    Panel 3 — Price duration curve for winter + V2G profitable zone
+    Panel 4 — V2G export kWh/day and revenue/day by season (Scenario C MILP)
+    """
+    season_keys   = ["winter", "summer", "winter_weekend", "summer_weekend"]
+    season_labels = ["Winter WD", "Summer WD", "Winter WE", "Summer WE"]
+    days_per_yr   = [130, 131, 52, 52]
+    sc_keys       = ["A", "B", "C", "D"]
+    sc_labels     = ["A Dumb", "B Smart", "C MILP", "D MPC"]
+    sc_colors     = [COL["dumb"], COL["smart"], COL["milp"], COL["mpc"]]
+
+    fig = plt.figure(figsize=(22, 16))
+    fig.patch.set_facecolor("#F7F9FC")
+    gs  = GridSpec(2, 2, figure=fig, hspace=0.40, wspace=0.32,
+                   top=0.92, bottom=0.07, left=0.07, right=0.97)
+    fig.suptitle(
+        "V2G Additional Analysis — Cross-Season Summary\n"
+        f"Battery: {v2g.usable_capacity_kWh:.0f} kWh usable | "
+        f"P_c/d max: {v2g.p_c_max:.0f}/{v2g.p_d_max:.0f} kW | "
+        f"eta: {v2g.eta_charge:.2f}/{v2g.eta_discharge:.2f} | "
+        f"deg: {v2g.deg_cost_eur_kwh:.3f} EUR/kWh",
+        fontsize=13, fontweight="bold", color="#1A237E", y=0.97,
+    )
+
+    x      = np.arange(len(season_keys))
+    n_sc   = len(sc_keys)
+    bar_w  = 0.18
+
+    # ── Panel 1: Net cost per scenario per season ──────────────────────────────
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.set_facecolor("#EEF2FF")
+
+    for i, (sc, lbl, col) in enumerate(zip(sc_keys, sc_labels, sc_colors)):
+        costs = []
+        for sk in season_keys:
+            if sk in all_season_results and sc in all_season_results[sk]:
+                costs.append(all_season_results[sk][sc].cost_eur_day)
+            else:
+                costs.append(0.0)
+        offset = (i - n_sc / 2 + 0.5) * bar_w
+        bars = ax1.bar(x + offset, costs, width=bar_w, color=col,
+                       alpha=0.85, label=lbl, zorder=3)
+        for bar, v in zip(bars, costs):
+            ax1.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + 0.001,
+                f"{v:.3f}",
+                ha="center", va="bottom", fontsize=6.5, color=col,
+            )
+
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(season_labels, fontsize=9)
+    ax1.set_ylabel("Net Cost (EUR/day)", fontsize=10)
+    ax1.set_title("(1) Net Cost per Scenario × Season", fontsize=11, fontweight="bold")
+    ax1.legend(fontsize=8.5, loc="upper right")
+    ax1.grid(True, alpha=0.3, axis="y", zorder=0)
+    ax1.axhline(0, color="black", lw=0.8)
+
+    # ── Panel 2: Annual savings contribution by season ─────────────────────────
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax2.set_facecolor("#E8F5E9")
+
+    sc_save   = ["B", "C", "D"]
+    sc_col2   = [COL["smart"], COL["milp"], COL["mpc"]]
+    sc_lbl2   = ["B Smart", "C MILP", "D MPC"]
+    bar_w2    = 0.25
+
+    for i, (sc, lbl, col) in enumerate(zip(sc_save, sc_lbl2, sc_col2)):
+        ann_sav = []
+        for sk, dpyr in zip(season_keys, days_per_yr):
+            if sk in all_season_results:
+                r_a  = all_season_results[sk]["A"].cost_eur_day
+                r_sc = all_season_results[sk][sc].cost_eur_day
+                ann_sav.append((r_a - r_sc) * dpyr)
+            else:
+                ann_sav.append(0.0)
+        offset = (i - len(sc_save) / 2 + 0.5) * bar_w2
+        bars = ax2.bar(x + offset, ann_sav, width=bar_w2, color=col,
+                       alpha=0.85, label=lbl, zorder=3)
+        for bar, v in zip(bars, ann_sav):
+            ax2.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + (1.5 if v >= 0 else -6),
+                f"{v:+.0f}",
+                ha="center", va="bottom", fontsize=7, color=col,
+            )
+
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(season_labels, fontsize=9)
+    ax2.set_ylabel("Annual Savings vs A (EUR/year)", fontsize=10)
+    ax2.set_title("(2) Annual Savings Contribution by Season", fontsize=11, fontweight="bold")
+    ax2.legend(fontsize=8.5, loc="upper right")
+    ax2.axhline(0, color="black", lw=0.8)
+    ax2.grid(True, alpha=0.3, axis="y", zorder=0)
+
+    # ── Panel 3: Price duration curve (winter) + V2G zone ─────────────────────
+    ax3 = fig.add_subplot(gs[1, 0])
+    ax3.set_facecolor("#FFF8E1")
+
+    sorted_buy = np.sort(buy)[::-1] * 1000  # convert to EUR/MWh
+    n_slots    = len(sorted_buy)
+    pct_time   = np.linspace(0, 100, n_slots)
+
+    ax3.fill_between(pct_time, sorted_buy, alpha=0.30, color=COL["price"], zorder=2)
+    ax3.plot(pct_time, sorted_buy, color=COL["price"], lw=2,
+             label="Winter buy price (sorted)", zorder=3)
+
+    deg_threshold_mwh = v2g.deg_cost_eur_kwh * 1000  # EUR/MWh
+    ax3.axhline(deg_threshold_mwh, color=COL["mpc"], lw=1.8, ls="--",
+                label=f"Deg cost threshold ({deg_threshold_mwh:.0f} EUR/MWh)")
+    ax3.axhline(0, color="grey", lw=0.8, ls=":")
+
+    v2g_zone = sorted_buy > deg_threshold_mwh
+    if v2g_zone.any():
+        pct_cutoff = float(pct_time[v2g_zone][-1])
+        ax3.axvspan(0, pct_cutoff, alpha=0.12, color=COL["mpc"],
+                    label=f"V2G profitable zone ({pct_cutoff:.1f}% of slots)")
+        ax3.text(pct_cutoff / 2, sorted_buy.max() * 0.55,
+                 f"V2G\nzone\n{pct_cutoff:.0f}%",
+                 ha="center", va="center", fontsize=8.5,
+                 color=COL["mpc"], fontweight="bold")
+
+    ax3.set_xlabel("% of 15-min slots (high → low price)", fontsize=9)
+    ax3.set_ylabel("Electricity price (EUR/MWh)", fontsize=10)
+    ax3.set_title("(3) Price Duration Curve (Winter) + V2G Profitable Zone",
+                  fontsize=11, fontweight="bold")
+    ax3.legend(fontsize=8.5)
+    ax3.grid(True, alpha=0.3)
+    ax3.set_xlim(0, 100)
+
+    # ── Panel 4: V2G export kWh/day + revenue/day by season (MILP C) ──────────
+    ax4  = fig.add_subplot(gs[1, 1])
+    ax4b = ax4.twinx()
+    ax4.set_facecolor("#FCE4EC")
+
+    export_kwh = []
+    v2g_rev    = []
+    for sk in season_keys:
+        if sk in all_season_results:
+            export_kwh.append(all_season_results[sk]["C"].v2g_export_kwh_day)
+            v2g_rev.append(all_season_results[sk]["C"].v2g_revenue_eur_day)
+        else:
+            export_kwh.append(0.0)
+            v2g_rev.append(0.0)
+
+    bar_w4 = 0.30
+    b1 = ax4.bar(x - bar_w4 / 2, export_kwh, width=bar_w4,
+                 color=COL["milp"], alpha=0.85,
+                 label="V2G Export (kWh/day)", zorder=3)
+    b2 = ax4b.bar(x + bar_w4 / 2, v2g_rev, width=bar_w4,
+                  color=COL["mpc"], alpha=0.75,
+                  label="V2G Revenue (EUR/day)", zorder=3)
+
+    for bar, v in zip(b1, export_kwh):
+        ax4.text(bar.get_x() + bar.get_width() / 2,
+                 bar.get_height() + 0.08,
+                 f"{v:.1f} kWh",
+                 ha="center", va="bottom", fontsize=7.5, color=COL["milp"])
+    for bar, v in zip(b2, v2g_rev):
+        ax4b.text(bar.get_x() + bar.get_width() / 2,
+                  bar.get_height() + 0.001,
+                  f"€{v:.4f}",
+                  ha="center", va="bottom", fontsize=7.5, color=COL["mpc"])
+
+    ax4.set_xticks(x)
+    ax4.set_xticklabels(season_labels, fontsize=9)
+    ax4.set_ylabel("V2G Export (kWh/day)", fontsize=10, color=COL["milp"])
+    ax4b.set_ylabel("V2G Revenue (EUR/day)", fontsize=10, color=COL["mpc"])
+    ax4.tick_params(axis="y", colors=COL["milp"])
+    ax4b.tick_params(axis="y", colors=COL["mpc"])
+    ax4.set_title("(4) V2G Export & Revenue by Season (Scenario C — MILP)",
+                  fontsize=11, fontweight="bold")
+
+    lines1, lbl1 = ax4.get_legend_handles_labels()
+    lines2, lbl2 = ax4b.get_legend_handles_labels()
+    ax4.legend(lines1 + lines2, lbl1 + lbl2, fontsize=8.5, loc="upper right")
+    ax4.grid(True, alpha=0.3, axis="y", zorder=0)
+
+    plt.savefig(out, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close()
+    print(f"  Additional analysis chart saved -> {out}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1525,14 +1683,13 @@ def main() -> None:
     print("  Generating equations reference card ...")
     generate_equations_card("equations_reference.png")
 
-    # 1. ─── AVERAGE SEASON RUNS (fast, keeps the seasonal .png outputs you liked) ───
     DAY_TYPES = [
         ("winter",         "DayTrip", 130, "Winter weekday  (Mon-Fri, Oct-Mar)"),
         ("summer",         "DayTrip", 131, "Summer weekday  (Mon-Fri, Apr-Sep)"),
         ("winter_weekend", "Weekend",  52, "Winter weekend  (Sat-Sun, Oct-Mar)"),
         ("summer_weekend", "Weekend",  52, "Summer weekend  (Sat-Sun, Apr-Sep)"),
     ]
-    
+
     deg_values = load_deg_sensitivity(v2g)
     hours = np.arange(v2g.n_slots) * v2g.dt_h
 
@@ -1556,16 +1713,13 @@ def main() -> None:
         print_report(v2g, results, deg_df, season=label, price_source=price_source)
         plot_all(v2g, hours, A, B, C, D, deg_df, season=label, out=f"results_{season}.png")
 
-
-    # 2. ─── ACCURATE 365-DAY FULL YEAR RUN ───
     print("\n" + "=" * 65)
     print("  RUNNING FULL 365-DAY YEAR ANALYSIS")
     print("=" * 65)
-    
+
     full_year_df = run_full_year(v2g, csv_path, soc_init_pct, soc_final_pct)
     plot_full_year_analysis(full_year_df, v2g, out="full_year_analysis.png")
 
-    # Accurate KPIs sum over all 365 rows in the dataframe
     annual_cost_a       = full_year_df["Cost_A"].sum()
     annual_cost_milp    = full_year_df["Cost_C"].sum()
     annual_v2g_milp     = full_year_df["Rev_C"].sum()
@@ -1579,11 +1733,6 @@ def main() -> None:
     print(f"  Annual V2G revenue (MILP):        EUR{annual_v2g_milp:>8,.0f}/year")
     print(f"  Annual savings vs Dumb charging:  EUR{annual_savings_dumb:>8,.0f}/year")
     print(f"  [Agora 2025 benchmark for car:    ~EUR500/year for arbitrage only]")
-    print(f"\n  Output files created/updated:")
-    print(f"    abbreviation_legend.png / equations_reference.png")
-    print(f"    results_winter.png / results_summer.png")
-    print(f"    results_winter_weekend.png / results_summer_weekend.png")
-    print(f"    ⭐ full_year_analysis.png (New 365-day dashboard)")
     print()
 
 
