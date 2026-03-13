@@ -1,0 +1,11 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Setup environment",
+            "type": "shell",
+            "command": "python setup_env.py",
+            "runOptions": { "runOn": "folderOpen" }
+        }
+    ]
+}
