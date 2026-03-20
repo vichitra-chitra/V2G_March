@@ -502,17 +502,16 @@ def plot_season_chart(v2g, season_label, buy_d, plug_d, hours_d,
 # =============================================================================
 #  8. KPI MULTI-TABLE  (unchanged from v4)
 # =============================================================================
-
 def plot_kpi_multi(all_res, v2g, arrival_h, departure_h, run_mpc, out):
+    """KPI comparison table — works with any number of scenarios (2, 3, or 4)."""
     day_cfg = [
-        ("winter_weekday","Winter Weekday","#1565C0"),
-        ("summer_weekday","Summer Weekday","#E65100"),
-        ("winter_weekend","Winter Weekend (48h Sat+Sun)","#6A1B9A"),
-        ("summer_weekend","Summer Weekend (48h Sat+Sun)","#2E7D32"),
+        ("winter_weekday", "Winter Weekday",            "#1565C0"),
+        ("summer_weekday", "Summer Weekday",            "#E65100"),
+        ("winter_weekend", "Winter Weekend (48h Sat+Sun)", "#6A1B9A"),
+        ("summer_weekend", "Summer Weekend (48h Sat+Sun)", "#2E7D32"),
     ]
-    sc_keys  = ["A","B","C","D"]
-    sc_short = ["A — Dumb","B — Smart","C — MILP","D — MPC"]
-    metrics  = [
+
+    metrics = [
         ("Net cost (EUR/day)",    "net_cost",    "{:.4f}"),
         ("Charge cost (EUR/day)", "charge_cost", "{:.4f}"),
         ("V2G revenue (EUR/day)", "v2g_rev",     "{:.4f}"),
@@ -520,56 +519,103 @@ def plot_kpi_multi(all_res, v2g, arrival_h, departure_h, run_mpc, out):
         ("Daily savings vs Dumb", "savings_day", "{:+.4f}"),
         ("Annual savings (x365)", "savings_ann", "EUR {:+,.0f}"),
     ]
-    fig, axes = plt.subplots(2, 2, figsize=(20,13),
-                             gridspec_kw={"hspace":0.55,"wspace":0.25})
+
+    def label_to_key(lbl):
+        if "Dumb"  in lbl: return "A"
+        if "Smart" in lbl: return "B"
+        if "MILP"  in lbl: return "C"
+        if "MPC"   in lbl: return "D"
+        return "A"
+
+    fig, axes = plt.subplots(2, 2, figsize=(20, 13),
+                             gridspec_kw={"hspace": 0.55, "wspace": 0.25})
     fig.patch.set_facecolor("#F8F9FA")
     fig.suptitle(
         "S.KOe COOL — KPI Summary: All Scenarios × All Day Types\n"
-        f"Weekday: arrival {int(arrival_h):02d}:00 | departure {int(departure_h):02d}:00 | "
-        f"Weekend: 48h (Sat+Sun) | Battery {v2g.usable_capacity_kWh:.0f} kWh | deg=0",
+        f"Weekday: arrival {int(arrival_h):02d}:00 | "
+        f"departure {int(departure_h):02d}:00 | "
+        f"Weekend: 48h (Sat+Sun) | "
+        f"Battery {v2g.usable_capacity_kWh:.0f} kWh | deg=0",
         fontsize=13, fontweight="bold", y=1.01)
 
+    col_bgs = ["#F5F5F5", "#F5F5F5", "#E3F2FD", "#E0F7FA", "#FFF3E0"]
+
     for ai, (dt_key, dt_lbl, hdr_col) in enumerate(day_cfg):
-        ax = axes[ai//2][ai%2]; ax.axis("off")
-        ax.set_title(f"  {dt_lbl}  ", fontsize=11, fontweight="bold",
-                     color="white", pad=10,
-                     bbox=dict(facecolor=hdr_col, edgecolor="none",
-                               boxstyle="round,pad=0.4"))
-        if dt_key not in all_res: continue
-        res = all_res[dt_key]; ref = res[0]["net_cost"]
+        ax = axes[ai // 2][ai % 2]
+        ax.axis("off")
+        ax.set_title(
+            f"  {dt_lbl}  ", fontsize=11, fontweight="bold",
+            color="white", pad=10,
+            bbox=dict(facecolor=hdr_col, edgecolor="none",
+                      boxstyle="round,pad=0.4")
+        )
+        if dt_key not in all_res:
+            continue
+        res = all_res[dt_key]
+        if not res:
+            continue
+
+        # ── Dynamic scenario keys based on what was actually run ──────────────
+        res_keys  = [label_to_key(r["label"]) for r in res]
+        res_short = [r["label"].split("(")[0].strip() for r in res]
+        n_sc      = len(res)
+        ref       = res[0]["net_cost"]
+
+        # ── Build cell data ───────────────────────────────────────────────────
         cell_data = []
         for mname, mkey, mfmt in metrics:
             row = [mname]
             for i, r in enumerate(res):
-                if mkey=="savings_day":
-                    v = ref-r["net_cost"]; row.append("—" if i==0 else mfmt.format(v))
-                elif mkey=="savings_ann":
-                    v = (ref-r["net_cost"])*365; row.append("—" if i==0 else mfmt.format(v))
+                if mkey == "savings_day":
+                    v = ref - r["net_cost"]
+                    row.append("—" if i == 0 else mfmt.format(v))
+                elif mkey == "savings_ann":
+                    v = (ref - r["net_cost"]) * 365
+                    row.append("—" if i == 0 else mfmt.format(v))
                 else:
                     row.append(mfmt.format(r[mkey]))
             cell_data.append(row)
 
-        tbl = ax.table(cellText=cell_data, colLabels=["Metric"]+sc_short,
-                       loc="center", cellLoc="center")
-        tbl.auto_set_font_size(False); tbl.set_fontsize(9); tbl.scale(1,2.3)
-        for ci,hc in enumerate(["#263238"]+[SC_COL[k] for k in sc_keys]):
-            cell=tbl[0,ci]; cell.set_facecolor(hc)
+        # ── Build table ───────────────────────────────────────────────────────
+        tbl = ax.table(
+            cellText=cell_data,
+            colLabels=["Metric"] + res_short,
+            loc="center", cellLoc="center"
+        )
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(9)
+        tbl.scale(1, 2.3)
+
+        # Header row — dynamic colours
+        hdr_bgs = ["#263238"] + [SC_COL[k] for k in res_keys]
+        for ci, hc in enumerate(hdr_bgs):
+            cell = tbl[0, ci]
+            cell.set_facecolor(hc)
             cell.set_text_props(color="white", fontweight="bold")
-        col_bgs=["#F5F5F5","#F5F5F5","#E3F2FD","#E0F7FA","#FFF3E0"]
-        for ri in range(1,len(cell_data)+1):
-            for ci in range(5):
-                cell=tbl[ri,ci]; cell.set_facecolor(col_bgs[ci])
-                if ci==0: cell.set_text_props(fontweight="bold")
-                txt=cell.get_text().get_text()
-                if "+" in txt and ri>=5:
-                    cell.set_text_props(color="#1B5E20",fontweight="bold")
-        for ri in range(len(cell_data)+1):
-            tbl[ri,0].set_width(0.35)
-            for ci in range(1,5): tbl[ri,ci].set_width(0.155)
+
+        # Body rows
+        for ri in range(1, len(cell_data) + 1):
+            for ci in range(n_sc + 1):
+                cell = tbl[ri, ci]
+                cell.set_facecolor(col_bgs[min(ci, len(col_bgs) - 1)])
+                if ci == 0:
+                    cell.set_text_props(fontweight="bold")
+                txt = cell.get_text().get_text()
+                if "+" in txt and ri >= 5:
+                    cell.set_text_props(color="#1B5E20", fontweight="bold")
+
+        # Column widths — dynamic
+        metric_w  = 0.35
+        scenario_w = (1.0 - metric_w) / n_sc * 0.95
+        for ri in range(len(cell_data) + 1):
+            tbl[ri, 0].set_width(metric_w)
+            for ci in range(1, n_sc + 1):
+                tbl[ri, ci].set_width(scenario_w)
 
     plt.savefig(out, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
-    plt.close(); print(f"  Saved -> {out}")
-
+    plt.close()
+    if isinstance(out, str):
+        print(f"  Saved -> {out}")
 
 # =============================================================================
 #  9. FULL-YEAR SIMULATION  (FIX 3: SoC carry-forward Fri->Sat->Sun)

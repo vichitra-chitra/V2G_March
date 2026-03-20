@@ -9,13 +9,117 @@ from pathlib import Path
 from v2g_single_day4 import (
     V2GParams, WINTER_M, SUMMER_M, SC_COL, SC_FILL,
     _interpolate_to_15min, _load_csv_raw,
-    get_wd_window, build_wd_display, to_display_wd, soc_ramp,
+    get_wd_window, build_wd_display,
     run_A_dumb, run_B_smart, run_C_milp, run_D_mpc,
     make_kpi, plot_season_chart, plot_kpi_multi,
     plot_price_profiles
 )
 
 CSV_PATH = "2025_Electricity_Price.csv"
+
+
+# =============================================================================
+#  HELPERS
+# =============================================================================
+
+def parse_hhmm(s: str, default: float) -> float:
+    """Parse HH:MM string to decimal hours. Returns default on error."""
+    try:
+        parts = s.strip().split(":")
+        h = int(parts[0])
+        m = int(parts[1]) if len(parts) > 1 else 0
+        assert 0 <= h <= 23 and 0 <= m <= 59
+        return h + m / 60.0
+    except Exception:
+        return default
+
+
+@st.cache_data(show_spinner=False)
+def run_day_type_cached(season_key: str, arrival_h: float, departure_h: float,
+                        soc_init_pct: float, do_B: bool, do_C: bool, do_D: bool):
+    """
+    Run selected scenarios for one day type.
+    Cached by all parameters — reruns only when something changes.
+    First run: ~30s per day type. Subsequent runs with same params: instant.
+    """
+    months_map = {
+        "winter_weekday": (WINTER_M, False, False),
+        "summer_weekday": (SUMMER_M, False, False),
+        "winter_weekend": (WINTER_M, True,  True),
+        "summer_weekend": (SUMMER_M, True,  True),
+    }
+    months, is_wknd, is_48h = months_map[season_key]
+
+    df      = _load_csv_raw(CSV_PATH)
+    mask    = df["month"].isin(months) & (df["is_weekend"] == is_wknd)
+    sub     = df[mask]
+    profile = sub.groupby("slot")["price"].mean().values
+    buy     = _interpolate_to_15min(profile)
+    v2gp    = buy.copy()
+
+    v2g    = V2GParams()
+    E_init = v2g.usable_capacity_kWh * soc_init_pct / 100.0
+
+    if is_48h:
+        buy48   = np.concatenate([buy, buy])
+        v2gp48  = buy48.copy()
+        W       = 192
+        hours_d = np.arange(W) * v2g.dt_h
+        plug_d  = np.ones(W)
+        buy_d   = buy48
+
+        Pc, Pd, soc = run_A_dumb(v2g, buy48, v2gp48, W, E_init)
+        results = [make_kpi("A - Dumb", v2g, Pc, Pd, soc,
+                            buy48, v2gp48, E_init, is_weekend_48=True)]
+        if do_B:
+            Pc, Pd, soc = run_B_smart(v2g, buy48, v2gp48, E_init)
+            results.append(make_kpi("B - Smart (no V2G)", v2g, Pc, Pd, soc,
+                                    buy48, v2gp48, E_init, is_weekend_48=True))
+        if do_C:
+            Pc, Pd, soc = run_C_milp(v2g, buy48, v2gp48, E_init)
+            results.append(make_kpi("C - MILP Day-Ahead", v2g, Pc, Pd, soc,
+                                    buy48, v2gp48, E_init, is_weekend_48=True))
+        if do_D:
+            Pc, Pd, soc = run_D_mpc(v2g, buy48, v2gp48, E_init)
+            results.append(make_kpi("D - MPC (receding)", v2g, Pc, Pd, soc,
+                                    buy48, v2gp48, E_init, is_weekend_48=True))
+
+        results_kpi = [{**r,
+            "net_cost"   : r["net_cost"]    / 2,
+            "charge_cost": r["charge_cost"] / 2,
+            "v2g_rev"    : r["v2g_rev"]     / 2,
+            "v2g_kwh"    : r["v2g_kwh"]     / 2,
+        } for r in results]
+
+        return results, results_kpi, buy_d, plug_d, hours_d, is_wknd, is_48h
+
+    else:
+        win, arr, dep, W = get_wd_window(v2g, arrival_h, departure_h)
+        buy_w  = buy[win]; v2gp_w = v2gp[win]
+        buy_d, plug_d, hours_d = build_wd_display(v2g, buy, arrival_h, departure_h)
+
+        Pc, Pd, soc = run_A_dumb(v2g, buy_w, v2gp_w, W, E_init)
+        results = [make_kpi("A - Dumb", v2g, Pc, Pd, soc,
+                            buy_w, v2gp_w, E_init, arr, dep)]
+        if do_B:
+            Pc, Pd, soc = run_B_smart(v2g, buy_w, v2gp_w, E_init)
+            results.append(make_kpi("B - Smart (no V2G)", v2g, Pc, Pd, soc,
+                                    buy_w, v2gp_w, E_init, arr, dep))
+        if do_C:
+            Pc, Pd, soc = run_C_milp(v2g, buy_w, v2gp_w, E_init)
+            results.append(make_kpi("C - MILP Day-Ahead", v2g, Pc, Pd, soc,
+                                    buy_w, v2gp_w, E_init, arr, dep))
+        if do_D:
+            Pc, Pd, soc = run_D_mpc(v2g, buy_w, v2gp_w, E_init)
+            results.append(make_kpi("D - MPC (receding)", v2g, Pc, Pd, soc,
+                                    buy_w, v2gp_w, E_init, arr, dep))
+
+        return results, results, buy_d, plug_d, hours_d, is_wknd, is_48h
+
+
+# =============================================================================
+#  PAGE SETUP
+# =============================================================================
 
 st.set_page_config(
     page_title="S.KOe COOL — V2G Optimisation",
@@ -29,197 +133,127 @@ st.caption(
     "Master's Thesis 2026  |  Kuldip Bhadreshvara"
 )
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
+
+# =============================================================================
+#  SIDEBAR
+# =============================================================================
+
 with st.sidebar:
     st.header("Configuration")
+    st.caption("Results update automatically when parameters change.")
 
     st.subheader("Weekday schedule")
-    arrival_h    = st.slider("Arrival hour",    10, 23, 16, 1)
-    departure_h  = st.slider("Departure hour",   1,  9,  6, 1)
-    soc_init_pct = st.slider("Arrival SoC (%)", 20, 90, 45, 5)
+    arrival_str   = st.text_input(
+        "Arrival time (HH:MM)", "16:00",
+        help="Time trailer returns to depot"
+    )
+    departure_str = st.text_input(
+        "Departure time (HH:MM)", "06:00",
+        help="Time trailer leaves next morning"
+    )
+    soc_str = st.text_input(
+        "Arrival battery SoC (%)", "45",
+        help="Battery charge level on arrival — enter a number between 20 and 100"
+    )
+
+    # Parse all inputs
+    arrival_h   = parse_hhmm(arrival_str,   16.0)
+    departure_h = parse_hhmm(departure_str,  6.0)
+    try:
+        soc_init_pct = float(soc_str)
+        soc_init_pct = max(20.0, min(100.0, soc_init_pct))
+    except Exception:
+        soc_init_pct = 45.0
+
+    # Confirm parsed values
+    st.caption(
+        f"Parsed → arrival {int(arrival_h):02d}:{int((arrival_h % 1)*60):02d}  |  "
+        f"departure {int(departure_h):02d}:{int((departure_h % 1)*60):02d}  |  "
+        f"SoC {soc_init_pct:.0f}%"
+    )
 
     st.divider()
-    st.subheader("Scenarios")
+    st.subheader("Scenarios to run")
     do_B = st.checkbox("B — Smart charging (no V2G)", True)
     do_C = st.checkbox("C — MILP Day-Ahead",          True)
     do_D = st.checkbox("D — MPC receding horizon",    False,
-                        help="Adds ~2 min compute per day type")
+                        help="~2 min first run — cached after that")
 
     st.divider()
     st.subheader("Day types")
-    do_wwd   = st.checkbox("Winter weekday",           True)
-    do_swd   = st.checkbox("Summer weekday",           True)
-    do_wwe   = st.checkbox("Winter weekend (48h)",     False)
-    do_swe   = st.checkbox("Summer weekend (48h)",     False)
-    do_price = st.checkbox("Price profile analysis",   False)
+    do_wwd   = st.checkbox("Winter weekday",         True)
+    do_swd   = st.checkbox("Summer weekday",         True)
+    do_wwe   = st.checkbox("Winter weekend (48h)",   False)
+    do_swe   = st.checkbox("Summer weekend (48h)",   False)
+    do_price = st.checkbox("Price profile analysis", False)
 
     st.divider()
-    run_btn = st.button(
-        "Run optimisation", type="primary", use_container_width=True
+    st.markdown("**S.KOe COOL specs**")
+    st.caption("70 kWh total / 60 kWh usable")
+    st.caption("22 kW AC bidirectional (ISO 15118-20)")
+    st.caption("Cold-chain floor: SoC ≥ 20%")
+    st.caption("Departure target: SoC = 100%")
+
+
+# =============================================================================
+#  LOAD CSV
+# =============================================================================
+
+if not Path(CSV_PATH).exists():
+    st.error(
+        f"CSV file '{CSV_PATH}' not found. "
+        "Make sure it is committed to the GitHub repo."
     )
-
-# ── About section before run ──────────────────────────────────────────────────
-if not run_btn:
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("""
-**About this tool**
-
-Optimises charging and V2G discharge for the
-**Schmitz Cargobull S.KOe COOL** electric reefer trailer
-using 2025 SMARD DE/LU day-ahead electricity prices.
-
-| Scenario | Strategy |
-|---|---|
-| A — Dumb   | Full power on arrival, no price awareness |
-| B — Smart  | MILP shifts charge to cheapest slots |
-| C — MILP   | Full day-ahead optimal schedule + V2G |
-| D — MPC    | Receding-horizon real-time control |
-        """)
-    with col2:
-        st.markdown("""
-**Trailer specifications**
-
-| Parameter | Value |
-|---|---|
-| Battery total | 70 kWh |
-| Battery usable | 60 kWh (SoC 20–100%) |
-| Charging power | 22 kW AC bidirectional |
-| Standard | ISO 15118-20 |
-| Cold-chain floor | SoC ≥ 20% always |
-| Departure target | SoC = 100% |
-| Protocol | CCS2 + OCPP 2.1 |
-        """)
-    st.info("Set parameters in the sidebar and click **Run optimisation**.")
     st.stop()
 
-# ── Load CSV from repo ────────────────────────────────────────────────────────
-with st.spinner("Loading 2025 price data..."):
+with st.spinner("Loading 2025 SMARD price data..."):
     try:
-        if not Path(CSV_PATH).exists():
-            st.error(
-                f"CSV file '{CSV_PATH}' not found in the repo. "
-                "Make sure it is committed to GitHub."
-            )
-            st.stop()
-        df_prices = _load_csv_raw(CSV_PATH)
-        n_days    = len(df_prices) // 96
+        df_info = _load_csv_raw(CSV_PATH)
+        n_days  = len(df_info) // 96
         st.success(
-            f"2025 SMARD DE/LU prices loaded  |  "
-            f"{n_days} days  |  "
-            f"{df_prices.index[0].date()} → {df_prices.index[-1].date()}  |  "
-            f"Range: {df_prices['price'].min()*1000:.0f}–"
-            f"{df_prices['price'].max()*1000:.0f} EUR/MWh"
+            f"2025 SMARD DE/LU prices loaded  |  {n_days} days  |  "
+            f"{df_info.index[0].date()} → {df_info.index[-1].date()}  |  "
+            f"Price range: {df_info['price'].min()*1000:.0f}–"
+            f"{df_info['price'].max()*1000:.0f} EUR/MWh"
         )
     except Exception as e:
         st.error(f"Could not load CSV: {e}")
         st.stop()
 
 
-def load_profile(months, is_weekend):
-    mask    = df_prices["month"].isin(months) & (df_prices["is_weekend"] == is_weekend)
-    sub     = df_prices[mask]
-    if len(sub) == 0:
-        raise ValueError(f"No data for months={months}, weekend={is_weekend}")
-    profile = sub.groupby("slot")["price"].mean().values
-    if len(profile) != 96:
-        raise ValueError(f"Expected 96 slots, got {len(profile)}")
-    return _interpolate_to_15min(profile)
-
-
-v2g    = V2GParams()
-E_init = v2g.usable_capacity_kWh * soc_init_pct / 100.0
+# =============================================================================
+#  RUN AND DISPLAY
+# =============================================================================
 
 CONFIGS = []
-if do_wwd: CONFIGS.append(("Winter Weekday",            WINTER_M, False, False))
-if do_swd: CONFIGS.append(("Summer Weekday",            SUMMER_M, False, False))
-if do_wwe: CONFIGS.append(("Winter Weekend (48h Sat+Sun)", WINTER_M, True,  True))
-if do_swe: CONFIGS.append(("Summer Weekend (48h Sat+Sun)", SUMMER_M, True,  True))
+if do_wwd: CONFIGS.append(("Winter Weekday",               "winter_weekday"))
+if do_swd: CONFIGS.append(("Summer Weekday",               "summer_weekday"))
+if do_wwe: CONFIGS.append(("Winter Weekend (48h Sat+Sun)", "winter_weekend"))
+if do_swe: CONFIGS.append(("Summer Weekend (48h Sat+Sun)", "summer_weekend"))
 
 if not CONFIGS and not do_price:
     st.warning("Select at least one day type in the sidebar.")
     st.stop()
 
+v2g            = V2GParams()
 all_season_res = {}
 
-# ── Run each day type ─────────────────────────────────────────────────────────
-for (label, months, is_wknd, is_48h) in CONFIGS:
+for (label, season_key) in CONFIGS:
     st.subheader(label)
 
-    with st.spinner(f"Optimising {label}..."):
+    with st.spinner(f"Computing {label} — first run ~30s, cached after..."):
         try:
-            buy  = load_profile(months, is_wknd)
-            v2gp = buy.copy()
-
-            if is_48h:
-                buy48   = np.concatenate([buy, buy])
-                v2gp48  = buy48.copy()
-                W       = 192
-                hours_d = np.arange(W) * v2g.dt_h
-                plug_d  = np.ones(W)
-                buy_d   = buy48
-
-                Pc, Pd, soc = run_A_dumb(v2g, buy48, v2gp48, W, E_init)
-                results = [make_kpi("A - Dumb", v2g, Pc, Pd, soc,
-                                    buy48, v2gp48, E_init, is_weekend_48=True)]
-                if do_B:
-                    Pc, Pd, soc = run_B_smart(v2g, buy48, v2gp48, E_init)
-                    results.append(make_kpi("B - Smart (no V2G)", v2g, Pc, Pd,
-                                            soc, buy48, v2gp48, E_init,
-                                            is_weekend_48=True))
-                if do_C:
-                    Pc, Pd, soc = run_C_milp(v2g, buy48, v2gp48, E_init)
-                    results.append(make_kpi("C - MILP Day-Ahead", v2g, Pc, Pd,
-                                            soc, buy48, v2gp48, E_init,
-                                            is_weekend_48=True))
-                if do_D:
-                    with st.spinner(f"MPC: solving {W} sub-problems (~2 min)..."):
-                        Pc, Pd, soc = run_D_mpc(v2g, buy48, v2gp48, E_init)
-                    results.append(make_kpi("D - MPC (receding)", v2g, Pc, Pd,
-                                            soc, buy48, v2gp48, E_init,
-                                            is_weekend_48=True))
-
-                results_kpi = [{**r,
-                    "net_cost"   : r["net_cost"]    / 2,
-                    "charge_cost": r["charge_cost"] / 2,
-                    "v2g_rev"    : r["v2g_rev"]     / 2,
-                    "v2g_kwh"    : r["v2g_kwh"]     / 2,
-                } for r in results]
-                key = "winter_weekend" if "Winter" in label else "summer_weekend"
-                all_season_res[key] = results_kpi
-
-            else:
-                win, arr, dep, W = get_wd_window(v2g, arrival_h, departure_h)
-                buy_w  = buy[win]; v2gp_w = v2gp[win]
-                buy_d, plug_d, hours_d = build_wd_display(
-                    v2g, buy, arrival_h, departure_h
+            results, results_kpi, buy_d, plug_d, hours_d, is_wknd, is_48h = \
+                run_day_type_cached(
+                    season_key, arrival_h, departure_h, soc_init_pct,
+                    do_B, do_C, do_D
                 )
-
-                Pc, Pd, soc = run_A_dumb(v2g, buy_w, v2gp_w, W, E_init)
-                results = [make_kpi("A - Dumb", v2g, Pc, Pd, soc,
-                                    buy_w, v2gp_w, E_init, arr, dep)]
-                if do_B:
-                    Pc, Pd, soc = run_B_smart(v2g, buy_w, v2gp_w, E_init)
-                    results.append(make_kpi("B - Smart (no V2G)", v2g, Pc, Pd,
-                                            soc, buy_w, v2gp_w, E_init, arr, dep))
-                if do_C:
-                    Pc, Pd, soc = run_C_milp(v2g, buy_w, v2gp_w, E_init)
-                    results.append(make_kpi("C - MILP Day-Ahead", v2g, Pc, Pd,
-                                            soc, buy_w, v2gp_w, E_init, arr, dep))
-                if do_D:
-                    with st.spinner(f"MPC: solving {W} sub-problems (~2 min)..."):
-                        Pc, Pd, soc = run_D_mpc(v2g, buy_w, v2gp_w, E_init)
-                    results.append(make_kpi("D - MPC (receding)", v2g, Pc, Pd,
-                                            soc, buy_w, v2gp_w, E_init, arr, dep))
-
-                key = "winter_weekday" if "Winter" in label else "summer_weekday"
-                all_season_res[key] = results
-
+            all_season_res[season_key] = results_kpi
         except Exception as e:
-            st.error(f"Error in {label}: {e}")
+            st.error(f"Optimisation error in {label}: {e}")
             continue
 
-    # Chart
+    # ── Chart ─────────────────────────────────────────────────────────────────
     buf = BytesIO()
     plot_season_chart(
         v2g, label, buy_d, plug_d, hours_d,
@@ -229,7 +263,7 @@ for (label, months, is_wknd, is_48h) in CONFIGS:
     buf.seek(0)
     st.image(buf, use_container_width=True)
 
-    # Download
+    # ── Download chart ────────────────────────────────────────────────────────
     buf2 = BytesIO()
     plot_season_chart(
         v2g, label, buy_d, plug_d, hours_d,
@@ -237,14 +271,13 @@ for (label, months, is_wknd, is_48h) in CONFIGS:
         is_48h=is_48h, out=buf2
     )
     buf2.seek(0)
-    safe = label.lower().replace(" ","_").replace("(","").replace(")","")
     st.download_button(
         f"Download {label} chart (PNG)",
-        data=buf2, file_name=f"v2g_{safe}.png",
-        mime="image/png", key=f"dl_{label}"
+        data=buf2, file_name=f"v2g_{season_key}.png",
+        mime="image/png", key=f"dl_{season_key}"
     )
 
-    # KPI table
+    # ── KPI table ─────────────────────────────────────────────────────────────
     ref   = results[0]["net_cost"]
     table = []
     for r in results:
@@ -263,34 +296,36 @@ for (label, months, is_wknd, is_48h) in CONFIGS:
     )
     st.divider()
 
-# ── KPI multi-table ───────────────────────────────────────────────────────────
+# ── KPI multi-table ────────────────────────────────────────────────────────────
 if len(all_season_res) > 1:
     st.subheader("KPI Comparison — All Day Types")
-    with st.spinner("Building KPI comparison table..."):
+    try:
         buf = BytesIO()
         plot_kpi_multi(
             all_season_res, v2g, arrival_h, departure_h,
             run_mpc=do_D, out=buf
         )
         buf.seek(0)
-    st.image(buf, use_container_width=True)
-    buf2 = BytesIO()
-    plot_kpi_multi(
-        all_season_res, v2g, arrival_h, departure_h,
-        run_mpc=do_D, out=buf2
-    )
-    buf2.seek(0)
-    st.download_button(
-        "Download KPI comparison (PNG)",
-        data=buf2, file_name="v2g_KPI_multi.png",
-        mime="image/png", key="dl_kpi"
-    )
+        st.image(buf, use_container_width=True)
+        buf2 = BytesIO()
+        plot_kpi_multi(
+            all_season_res, v2g, arrival_h, departure_h,
+            run_mpc=do_D, out=buf2
+        )
+        buf2.seek(0)
+        st.download_button(
+            "Download KPI comparison (PNG)",
+            data=buf2, file_name="v2g_KPI_multi.png",
+            mime="image/png", key="dl_kpi"
+        )
+    except Exception as e:
+        st.error(f"KPI comparison error: {e}")
     st.divider()
 
-# ── Price profile analysis ────────────────────────────────────────────────────
+# ── Price analysis ─────────────────────────────────────────────────────────────
 if do_price:
     st.subheader("Electricity Price Analysis")
-    with st.spinner("Building price profile charts..."):
+    with st.spinner("Building price charts..."):
         try:
             buf = BytesIO()
             plot_price_profiles(CSV_PATH, buf)
