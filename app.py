@@ -3,83 +3,19 @@ import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
-from io import BytesIO, StringIO
+from io import BytesIO
+from pathlib import Path
 
-# Import everything from your v5 script
 from v2g_single_day4 import (
     V2GParams, WINTER_M, SUMMER_M, SC_COL, SC_FILL,
-    _interpolate_to_15min,
+    _interpolate_to_15min, _load_csv_raw,
     get_wd_window, build_wd_display, to_display_wd, soc_ramp,
     run_A_dumb, run_B_smart, run_C_milp, run_D_mpc,
     make_kpi, plot_season_chart, plot_kpi_multi,
     plot_price_profiles
 )
 
-# ─────────────────────────────────────────────────────────────
-#  CSV loader (reads from uploaded bytes, not file path)
-# ─────────────────────────────────────────────────────────────
-
-@st.cache_data(show_spinner=False)
-def load_csv_bytes(file_bytes: bytes) -> pd.DataFrame:
-    content = file_bytes.decode("utf-8-sig", errors="replace")
-    df = None
-    for sep in (";", ","):
-        try:
-            df = pd.read_csv(StringIO(content), sep=sep)
-            if len(df.columns) > 1:
-                break
-        except Exception:
-            continue
-    if df is None or df.empty:
-        raise ValueError("Could not parse CSV.")
-    pc = next((c for c in df.columns if "Germany" in c and "MWh" in c), None)
-    if not pc:
-        raise ValueError(
-            f"Germany/Luxembourg price column not found.\n"
-            f"Columns found: {list(df.columns)}"
-        )
-    df = df[["Start date", pc]].copy()
-    df.columns = ["dt_str", "price_eur_mwh"]
-    df["dt"] = pd.to_datetime(
-        df["dt_str"], format="%b %d, %Y %I:%M %p", errors="coerce"
-    )
-    df = df.dropna(subset=["dt", "price_eur_mwh"])
-    df["price"] = pd.to_numeric(df["price_eur_mwh"], errors="coerce") / 1000.0
-    df = df.dropna(subset=["price"]).set_index("dt").sort_index()
-    df["slot"]       = df.index.hour * 4 + df.index.minute // 15
-    df["is_weekend"] = df.index.dayofweek >= 5
-    df["month"]      = df.index.month
-    df["date"]       = df.index.date
-    return df
-
-
-def load_profile_from_df(df: pd.DataFrame, months: list,
-                          is_weekend: bool) -> np.ndarray:
-    mask    = df["month"].isin(months) & (df["is_weekend"] == is_weekend)
-    sub     = df[mask]
-    if len(sub) == 0:
-        raise ValueError(f"No data for months={months}, weekend={is_weekend}")
-    profile = sub.groupby("slot")["price"].mean().values
-    if len(profile) != 96:
-        raise ValueError(f"Expected 96 slots, got {len(profile)}")
-    return _interpolate_to_15min(profile)
-
-
-def chart_to_buf(v2g, label, buy_d, plug_d, hours_d,
-                 results, arrival_h, departure_h, is_48h) -> BytesIO:
-    buf = BytesIO()
-    plot_season_chart(
-        v2g, label, buy_d, plug_d, hours_d,
-        results, is_48h, arrival_h, departure_h,
-        is_48h=is_48h, out=buf
-    )
-    buf.seek(0)
-    return buf
-
-
-# ─────────────────────────────────────────────────────────────
-#  STREAMLIT UI
-# ─────────────────────────────────────────────────────────────
+CSV_PATH = "2025_Electricity_Price.csv"
 
 st.set_page_config(
     page_title="S.KOe COOL — V2G Optimisation",
@@ -93,25 +29,14 @@ st.caption(
     "Master's Thesis 2026  |  Kuldip Bhadreshvara"
 )
 
-# ── Sidebar ────────────────────────────────────────────────────
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Configuration")
 
-    uploaded = st.file_uploader(
-        "SMARD price CSV  (DE/LU 15-min day-ahead)",
-        type=["csv"],
-        help=(
-            "Download from smard.de → Market data → "
-            "Day-ahead prices → Germany/Luxembourg → "
-            "Quarterly (15-min) resolution"
-        )
-    )
-
-    st.divider()
     st.subheader("Weekday schedule")
-    arrival_h    = st.slider("Arrival hour",     10, 23, 16, 1)
-    departure_h  = st.slider("Departure hour",    1,  9,  6, 1)
-    soc_init_pct = st.slider("Arrival SoC (%)",  20, 90, 45, 5)
+    arrival_h    = st.slider("Arrival hour",    10, 23, 16, 1)
+    departure_h  = st.slider("Departure hour",   1,  9,  6, 1)
+    soc_init_pct = st.slider("Arrival SoC (%)", 20, 90, 45, 5)
 
     st.divider()
     st.subheader("Scenarios")
@@ -122,93 +47,108 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Day types")
-    do_wwd = st.checkbox("Winter weekday",           True)
-    do_swd = st.checkbox("Summer weekday",           True)
-    do_wwe = st.checkbox("Winter weekend (48h)",     False)
-    do_swe = st.checkbox("Summer weekend (48h)",     False)
-    do_price = st.checkbox("Price profile analysis", False)
+    do_wwd   = st.checkbox("Winter weekday",           True)
+    do_swd   = st.checkbox("Summer weekday",           True)
+    do_wwe   = st.checkbox("Winter weekend (48h)",     False)
+    do_swe   = st.checkbox("Summer weekend (48h)",     False)
+    do_price = st.checkbox("Price profile analysis",   False)
 
     st.divider()
     run_btn = st.button(
         "Run optimisation", type="primary", use_container_width=True
     )
 
-# ── Landing page when no CSV ────────────────────────────────────
-if not uploaded:
+# ── About section before run ──────────────────────────────────────────────────
+if not run_btn:
     col1, col2 = st.columns(2)
     with col1:
-        st.info("Upload a SMARD CSV file in the sidebar to begin.")
-        st.markdown("""
-**How to download the price CSV:**
-1. Go to [smard.de/en/marktdaten](https://www.smard.de/en/marktdaten)
-2. Select **Wholesale prices → Day-ahead prices**
-3. Region: **Germany/Luxembourg**
-4. Resolution: **Quarterly (15 min)**
-5. Year: **2025** → Download CSV
-        """)
-    with col2:
         st.markdown("""
 **About this tool**
 
 Optimises charging and V2G discharge for the
-**Schmitz Cargobull S.KOe COOL** electric reefer trailer.
+**Schmitz Cargobull S.KOe COOL** electric reefer trailer
+using 2025 SMARD DE/LU day-ahead electricity prices.
 
 | Scenario | Strategy |
 |---|---|
 | A — Dumb   | Full power on arrival, no price awareness |
-| B — Smart  | MILP shifts charge to cheap price slots |
+| B — Smart  | MILP shifts charge to cheapest slots |
 | C — MILP   | Full day-ahead optimal schedule + V2G |
 | D — MPC    | Receding-horizon real-time control |
-
-**Battery:** 70 kWh total / 60 kWh usable  
-**Charging:** 22 kW AC bidirectional (ISO 15118)  
-**Cold-chain floor:** SoC ≥ 20% always  
-**Departure target:** SoC = 100%
         """)
+    with col2:
+        st.markdown("""
+**Trailer specifications**
+
+| Parameter | Value |
+|---|---|
+| Battery total | 70 kWh |
+| Battery usable | 60 kWh (SoC 20–100%) |
+| Charging power | 22 kW AC bidirectional |
+| Standard | ISO 15118-20 |
+| Cold-chain floor | SoC ≥ 20% always |
+| Departure target | SoC = 100% |
+| Protocol | CCS2 + OCPP 2.1 |
+        """)
+    st.info("Set parameters in the sidebar and click **Run optimisation**.")
     st.stop()
 
-if not run_btn:
-    st.info("Set parameters in the sidebar then click **Run optimisation**.")
-    st.stop()
-
-# ── Load CSV ────────────────────────────────────────────────────
-with st.spinner("Reading price data..."):
+# ── Load CSV from repo ────────────────────────────────────────────────────────
+with st.spinner("Loading 2025 price data..."):
     try:
-        df_prices = load_csv_bytes(uploaded.read())
+        if not Path(CSV_PATH).exists():
+            st.error(
+                f"CSV file '{CSV_PATH}' not found in the repo. "
+                "Make sure it is committed to GitHub."
+            )
+            st.stop()
+        df_prices = _load_csv_raw(CSV_PATH)
         n_days    = len(df_prices) // 96
         st.success(
-            f"Loaded {len(df_prices):,} price slots  |  "
+            f"2025 SMARD DE/LU prices loaded  |  "
             f"{n_days} days  |  "
             f"{df_prices.index[0].date()} → {df_prices.index[-1].date()}  |  "
             f"Range: {df_prices['price'].min()*1000:.0f}–"
             f"{df_prices['price'].max()*1000:.0f} EUR/MWh"
         )
     except Exception as e:
-        st.error(f"Could not read CSV: {e}")
+        st.error(f"Could not load CSV: {e}")
         st.stop()
+
+
+def load_profile(months, is_weekend):
+    mask    = df_prices["month"].isin(months) & (df_prices["is_weekend"] == is_weekend)
+    sub     = df_prices[mask]
+    if len(sub) == 0:
+        raise ValueError(f"No data for months={months}, weekend={is_weekend}")
+    profile = sub.groupby("slot")["price"].mean().values
+    if len(profile) != 96:
+        raise ValueError(f"Expected 96 slots, got {len(profile)}")
+    return _interpolate_to_15min(profile)
+
 
 v2g    = V2GParams()
 E_init = v2g.usable_capacity_kWh * soc_init_pct / 100.0
 
 CONFIGS = []
-if do_wwd: CONFIGS.append(("Winter Weekday", WINTER_M, False, False))
-if do_swd: CONFIGS.append(("Summer Weekday", SUMMER_M, False, False))
-if do_wwe: CONFIGS.append(("Winter Weekend (48h Sat+Sun)", WINTER_M, True, True))
-if do_swe: CONFIGS.append(("Summer Weekend (48h Sat+Sun)", SUMMER_M, True, True))
+if do_wwd: CONFIGS.append(("Winter Weekday",            WINTER_M, False, False))
+if do_swd: CONFIGS.append(("Summer Weekday",            SUMMER_M, False, False))
+if do_wwe: CONFIGS.append(("Winter Weekend (48h Sat+Sun)", WINTER_M, True,  True))
+if do_swe: CONFIGS.append(("Summer Weekend (48h Sat+Sun)", SUMMER_M, True,  True))
 
 if not CONFIGS and not do_price:
-    st.warning("Select at least one day type or price analysis in the sidebar.")
+    st.warning("Select at least one day type in the sidebar.")
     st.stop()
 
 all_season_res = {}
 
-# ── Run each day type ────────────────────────────────────────────
+# ── Run each day type ─────────────────────────────────────────────────────────
 for (label, months, is_wknd, is_48h) in CONFIGS:
     st.subheader(label)
 
     with st.spinner(f"Optimising {label}..."):
         try:
-            buy  = load_profile_from_df(df_prices, months, is_wknd)
+            buy  = load_profile(months, is_wknd)
             v2gp = buy.copy()
 
             if is_48h:
@@ -217,38 +157,36 @@ for (label, months, is_wknd, is_48h) in CONFIGS:
                 W       = 192
                 hours_d = np.arange(W) * v2g.dt_h
                 plug_d  = np.ones(W)
+                buy_d   = buy48
 
-                Pc,Pd,soc = run_A_dumb(v2g, buy48, v2gp48, W, E_init)
+                Pc, Pd, soc = run_A_dumb(v2g, buy48, v2gp48, W, E_init)
                 results = [make_kpi("A - Dumb", v2g, Pc, Pd, soc,
                                     buy48, v2gp48, E_init, is_weekend_48=True)]
                 if do_B:
-                    Pc,Pd,soc = run_B_smart(v2g, buy48, v2gp48, E_init)
+                    Pc, Pd, soc = run_B_smart(v2g, buy48, v2gp48, E_init)
                     results.append(make_kpi("B - Smart (no V2G)", v2g, Pc, Pd,
-                                           soc, buy48, v2gp48, E_init,
-                                           is_weekend_48=True))
+                                            soc, buy48, v2gp48, E_init,
+                                            is_weekend_48=True))
                 if do_C:
-                    Pc,Pd,soc = run_C_milp(v2g, buy48, v2gp48, E_init)
+                    Pc, Pd, soc = run_C_milp(v2g, buy48, v2gp48, E_init)
                     results.append(make_kpi("C - MILP Day-Ahead", v2g, Pc, Pd,
-                                           soc, buy48, v2gp48, E_init,
-                                           is_weekend_48=True))
+                                            soc, buy48, v2gp48, E_init,
+                                            is_weekend_48=True))
                 if do_D:
-                    with st.spinner(f"MPC: solving {W} sub-problems..."):
-                        Pc,Pd,soc = run_D_mpc(v2g, buy48, v2gp48, E_init)
+                    with st.spinner(f"MPC: solving {W} sub-problems (~2 min)..."):
+                        Pc, Pd, soc = run_D_mpc(v2g, buy48, v2gp48, E_init)
                     results.append(make_kpi("D - MPC (receding)", v2g, Pc, Pd,
-                                           soc, buy48, v2gp48, E_init,
-                                           is_weekend_48=True))
-                buy_d = buy48
-                # KPI per-day equivalent
+                                            soc, buy48, v2gp48, E_init,
+                                            is_weekend_48=True))
+
                 results_kpi = [{**r,
                     "net_cost"   : r["net_cost"]    / 2,
                     "charge_cost": r["charge_cost"] / 2,
                     "v2g_rev"    : r["v2g_rev"]     / 2,
                     "v2g_kwh"    : r["v2g_kwh"]     / 2,
                 } for r in results]
-                all_season_res[
-                    "winter_weekend" if "Winter" in label
-                    else "summer_weekend"
-                ] = results_kpi
+                key = "winter_weekend" if "Winter" in label else "summer_weekend"
+                all_season_res[key] = results_kpi
 
             else:
                 win, arr, dep, W = get_wd_window(v2g, arrival_h, departure_h)
@@ -257,27 +195,25 @@ for (label, months, is_wknd, is_48h) in CONFIGS:
                     v2g, buy, arrival_h, departure_h
                 )
 
-                Pc,Pd,soc = run_A_dumb(v2g, buy_w, v2gp_w, W, E_init)
+                Pc, Pd, soc = run_A_dumb(v2g, buy_w, v2gp_w, W, E_init)
                 results = [make_kpi("A - Dumb", v2g, Pc, Pd, soc,
                                     buy_w, v2gp_w, E_init, arr, dep)]
                 if do_B:
-                    Pc,Pd,soc = run_B_smart(v2g, buy_w, v2gp_w, E_init)
+                    Pc, Pd, soc = run_B_smart(v2g, buy_w, v2gp_w, E_init)
                     results.append(make_kpi("B - Smart (no V2G)", v2g, Pc, Pd,
-                                           soc, buy_w, v2gp_w, E_init, arr, dep))
+                                            soc, buy_w, v2gp_w, E_init, arr, dep))
                 if do_C:
-                    Pc,Pd,soc = run_C_milp(v2g, buy_w, v2gp_w, E_init)
+                    Pc, Pd, soc = run_C_milp(v2g, buy_w, v2gp_w, E_init)
                     results.append(make_kpi("C - MILP Day-Ahead", v2g, Pc, Pd,
-                                           soc, buy_w, v2gp_w, E_init, arr, dep))
+                                            soc, buy_w, v2gp_w, E_init, arr, dep))
                 if do_D:
-                    with st.spinner(f"MPC: solving {W} sub-problems..."):
-                        Pc,Pd,soc = run_D_mpc(v2g, buy_w, v2gp_w, E_init)
+                    with st.spinner(f"MPC: solving {W} sub-problems (~2 min)..."):
+                        Pc, Pd, soc = run_D_mpc(v2g, buy_w, v2gp_w, E_init)
                     results.append(make_kpi("D - MPC (receding)", v2g, Pc, Pd,
-                                           soc, buy_w, v2gp_w, E_init, arr, dep))
+                                            soc, buy_w, v2gp_w, E_init, arr, dep))
 
-                all_season_res[
-                    "winter_weekday" if "Winter" in label
-                    else "summer_weekday"
-                ] = results
+                key = "winter_weekday" if "Winter" in label else "summer_weekday"
+                all_season_res[key] = results
 
         except Exception as e:
             st.error(f"Error in {label}: {e}")
@@ -293,7 +229,7 @@ for (label, months, is_wknd, is_48h) in CONFIGS:
     buf.seek(0)
     st.image(buf, use_container_width=True)
 
-    # Download button
+    # Download
     buf2 = BytesIO()
     plot_season_chart(
         v2g, label, buy_d, plug_d, hours_d,
@@ -301,13 +237,11 @@ for (label, months, is_wknd, is_48h) in CONFIGS:
         is_48h=is_48h, out=buf2
     )
     buf2.seek(0)
-    safe = label.lower().replace(" ", "_").replace("(","").replace(")","")
+    safe = label.lower().replace(" ","_").replace("(","").replace(")","")
     st.download_button(
         f"Download {label} chart (PNG)",
-        data=buf2,
-        file_name=f"v2g_{safe}.png",
-        mime="image/png",
-        key=f"dl_{label}"
+        data=buf2, file_name=f"v2g_{safe}.png",
+        mime="image/png", key=f"dl_{label}"
     )
 
     # KPI table
@@ -324,13 +258,15 @@ for (label, months, is_wknd, is_48h) in CONFIGS:
             "Daily savings vs Dumb" : "—" if sav == 0 else f"EUR {sav:+.4f}",
             "Annual savings (x365)" : "—" if sav == 0 else f"EUR {sav*365:+,.0f}",
         })
-    st.dataframe(pd.DataFrame(table), use_container_width=True, hide_index=True)
+    st.dataframe(
+        pd.DataFrame(table), use_container_width=True, hide_index=True
+    )
     st.divider()
 
-# ── KPI multi-table ──────────────────────────────────────────────
+# ── KPI multi-table ───────────────────────────────────────────────────────────
 if len(all_season_res) > 1:
     st.subheader("KPI Comparison — All Day Types")
-    with st.spinner("Building KPI table..."):
+    with st.spinner("Building KPI comparison table..."):
         buf = BytesIO()
         plot_kpi_multi(
             all_season_res, v2g, arrival_h, departure_h,
@@ -338,39 +274,41 @@ if len(all_season_res) > 1:
         )
         buf.seek(0)
     st.image(buf, use_container_width=True)
+    buf2 = BytesIO()
+    plot_kpi_multi(
+        all_season_res, v2g, arrival_h, departure_h,
+        run_mpc=do_D, out=buf2
+    )
+    buf2.seek(0)
     st.download_button(
         "Download KPI comparison (PNG)",
-        data=buf, file_name="v2g_KPI_multi.png",
+        data=buf2, file_name="v2g_KPI_multi.png",
         mime="image/png", key="dl_kpi"
     )
     st.divider()
 
-# ── Price profile analysis ────────────────────────────────────────
+# ── Price profile analysis ────────────────────────────────────────────────────
 if do_price:
     st.subheader("Electricity Price Analysis")
     with st.spinner("Building price profile charts..."):
-        import tempfile, os
-        with tempfile.NamedTemporaryFile(
-            delete=False, suffix=".csv", mode="wb"
-        ) as tmp:
-            uploaded.seek(0)
-            tmp.write(uploaded.read())
-            tmp_path = tmp.name
         try:
             buf = BytesIO()
-            plot_price_profiles(tmp_path, buf)
+            plot_price_profiles(CSV_PATH, buf)
             buf.seek(0)
             st.image(buf, use_container_width=True)
+            buf2 = BytesIO()
+            plot_price_profiles(CSV_PATH, buf2)
+            buf2.seek(0)
             st.download_button(
                 "Download price analysis (PNG)",
-                data=buf, file_name="v2g_price_profiles.png",
+                data=buf2, file_name="v2g_price_profiles.png",
                 mime="image/png", key="dl_price"
             )
-        finally:
-            os.unlink(tmp_path)
+        except Exception as e:
+            st.error(f"Price analysis error: {e}")
 
 st.caption(
-    "S.KOe COOL V2G Optimisation · "
-    "TU Dortmund IE³ × Schmitz Cargobull AG · "
-    "Thesis 2026 · Confidential"
+    "S.KOe COOL V2G Optimisation  ·  "
+    "TU Dortmund IE³ × Schmitz Cargobull AG  ·  "
+    "Thesis 2026  ·  Confidential"
 )
