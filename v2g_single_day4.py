@@ -20,19 +20,6 @@ import matplotlib.patches as mpatches
 from io import BytesIO
 from pathlib import Path
 
-from v2g_single_day4 import (
-    V2GParams, WINTER_M, SUMMER_M, SC_COL, SC_FILL,
-    GERMAN_TARIFF, FIXED_PRICE_EUR_KWH,
-    _interpolate_to_15min, _load_csv_raw,
-    get_tru_15min_trace, tru_avg_kw,
-    compose_all_in_price, compute_reefer_costs,
-    yearly_extrapolation,
-    get_wd_window, build_wd_display,
-    run_A_dumb, run_B_smart, run_C_milp, run_D_mpc,
-    make_kpi, plot_kpi_multi, plot_price_profiles,
-    soc_ramp,
-)
-
 CSV_PATH = "2025_Electricity_Price.csv"
 
 st.set_page_config(
