@@ -16,10 +16,10 @@ from pathlib import Path
 
 from v2g_single_day4 import (
     V2GParams, WINTER_M, SUMMER_M, SC_COL, SC_FILL,
-    GERMAN_TARIFF, FIXED_PRICE_EUR_KWH,
+    FIXED_PRICE_EUR_KWH,
     _interpolate_to_15min, _load_csv_raw,
     get_tru_15min_trace, tru_avg_kw,
-    compose_all_in_price, compute_reefer_costs,
+    compute_reefer_costs,
     yearly_extrapolation,
     get_wd_window, build_wd_display,
     run_A_dumb, run_B_smart, run_C_milp, run_D_mpc,
@@ -56,18 +56,11 @@ def fmt_hhmm(h: float) -> str:
 
 # =============================================================================
 #  CHART — season overview (3-panel: price | power | SoC)
-#  Built directly in app.py so no dependency on plot_season_chart
 # =============================================================================
 
 def plot_season_chart_inline(v2g, label, buy_d, plug_d, hours_d,
                               results, arrival_h, departure_h,
                               is_48h, tru_d=None, tru_cycle="OFF"):
-    """
-    3-panel season chart returned as BytesIO PNG.
-    Panel 1 : Day-ahead price + plugged-in shading
-    Panel 2 : Charge / discharge power (fill + line, all scenarios)
-    Panel 3 : Battery SoC % (gradual ramp, all scenarios)
-    """
     if is_48h:
         pos  = np.arange(0, 49, 4)
         xlbl = [f"{'Sat' if h < 24 else 'Sun'}\n{int(h % 24):02d}:00" for h in pos]
@@ -116,7 +109,7 @@ def plot_season_chart_inline(v2g, label, buy_d, plug_d, hours_d,
                   loc="upper center", bbox_to_anchor=(0.5, -0.40),
                   framealpha=0.95, edgecolor="#CCCCCC")
 
-    # ── Panel 1: Price ────────────────────────────────────────────────────────
+    # Panel 1: Price
     for t in range(len(hours_d)):
         if plug_d[t] > 0.5:
             ax0.axvspan(hours_d[t], hours_d[t] + 0.25,
@@ -139,9 +132,9 @@ def plot_season_chart_inline(v2g, label, buy_d, plug_d, hours_d,
             Line2D([0],[0], color="#555555", ls="--", lw=1.3, label="Midnight"),
         ]
     _leg_below(ax0, leg0, ncol=5)
-    _fmt(ax0, "EUR / MWh", "(1) Day-Ahead Electricity Price + Plugged-In Availability")
+    _fmt(ax0, "EUR / MWh", "(1) Day-Ahead Electricity Price (SMARD spot) + Plugged-In Availability")
 
-    # ── Panel 2: Power ────────────────────────────────────────────────────────
+    # Panel 2: Power
     leg1 = []
     for key, r in zip(["A", "B", "C", "D"], results):
         col  = SC_COL[key]; fill = SC_FILL[key]
@@ -159,7 +152,7 @@ def plot_season_chart_inline(v2g, label, buy_d, plug_d, hours_d,
     if tru_d is not None and np.any(tru_d > 0.01):
         ht, = ax1.step(hours_d, -tru_d, where="post",
                        color="#C62828", lw=1.4, ls=":", alpha=0.80, zorder=4,
-                       label=f"TRU load (shown -)")
+                       label="TRU load (shown -)")
         leg1.append(ht)
     ax1.axhline(0, color="black", lw=0.7)
     _vlines(ax1)
@@ -167,7 +160,7 @@ def plot_season_chart_inline(v2g, label, buy_d, plug_d, hours_d,
     _fmt(ax1, "Power (kW)",
          "(2) Charge / Discharge Power  [solid=charge | dashed below 0=V2G | dotted=TRU]")
 
-    # ── Panel 3: SoC ──────────────────────────────────────────────────────────
+    # Panel 3: SoC
     for t in range(len(hours_d)):
         if plug_d[t] > 0.5:
             ax2.axvspan(hours_d[t], hours_d[t] + 0.25,
@@ -230,7 +223,7 @@ def load_profile_cached(months: tuple, is_weekend: bool) -> np.ndarray:
 @st.cache_data(show_spinner=False)
 def run_scenarios_cached(season_key, arrival_h, departure_h, soc_pct,
                           soc_departure_pct, tru_cycle,
-                          do_B, do_C, do_D, use_allin):
+                          do_B, do_C, do_D):
     months_map = {
         "winter_weekday": (WINTER_M, False, False),
         "summer_weekday": (SUMMER_M, False, False),
@@ -239,9 +232,9 @@ def run_scenarios_cached(season_key, arrival_h, departure_h, soc_pct,
     }
     months, is_wknd, is_48h = months_map[season_key]
 
-    buy_spot = load_profile_cached(tuple(months), is_wknd)
-    buy      = compose_all_in_price(buy_spot) if use_allin else buy_spot
-    v2gp     = buy_spot.copy()
+    # Use raw SMARD spot price directly — no tariff composition
+    buy  = load_profile_cached(tuple(months), is_wknd)
+    v2gp = buy.copy()
 
     v2g    = V2GParams(soc_departure_pct=soc_departure_pct)
     E_init = v2g.usable_capacity_kWh * soc_pct / 100.0
@@ -281,12 +274,12 @@ def run_scenarios_cached(season_key, arrival_h, departure_h, soc_pct,
             "charge_kwh":  r["charge_kwh"]  / 2,
         } for r in results]
 
-        rc = compute_reefer_costs(tru_w[:96], buy_spot[:96], v2g.dt_h)
+        rc = compute_reefer_costs(tru_w[:96], buy[:96], v2g.dt_h)
         return results, results_kpi, buy_d, plug_d, hours_d, is_wknd, is_48h, tru_w, rc
 
     else:
         win, arr, dep, W = get_wd_window(v2g, arrival_h, departure_h)
-        buy_w  = buy[win]; v2gp_w = v2gp[win]; spot_w = buy_spot[win]
+        buy_w  = buy[win]; v2gp_w = v2gp[win]
         tru_w  = get_tru_15min_trace(tru_cycle, W, v2g.dt_h)
         buy_d, plug_d, hours_d = build_wd_display(v2g, buy, arrival_h, departure_h)
         tru_d = np.zeros(v2g.n_slots); tru_d[arr:dep] = tru_w[:dep - arr]
@@ -306,7 +299,7 @@ def run_scenarios_cached(season_key, arrival_h, departure_h, soc_pct,
             results.append(make_kpi("D - MPC (receding)",v2g,Pc,Pd,soc,
                                     buy_w,v2gp_w,E_init,arr,dep,tru_w=tru_w))
 
-        rc = compute_reefer_costs(tru_w, spot_w, v2g.dt_h)
+        rc = compute_reefer_costs(tru_w, buy_w, v2g.dt_h)
         return results, results, buy_d, plug_d, hours_d, is_wknd, is_48h, tru_d, rc
 
 
@@ -351,7 +344,6 @@ DEFAULTS = {
     "do_wwe":        False,
     "do_swe":        False,
     "do_price":      False,
-    "use_allin":     False,
     "fixed_price":   FIXED_PRICE_EUR_KWH,
     "wd_per_month":  22.0,
 }
@@ -386,7 +378,7 @@ def render_input_panel():
     with st.form("input_form", clear_on_submit=False):
         c1, c2, c3, c4 = st.columns([1.1, 1.1, 1.0, 0.9])
 
-        # ── Column 1: Schedule + season + price ───────────────────────────────
+        # Column 1: Schedule + season + price benchmark
         with c1:
             st.subheader("Weekday Schedule")
             cfg["arrival_str"]   = st.text_input(
@@ -401,25 +393,21 @@ def render_input_panel():
                 "Winter months (Oct-Mar)", 1, 11, int(cfg["winter_months"]))
             st.caption(f"Summer months auto: **{12 - int(cfg['winter_months'])}**")
 
-            st.markdown("##### Price Basis")
-            cfg["use_allin"] = st.checkbox(
-                "Use all-in German tariff",
-                value=bool(cfg["use_allin"]),
-                help=(
-                    "Adds Netzentgelt 6.63 ct + concession 1.99 ct + "
-                    "offshore 0.82 ct + CHP 0.28 ct + electricity tax 2.05 ct "
-                    "+ NEV19 1.56 ct + 19% VAT to SMARD spot. "
-                    "V2G revenue stays at spot."
-                )
-            )
+            st.markdown("##### Fixed-Tariff Benchmark")
             cfg["fixed_price"] = st.number_input(
-                "Fixed-tariff benchmark (EUR/kWh)",
+                "Fixed-tariff price (EUR/kWh)",
                 value=float(cfg["fixed_price"]),
                 min_value=0.05, max_value=1.0, step=0.01,
-                help="Flat electricity rate used as cost benchmark"
+                help=(
+                    "Flat electricity rate used as cost comparison baseline. "
+                    "All optimisation uses raw SMARD spot prices from the CSV."
+                )
+            )
+            st.caption(
+                "Optimisation uses **raw SMARD spot prices** from CSV directly."
             )
 
-        # ── Column 2: SoC ─────────────────────────────────────────────────────
+        # Column 2: SoC
         with c2:
             st.subheader("State of Charge")
             cfg["soc_winter"]    = st.slider(
@@ -448,7 +436,7 @@ def render_input_panel():
                 "D -- MPC receding horizon",   bool(cfg["do_D"]),
                 help="~2 min first run -- cached after that")
 
-        # ── Column 3: TRU ─────────────────────────────────────────────────────
+        # Column 3: TRU
         with c3:
             st.subheader("Reefer (TRU) at Depot")
             cycle_choice = st.radio(
@@ -471,7 +459,7 @@ def render_input_panel():
                     f"**{max(0, 22 - avg_kw):.1f} -- 22 kW**"
                 )
 
-        # ── Column 4: Day types + submit ──────────────────────────────────────
+        # Column 4: Day types + submit
         with c4:
             st.subheader("Analysis")
             cfg["do_wwd"]   = st.checkbox(
@@ -534,21 +522,20 @@ st.caption(
 )
 
 cfg = st.session_state.cfg
-arr_h     = parse_hhmm(cfg["arrival_str"],   16.0)
-dep_h     = parse_hhmm(cfg["departure_str"],  6.0)
-soc_w     = int(cfg["soc_winter"])
-soc_s     = int(cfg["soc_summer"])
-soc_dep   = int(cfg["soc_departure"])
-tru_cycle = cfg["tru_cycle"]
-w_months  = int(cfg["winter_months"])
-s_months  = 12 - w_months
-use_allin = bool(cfg["use_allin"])
-do_B      = bool(cfg["do_B"])
-do_C      = bool(cfg["do_C"])
-do_D      = bool(cfg["do_D"])
+arr_h       = parse_hhmm(cfg["arrival_str"],   16.0)
+dep_h       = parse_hhmm(cfg["departure_str"],  6.0)
+soc_w       = int(cfg["soc_winter"])
+soc_s       = int(cfg["soc_summer"])
+soc_dep     = int(cfg["soc_departure"])
+tru_cycle   = cfg["tru_cycle"]
+w_months    = int(cfg["winter_months"])
+s_months    = 12 - w_months
+do_B        = bool(cfg["do_B"])
+do_C        = bool(cfg["do_C"])
+do_D        = bool(cfg["do_D"])
 fixed_price = float(cfg["fixed_price"])
 
-# ── Sidebar quick-edit ────────────────────────────────────────────────────────
+# Sidebar quick-edit
 with st.sidebar:
     st.header("Quick Edit")
     st.caption("Changes take effect immediately")
@@ -560,15 +547,13 @@ with st.sidebar:
     cfg["winter_months"] = st.slider("Winter months",  1, 11, w_months)
     cfg["tru_cycle"]     = st.radio(
         "TRU cycle", ["Continuous", "Start-Stop", "OFF"],
-        index=["Continuous","Start-Stop","OFF"].index(tru_cycle))
-    cfg["use_allin"]     = st.checkbox("All-in tariff price", use_allin)
+        index=["Continuous", "Start-Stop", "OFF"].index(tru_cycle))
     st.divider()
     if st.button("Back to Input", use_container_width=True):
         st.session_state.show_output = False
         st.rerun()
 
     st.session_state.cfg = cfg
-    # Refresh local vars after sidebar edits
     arr_h     = parse_hhmm(cfg["arrival_str"],   16.0)
     dep_h     = parse_hhmm(cfg["departure_str"],  6.0)
     soc_w     = int(cfg["soc_winter"])
@@ -577,9 +562,8 @@ with st.sidebar:
     tru_cycle = cfg["tru_cycle"]
     w_months  = int(cfg["winter_months"])
     s_months  = 12 - w_months
-    use_allin = bool(cfg["use_allin"])
 
-# ── Verify CSV ────────────────────────────────────────────────────────────────
+# Verify CSV
 if not Path(CSV_PATH).exists():
     st.error(f"'{CSV_PATH}' not found -- commit it to the GitHub repo.")
     st.stop()
@@ -589,11 +573,10 @@ with st.spinner("Loading 2025 SMARD price data..."):
         df_info = _load_csv_raw(CSV_PATH)
         n_days  = len(df_info) // 96
         st.success(
-            f"2025 DE/LU prices loaded  |  {n_days} days  |  "
+            f"2025 SMARD DE/LU spot prices loaded  |  {n_days} days  |  "
             f"{df_info.index[0].date()} to {df_info.index[-1].date()}  |  "
-            f"Spot: {df_info['price'].min()*1000:.0f}-"
-            f"{df_info['price'].max()*1000:.0f} EUR/MWh  |  "
-            f"Price basis: {'all-in tariff+VAT' if use_allin else 'SMARD spot'}"
+            f"Range: {df_info['price'].min()*1000:.0f} -- "
+            f"{df_info['price'].max()*1000:.0f} EUR/MWh"
         )
     except Exception as e:
         st.error(f"Could not load CSV: {e}"); st.stop()
@@ -601,7 +584,7 @@ with st.spinner("Loading 2025 SMARD price data..."):
 v2g     = V2GParams(soc_departure_pct=float(soc_dep))
 tru_avg = tru_avg_kw(tru_cycle)
 
-# ── Summary banner ────────────────────────────────────────────────────────────
+# Summary banner
 m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("Arrival / Departure",  f"{fmt_hhmm(arr_h)} / {fmt_hhmm(dep_h)}")
 m2.metric("Winter / Summer SoC",  f"{soc_w}% / {soc_s}%")
@@ -611,7 +594,7 @@ m4.metric("TRU Reefer",
 m5.metric("Season Split",         f"{w_months} winter / {s_months} summer months")
 st.markdown("---")
 
-# ── Build configs ─────────────────────────────────────────────────────────────
+# Build configs
 CONFIGS = []
 if cfg["do_wwd"]: CONFIGS.append(("Winter Weekday",               "winter_weekday", soc_w))
 if cfg["do_swd"]: CONFIGS.append(("Summer Weekday",               "summer_weekday", soc_s))
@@ -639,14 +622,14 @@ for (label, season_key, soc_init) in CONFIGS:
              is_wknd, is_48h, tru_d, rc) = run_scenarios_cached(
                 season_key, arr_h, dep_h,
                 float(soc_init), float(soc_dep),
-                tru_cycle, do_B, do_C, do_D, use_allin
+                tru_cycle, do_B, do_C, do_D
             )
             all_season_res[season_key]   = results_kpi
             all_reefer_costs[season_key] = rc
         except Exception as e:
             st.error(f"Error in {label}: {e}"); continue
 
-    # ── Season chart (built inline) ───────────────────────────────────────────
+    # Season chart
     buf = plot_season_chart_inline(
         v2g, label, buy_d, plug_d, hours_d,
         results, arr_h, dep_h, is_48h,
@@ -654,7 +637,6 @@ for (label, season_key, soc_init) in CONFIGS:
     )
     st.image(buf, use_container_width=True)
 
-    # Download button for the same chart
     buf2 = plot_season_chart_inline(
         v2g, label, buy_d, plug_d, hours_d,
         results, arr_h, dep_h, is_48h,
@@ -662,38 +644,36 @@ for (label, season_key, soc_init) in CONFIGS:
     )
     st.download_button(
         f"Download {label} chart (PNG)",
-        data=buf2,
-        file_name=f"v2g_{season_key}.png",
-        mime="image/png",
-        key=f"dl_{season_key}"
+        data=buf2, file_name=f"v2g_{season_key}.png",
+        mime="image/png", key=f"dl_{season_key}"
     )
 
-    # ── EV KPI table ──────────────────────────────────────────────────────────
-    st.markdown("**EV Charging KPI**")
+    # EV KPI table
+    st.markdown("**EV Charging KPI  (prices: SMARD spot)**")
     ref = results[0]["net_cost"]
     table = []
     for r in results:
         sav      = ref - r["net_cost"]
         fixed_ev = r["charge_kwh"] * fixed_price
         table.append({
-            "Scenario"                          : r["label"],
-            "EV charge cost (EUR/d)"            : round(r["charge_cost"],  4),
-            "V2G revenue (EUR/d)"               : round(r["v2g_rev"],       4),
-            "Net EV cost (EUR/d)"               : round(r["net_cost"],      4),
-            f"Fixed @{fixed_price:.2f}/kWh (EUR/d)": round(fixed_ev,       4),
-            "V2G export (kWh/d)"                : round(r["v2g_kwh"],       2),
-            "Daily savings vs Dumb"             : "--" if sav == 0 else f"EUR {sav:+.4f}",
-            "Annual savings (x365)"             : "--" if sav == 0 else f"EUR {sav*365:+,.0f}",
+            "Scenario"                              : r["label"],
+            "EV charge cost (EUR/d)"                : round(r["charge_cost"],  4),
+            "V2G revenue (EUR/d)"                   : round(r["v2g_rev"],       4),
+            "Net EV cost (EUR/d)"                   : round(r["net_cost"],      4),
+            f"Fixed @{fixed_price:.2f}/kWh (EUR/d)" : round(fixed_ev,           4),
+            "V2G export (kWh/d)"                    : round(r["v2g_kwh"],       2),
+            "Daily savings vs Dumb"                 : "--" if sav == 0 else f"EUR {sav:+.4f}",
+            "Annual savings (x365)"                 : "--" if sav == 0 else f"EUR {sav*365:+,.0f}",
         })
     st.dataframe(pd.DataFrame(table), use_container_width=True, hide_index=True)
 
-    # ── Reefer cost table ─────────────────────────────────────────────────────
+    # Reefer cost table
     if tru_cycle != "OFF" and rc["E_kWh"] > 0.01:
         st.markdown("**Reefer (TRU) Energy Cost -- Supply Scenario Comparison**")
         st.dataframe(pd.DataFrame([
             ["TRU energy consumed (kWh/d)",
              f"{rc['E_kWh']:.2f}"],
-            ["Cost -- grid dynamic pricing (EUR/d)",
+            ["Cost -- grid spot pricing (EUR/d)",
              f"EUR {rc['cost_dynamic']:.3f}"],
             [f"Cost -- fixed grid @EUR{fixed_price:.2f}/kWh (EUR/d)",
              f"EUR {rc['E_kWh'] * fixed_price:.3f}"],
@@ -738,10 +718,10 @@ if all_season_res:
             mult = mults.get(dt_key, 0)
             lbl  = dt_key.replace("_", " ").title()
             tru_yearly[lbl] = {
-                "TRU energy (kWh)":                   round(rc["E_kWh"]        * mult, 0),
-                "Dynamic (EUR)":                      round(rc["cost_dynamic"]  * mult, 0),
-                f"Fixed @{fixed_price:.2f}/kWh (EUR)":round(rc["E_kWh"] * fixed_price * mult, 0),
-                "Diesel equiv (EUR)":                 round(rc["cost_diesel"]   * mult, 0),
+                "TRU energy (kWh)":                    round(rc["E_kWh"]        * mult, 0),
+                "Spot price cost (EUR)":               round(rc["cost_dynamic"]  * mult, 0),
+                f"Fixed @{fixed_price:.2f}/kWh (EUR)": round(rc["E_kWh"] * fixed_price * mult, 0),
+                "Diesel equiv (EUR)":                  round(rc["cost_diesel"]   * mult, 0),
             }
         tru_yr_df = pd.DataFrame(tru_yearly).T
         tru_yr_df.loc["TOTAL"] = tru_yr_df.sum()
@@ -804,23 +784,22 @@ if cfg["do_price"]:
 
 with st.expander("Methodology & Assumptions", expanded=False):
     st.markdown(f"""
+**Price data:** Raw SMARD DE/LU 15-min day-ahead spot prices used directly from CSV.
+No tariff surcharges or VAT added to the optimisation price signal.
+
 **Optimisation:** MILP with binary charge/discharge mutex.
-V2G revenue at SMARD spot price; charging cost at
-{'all-in German tariff' if use_allin else 'SMARD spot'}.
+Both charging cost and V2G revenue use the raw SMARD spot price.
 
 **TRU modelling ({tru_cycle}):** TRU competes with charger on the 22 kW grid connection.
 Effective charging capacity = max(0, 22 kW minus TRU load). TRU does NOT drain the battery.
 - Continuous: 7.6 / 0.7 kW cycle (1717 s / 292 s), avg **{tru_avg_kw("Continuous"):.1f} kW**
 - Start-Stop: 9.7 / 0.65 / 0 kW (975 / 295 / 1207 s), avg **{tru_avg_kw("Start-Stop"):.1f} kW**
 
-**German all-in tariff:** Netzentgelt 6.63 ct + concession 1.99 ct + offshore 0.82 ct
-+ CHP 0.28 ct + electricity tax 2.05 ct + NEV19 1.56 ct + 19% VAT on net total.
-
 **Cold-chain floor:** SoC >= 20% enforced as hard MILP constraint at all times.
 **Departure target:** SoC >= {soc_dep}% at end of plugged-in window.
 **Battery:** 70 kWh total / 60 kWh usable | eta_charge = 0.92 | eta_discharge = 0.92
 **Yearly extrapolation:** {int(cfg['wd_per_month'])} working days/month x seasonal month split.
-**Fixed-tariff benchmark:** EUR {fixed_price:.2f}/kWh flat rate.
+**Fixed-tariff benchmark:** EUR {fixed_price:.2f}/kWh flat rate (comparison only, not used in optimisation).
     """)
 
 st.caption(
