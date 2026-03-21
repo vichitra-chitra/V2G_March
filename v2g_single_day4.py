@@ -392,25 +392,6 @@ if not st.session_state.authenticated:
 #  SESSION STATE DEFAULTS
 # =============================================================================
 
-DEFAULTS = {
-    "arrival_str":    "16:00",
-    "departure_str":  "06:00",
-    "soc_winter":     80,
-    "soc_summer":     40,
-    "soc_departure":  100,
-    "winter_months":  6,
-    "tru_cycle":      "OFF",
-    "do_B":           True,
-    "do_C":           True,
-    "do_D":           False,
-    "do_price":       False,
-    "use_allin":      False,
-    "fixed_price":    FIXED_PRICE_EUR_KWH,
-    "wd_per_month":   22.0,
-    "analysis_mode":  "Seasonal Average",
-    "specific_date":  "2025-01-15",
-}
-
 if "cfg" not in st.session_state:
     st.session_state.cfg = DEFAULTS.copy()
 if "show_output" not in st.session_state:
