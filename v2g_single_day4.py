@@ -248,14 +248,11 @@ def _load_csv_raw(csv_path):
     return df
 
 
-def _interpolate_to_15min(profile):
+def _interpolate_to_15min(profile: np.ndarray) -> np.ndarray:
     n    = len(profile)
-    flat = sum(1 for i in range(0, n, 4) if np.ptp(profile[i:i + 4]) < 1e-9)
+    flat = sum(1 for i in range(0, n, 4) if np.ptp(profile[i:i+4]) < 1e-9)
     if (n // 4) > 0 and flat / (n // 4) > 0.55:
-        hourly  = profile[::4]
-        x_h     = np.arange(24) + 0.5
-        x_q     = np.arange(96) / 4.0
-        profile = np.interp(x_q, x_h, hourly, left=hourly[0], right=hourly[-1])
+        return profile
     return profile
 
 
