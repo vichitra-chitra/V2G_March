@@ -19,6 +19,22 @@ from matplotlib.lines import Line2D
 from io import BytesIO
 from pathlib import Path
 
+# ── German all-in tariff components (BNetzA 2024) ─────────────────────────
+TARIFF = {
+    "network_fee_ct":     6.63,    # Netzentgelt
+    "concession_ct":      1.992,   # Konzessionsabgabe
+    "offshore_levy_ct":   0.816,   # Offshore-Netzumlage
+    "chp_levy_ct":        0.277,   # KWKG-Umlage
+    "electricity_tax_ct": 2.05,    # Stromsteuer
+    "nev19_levy_ct":      1.558,   # NEV-19-Umlage
+}
+FIXED_NET_CT = sum(TARIFF.values())   # ct/kWh, excl. VAT
+VAT_RATE     = 0.19
+
+def to_allin_ct(spot_eur_kwh: np.ndarray) -> np.ndarray:
+    """Convert raw SMARD spot price (EUR/kWh) to all-in depot price (ct/kWh)."""
+    return (spot_eur_kwh * 100.0 + FIXED_NET_CT) * (1.0 + VAT_RATE)
+
 from v2g_single_day4 import (
     V2GParams, WINTER_M, SUMMER_M, SC_COL, SC_FILL,
     FIXED_PRICE_EUR_KWH,
@@ -101,11 +117,6 @@ def _vlines(ax, arrival_h, departure_h, is_48h, is_wknd_fullday=False):
     ax.axvline(dx(departure_h), color="#B71C1C", lw=1.0, ls=":", alpha=0.80, zorder=6)
     ax.axvline(dx(0.),          color="#555",    lw=1.0, ls="--", alpha=0.55, zorder=6)
 
-
-# =============================================================================
-#  PAIRWISE POWER CHART
-#  Dumb (grey) vs one scenario (coloured)
-#  Left Y-axis: kW  |  Right Y-axis: EUR/MWh
 # =============================================================================
 
 def make_power_chart(v2g, hours_d, buy_d, plug_d,
@@ -163,14 +174,15 @@ def make_power_chart(v2g, hours_d, buy_d, plug_d,
     _vlines(ax, arrival_h, departure_h, is_48h, is_wknd_fullday)
 
     # Right Y-axis: electricity price
+    buy_d_ct = to_allin_ct(buy_d)   # all-in ct/kWh
     ax2 = ax.twinx()
-    h_p, = ax2.step(hours_d, buy_d * 1000, where="post",
-                    color="#2E7D32", lw=1.4, alpha=0.85, label="Price")
-    ax2.fill_between(hours_d, buy_d * 1000,
+    h_p, = ax2.step(hours_d, buy_d_ct, where="post",
+                    color="#2E7D32", lw=1.4, alpha=0.85, label="Price (all-in)")
+    ax2.fill_between(hours_d, buy_d_ct,
                      step="post", color="#2E7D32", alpha=0.07)
-    ax2.set_ylabel("EUR/MWh", fontsize=8, color="#2E7D32")
+    ax2.set_ylabel("ct/kWh (all-in)", fontsize=8, color="#2E7D32")
     ax2.tick_params(axis="y", labelcolor="#2E7D32", labelsize=8)
-    ax2.set_ylim(bottom=min(0, (buy_d * 1000).min() - 5))
+    ax2.set_ylim(bottom=min(0, buy_d_ct.min() - 1))
     handles.append(h_p)
 
     ax.set_ylabel("Power (kW)", fontsize=9)
@@ -294,7 +306,7 @@ def render_season_block(v2g, season_title, color_hex,
     # LEFT: 3 power charts stacked
     with col_pow:
         st.caption("⚡ **Charge / Discharge Power**  "
-                   "(left axis = kW  |  right axis = EUR/MWh price)")
+                   "(left axis = kW  |  right axis = ct/kWh all-in incl. taxes & grid fees)")
         for result_X, x_label, x_key in comparisons:
             buf = make_power_chart(
                 v2g, hours_d, buy_d, plug_d,
@@ -946,14 +958,7 @@ if mode == "Specific Date":
     )
     st.markdown("---")
     show_kpi_table(results, fixed_price, tru_cycle, rc)
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  SEASONAL AVERAGE MODE
-#  Points 2, 4, 5: Winter 6 charts on top, Summer 6 charts below
-#  Each block: LEFT col = 3 power charts | RIGHT col = 3 SoC charts
-# ─────────────────────────────────────────────────────────────────────────────
 else:
-    st.markdown("---")
 
     # ── WINTER WEEKDAY ────────────────────────────────────────────────────────
     res_w = None
@@ -1084,8 +1089,7 @@ else:
 
 with st.expander("Methodology & Assumptions", expanded=False):
     st.markdown(f"""
-**Price data:** Raw SMARD DE/LU 15-min day-ahead spot prices.
-No tariff surcharges or VAT added. Both charge cost and V2G revenue use the raw spot price.
+**Price data:** SMARD DE/LU 15-min day-ahead spot prices.
 
 **Specific Date mode:** Uses actual SMARD prices for the chosen date.
 
