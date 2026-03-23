@@ -604,7 +604,7 @@ def render_input_panel():
 
             st.markdown("##### Season Split")
             cfg["winter_months"] = st.slider(
-                "Winter months (Oct-Mar)", 1, 11, int(cfg["winter_months"]))
+                "Winter months", 1, 11, int(cfg["winter_months"]))
             st.caption(f"Summer months auto: **{12 - int(cfg['winter_months'])}**")
 
             st.markdown("##### Fixed-Tariff Benchmark")
