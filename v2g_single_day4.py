@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""
-S.KOe COOL — V2G Optimisation Suite (v6)
-TU Dortmund IE3 x Schmitz Cargobull AG | 2026
-Pure backend — no Streamlit imports.
-"""
 
 from __future__ import annotations
 import sys
@@ -150,62 +145,6 @@ def compute_reefer_costs(tru_w, buy_w, dt_h,
         "cost_diesel":   cost_diesel,
         "diesel_liters": liters,
     }
-
-
-# =============================================================================
-#  4. YEARLY EXTRAPOLATION
-# =============================================================================
-
-def yearly_extrapolation(all_season_results,
-                          winter_months=6,
-                          wd_per_month=22.0,
-                          we_days_per_month=8.7):
-    summer_months = 12 - winter_months
-    multipliers = {
-        "winter_weekday": winter_months * wd_per_month,
-        "summer_weekday": summer_months * wd_per_month,
-        "winter_weekend": winter_months * we_days_per_month,
-        "summer_weekend": summer_months * we_days_per_month,
-    }
-    sc_labels = []
-    for v in all_season_results.values():
-        if v:
-            sc_labels = [r["label"].split("(")[0].strip() for r in v]
-            break
-    if not sc_labels:
-        return pd.DataFrame()
-
-    rows = []
-    for dt_key, mult in multipliers.items():
-        if dt_key not in all_season_results or not all_season_results[dt_key]:
-            continue
-        res   = all_season_results[dt_key]
-        label = dt_key.replace("_", " ").title()
-        row   = {"Day Type": label}
-        for r in res:
-            sc      = r["label"].split("(")[0].strip()
-            row[sc] = round(r["net_cost"] * mult, 0)
-        rows.append(row)
-
-    if not rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows).set_index("Day Type")
-    total = {sc: df[sc].sum() for sc in sc_labels if sc in df.columns}
-    df.loc["TOTAL (EUR/yr)"] = total
-
-    base_col = [c for c in df.columns if "Dumb" in c or c.startswith("A")]
-    if base_col:
-        bc = base_col[0]
-        for sc in df.columns:
-            if sc != bc:
-                df.loc["Savings vs Dumb (EUR/yr)", sc] = round(
-                    df.loc["TOTAL (EUR/yr)", bc] - df.loc["TOTAL (EUR/yr)", sc], 0
-                )
-        df.loc["Savings vs Dumb (EUR/yr)", bc] = 0.0
-
-    return df
-
 
 # =============================================================================
 #  5. PRICE LOADING

@@ -589,7 +589,6 @@ DEFAULTS = {
     "do_wwe":        False,
     "do_swe":        False,
     "fixed_price":   FIXED_PRICE_EUR_KWH,
-    "wd_per_month":  22.0,
     "mode":          "Seasonal Average",
     "specific_date": "2025-01-15",
 }
@@ -639,10 +638,8 @@ def render_input_panel():
                 ["Seasonal Average", "Specific Date"],
                 index=0 if cfg.get("mode", "Seasonal Average") == "Seasonal Average" else 1,
                 help=(
-                    "**Seasonal Average:** Average winter / summer weekday prices "
-                    "computed from the full 2025 CSV.\n\n"
-                    "**Specific Date:** Pick any single day in 2025 — uses the "
-                    "actual SMARD prices for that exact date."
+                    "**Seasonal Average:** Graph will be shown for average prices of full 2025.\n\n"
+                    "**Specific Date:** Uses the actual prices for that exact date."
                 )
             )
             cfg["mode"] = mode
@@ -685,13 +682,6 @@ def render_input_panel():
             cfg["soc_departure"] = st.slider(
                 "Departure target SoC (%)", 50, 100, int(cfg["soc_departure"]),
                 help="Minimum battery % required when leaving depot")
-
-            st.markdown("##### Yearly Extrapolation")
-            cfg["wd_per_month"] = st.number_input(
-                "Working days per month",
-                value=float(cfg["wd_per_month"]),
-                min_value=10.0, max_value=31.0, step=0.5
-            )
 
             st.markdown("##### Scenarios to Run")
             cfg["do_B"] = st.checkbox(
@@ -1067,42 +1057,6 @@ else:
             with tab_obj:
                 show_kpi_table(res, fixed_price, tru_cycle, rc, lbl)
 
-    # ── YEARLY EXTRAPOLATION ──────────────────────────────────────────────────
-    if all_season_res_kpi:
-        st.markdown("---")
-        st.subheader("Yearly Cost Extrapolation")
-        we_per_month = max(0.0, (365 - float(cfg["wd_per_month"]) * 12) / 12)
-        yr_df = yearly_extrapolation(
-            all_season_res_kpi,
-            winter_months=w_months,
-            wd_per_month=float(cfg["wd_per_month"]),
-            we_days_per_month=we_per_month,
-        )
-        if not yr_df.empty:
-            st.dataframe(yr_df, use_container_width=True)
-
-        if tru_cycle != "OFF" and all_reefer_costs:
-            st.markdown("**Annual TRU Grid Cost (EUR/year)**")
-            tru_yearly = {}
-            for dt_key, rc in all_reefer_costs.items():
-                mults = {
-                    "winter_weekday": w_months  * float(cfg["wd_per_month"]),
-                    "summer_weekday": s_months  * float(cfg["wd_per_month"]),
-                    "winter_weekend": w_months  * we_per_month,
-                    "summer_weekend": s_months  * we_per_month,
-                }
-                mult = mults.get(dt_key, 0)
-                lbl  = dt_key.replace("_"," ").title()
-                tru_yearly[lbl] = {
-                    "TRU energy (kWh)":                    round(rc["E_kWh"]        * mult, 0),
-                    "Spot price cost (EUR)":               round(rc["cost_dynamic"]  * mult, 0),
-                    f"Fixed @{fixed_price:.2f}/kWh (EUR)": round(rc["E_kWh"]*fixed_price*mult, 0),
-                    "Diesel equiv (EUR)":                  round(rc["cost_diesel"]   * mult, 0),
-                }
-            tru_yr_df = pd.DataFrame(tru_yearly).T
-            tru_yr_df.loc["TOTAL"] = tru_yr_df.sum()
-            st.dataframe(tru_yr_df, use_container_width=True)
-
     # ── KPI MULTI-CHART ───────────────────────────────────────────────────────
     if len(all_season_res_kpi) > 1:
         st.markdown("---")
@@ -1142,8 +1096,6 @@ No tariff surcharges or VAT added. Both charge cost and V2G revenue use the raw 
 **Departure target:** SoC >= {soc_dep}%.
 
 **Battery:** 70 kWh total / 60 kWh usable | eta_c = 0.92 | eta_d = 0.92
-
-**Yearly extrapolation:** {int(cfg['wd_per_month'])} working days/month x seasonal split.
 
 **Fixed-tariff benchmark:** EUR {fixed_price:.2f}/kWh (comparison only).
     """)
