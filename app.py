@@ -23,10 +23,10 @@ from pathlib import Path
 TARIFF = {
     "network_fee_ct":     6.63,
     "concession_ct":      1.992,
-    "offshore_levy_ct":   0.816,
-    "chp_levy_ct":        0.277,
+    "offshore_levy_ct":   0.941,
+    "chp_levy_ct":        0.446,
     "electricity_tax_ct": 2.05,
-    "nev19_levy_ct":      1.558,
+    "nev19_levy_ct":      1.559,
 }
 FIXED_NET_CT = sum(TARIFF.values())
 VAT_RATE     = 0.19
@@ -571,10 +571,10 @@ DEFAULTS = {
     # Tariff fields — current regulation
     "t_network_fee":    6.63,
     "t_concession":     1.992,
-    "t_offshore":       0.816,
-    "t_chp":            0.277,
+    "t_offshore":       0.941,
+    "t_chp":            0.446,
     "t_elec_tax":       2.05,
-    "t_nev19":          1.558,
+    "t_nev19":          1.559,
     "t_vat":            19.0,
     # Future — exempt fees
     "t_fut_network":    6.63,
@@ -650,6 +650,80 @@ def render_input_panel():
                 min_value=0.05, max_value=1.0, step=0.01,
                 help="Comparison baseline only.")
 
+            st.markdown("##### Tariff Configuration")
+
+            # ── Current Regulation ─────────────────────────────────────────
+            st.markdown(
+                "<div style='background:#1565C0;color:white;padding:2px 8px;"
+                "border-radius:4px;font-size:11px;font-weight:bold;margin-bottom:4px;'>"
+                "📋 Current — All-in Charges (ct/kWh)</div>",
+                unsafe_allow_html=True
+            )
+            _ta, _tb = st.columns(2)
+            with _ta:
+                cfg["t_network_fee"] = st.number_input(
+                    "Netzentgelt", value=float(cfg["t_network_fee"]),
+                    min_value=0.0, max_value=20.0, step=0.01, format="%.3f",
+                    key="ti_nf")
+                cfg["t_concession"]  = st.number_input(
+                    "Konzession", value=float(cfg["t_concession"]),
+                    min_value=0.0, max_value=10.0, step=0.001, format="%.3f",
+                    key="ti_con")
+                cfg["t_offshore"]    = st.number_input(
+                    "Offshore", value=float(cfg["t_offshore"]),
+                    min_value=0.0, max_value=10.0, step=0.001, format="%.3f",
+                    key="ti_off")
+            with _tb:
+                cfg["t_chp"]         = st.number_input(
+                    "KWKG", value=float(cfg["t_chp"]),
+                    min_value=0.0, max_value=5.0, step=0.001, format="%.3f",
+                    key="ti_chp")
+                cfg["t_elec_tax"]    = st.number_input(
+                    "Stromsteuer", value=float(cfg["t_elec_tax"]),
+                    min_value=0.0, max_value=10.0, step=0.01, format="%.3f",
+                    key="ti_et")
+                cfg["t_nev19"]       = st.number_input(
+                    "NEV-19", value=float(cfg["t_nev19"]),
+                    min_value=0.0, max_value=10.0, step=0.001, format="%.3f",
+                    key="ti_nev")
+            cfg["t_vat"] = st.number_input(
+                "VAT (%)", value=float(cfg["t_vat"]),
+                min_value=0.0, max_value=30.0, step=0.1, format="%.1f",
+                key="ti_vat")
+            _fn  = (cfg["t_network_fee"] + cfg["t_concession"] + cfg["t_offshore"]
+                    + cfg["t_chp"] + cfg["t_elec_tax"] + cfg["t_nev19"])
+            _vat = cfg["t_vat"] / 100.0
+            st.caption(
+                f"Fixed net: **{_fn:.3f} ct/kWh** | VAT: **{cfg['t_vat']:.1f}%** | "
+                f"@ 10 ct spot → **{(10.0 + _fn) * (1 + _vat):.2f} ct all-in**"
+            )
+
+            # ── Future Regulation (MiSpeL) ─────────────────────────────────
+            st.markdown(
+                "<div style='background:#2E7D32;color:white;padding:2px 8px;"
+                "border-radius:4px;font-size:11px;font-weight:bold;"
+                "margin-bottom:4px;margin-top:6px;'>"
+                "🔮 Future (MiSpeL) — V2G Exempt Fees (ct/kWh)</div>",
+                unsafe_allow_html=True
+            )
+            _fc, _fd = st.columns(2)
+            with _fc:
+                cfg["t_fut_network"] = st.number_input(
+                    "Netzentgelt exempt", value=float(cfg["t_fut_network"]),
+                    min_value=0.0, max_value=20.0, step=0.01, format="%.3f",
+                    key="tf_nf", help="Set to 0 to disable")
+            with _fd:
+                cfg["t_fut_elec_tax"] = st.number_input(
+                    "Stromsteuer exempt", value=float(cfg["t_fut_elec_tax"]),
+                    min_value=0.0, max_value=10.0, step=0.01, format="%.3f",
+                    key="tf_et", help="Set to 0 to disable")
+            _fut_total = cfg["t_fut_network"] + cfg["t_fut_elec_tax"]
+            st.caption(
+                f"Exempt: **{_fut_total:.3f} ct/kWh** "
+                f"(+VAT: **{_fut_total * (1 + _vat):.3f} ct**) added to V2G rev | "
+                f"Pending EU state aid approval (BNetzA 2025)"
+            )
+
         with c2:
             st.subheader("State of Charge")
             cfg["soc_winter"]    = st.slider(
@@ -719,85 +793,6 @@ def render_input_panel():
             st.caption("70 kWh total / 60 kWh usable")
             st.caption("22 kW AC bidirectional OBC")
             st.caption("Cold-chain floor: SoC >= 20%")
-
-        # ── Tariff row — full width below the 4 columns ───────────────────────
-        st.markdown("---")
-        st.markdown("##### Tariff Configuration")
-        t1, t2 = st.columns(2)
-
-        with t1:
-            st.markdown(
-                "<div style='background:#1565C0;color:white;padding:3px 10px;"
-                "border-radius:4px;font-size:12px;font-weight:bold;margin-bottom:6px;'>"
-                "📋 Current Regulation — All-in Charges (ct/kWh)</div>",
-                unsafe_allow_html=True
-            )
-            tt1, tt2, tt3 = st.columns(3)
-            with tt1:
-                cfg["t_network_fee"] = st.number_input(
-                    "Netzentgelt", value=float(cfg["t_network_fee"]),
-                    min_value=0.0, max_value=20.0, step=0.01, format="%.3f",
-                    key="ti_nf")
-                cfg["t_concession"]  = st.number_input(
-                    "Konzessionsabgabe", value=float(cfg["t_concession"]),
-                    min_value=0.0, max_value=10.0, step=0.001, format="%.3f",
-                    key="ti_con")
-            with tt2:
-                cfg["t_offshore"]    = st.number_input(
-                    "Offshore levy", value=float(cfg["t_offshore"]),
-                    min_value=0.0, max_value=10.0, step=0.001, format="%.3f",
-                    key="ti_off")
-                cfg["t_chp"]         = st.number_input(
-                    "KWKG levy", value=float(cfg["t_chp"]),
-                    min_value=0.0, max_value=5.0, step=0.001, format="%.3f",
-                    key="ti_chp")
-            with tt3:
-                cfg["t_elec_tax"]    = st.number_input(
-                    "Stromsteuer", value=float(cfg["t_elec_tax"]),
-                    min_value=0.0, max_value=10.0, step=0.01, format="%.3f",
-                    key="ti_et")
-                cfg["t_nev19"]       = st.number_input(
-                    "NEV-19 levy", value=float(cfg["t_nev19"]),
-                    min_value=0.0, max_value=10.0, step=0.001, format="%.3f",
-                    key="ti_nev")
-            cfg["t_vat"] = st.number_input(
-                "VAT (%)", value=float(cfg["t_vat"]),
-                min_value=0.0, max_value=30.0, step=0.1, format="%.1f",
-                key="ti_vat")
-            _fn  = (cfg["t_network_fee"] + cfg["t_concession"] + cfg["t_offshore"]
-                    + cfg["t_chp"] + cfg["t_elec_tax"] + cfg["t_nev19"])
-            _vat = cfg["t_vat"] / 100.0
-            st.caption(f"Fixed net total: **{_fn:.3f} ct/kWh**  |  "
-                       f"VAT: **{cfg['t_vat']:.1f}%**  |  "
-                       f"Example at 10 ct spot: **{(10.0 + _fn)*(1+_vat):.2f} ct/kWh all-in**")
-
-        with t2:
-            st.markdown(
-                "<div style='background:#2E7D32;color:white;padding:3px 10px;"
-                "border-radius:4px;font-size:12px;font-weight:bold;margin-bottom:6px;'>"
-                "🔮 Future Regulation (MiSpeL) — Exempt Fees on V2G Export (ct/kWh)</div>",
-                unsafe_allow_html=True
-            )
-            ft1, ft2 = st.columns(2)
-            with ft1:
-                cfg["t_fut_network"] = st.number_input(
-                    "Netzentgelt exempt", value=float(cfg["t_fut_network"]),
-                    min_value=0.0, max_value=20.0, step=0.01, format="%.3f",
-                    key="tf_nf",
-                    help="Set to 0 to disable this exemption")
-            with ft2:
-                cfg["t_fut_elec_tax"] = st.number_input(
-                    "Stromsteuer exempt", value=float(cfg["t_fut_elec_tax"]),
-                    min_value=0.0, max_value=10.0, step=0.01, format="%.3f",
-                    key="tf_et",
-                    help="Set to 0 to disable this exemption")
-            _fut_total = cfg["t_fut_network"] + cfg["t_fut_elec_tax"]
-            _vat_fut   = cfg["t_vat"] / 100.0
-            st.caption(
-                f"Total exempt: **{_fut_total:.3f} ct/kWh**  |  "
-                f"After VAT: **{_fut_total*(1+_vat_fut):.3f} ct/kWh** added to V2G revenue  |  "
-                f"Source: BNetzA MiSpeL 2025 — pending EU state aid approval"
-            )
 
         # ── Submit ─────────────────────────────────────────────────────────────
         st.markdown("")
