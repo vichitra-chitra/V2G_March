@@ -718,7 +718,7 @@ def render_input_panel():
                 "MPC forecast noise σ (EUR/kWh)",
                 min_value=0.00, max_value=0.05,
                 value=float(cfg.get("mpc_noise_std", 0.0)),
-                step=0.001, format="%.3f",
+                step=0.01, format="%.2f",
                 help=(
                     "0.000 = perfect foresight (MPC = MILP).\n\n"
                     "0.012 = realistic intraday uncertainty (Liu 2023).\n\n"
