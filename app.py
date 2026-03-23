@@ -19,7 +19,7 @@ from matplotlib.lines import Line2D
 from io import BytesIO
 from pathlib import Path
 
-# ── German all-in tariff components (BNetzA 2024) ─────────────────────────
+# ── German all-in tariff components (BNetzA 2024) ───────────────────────
 TARIFF = {
     "network_fee_ct":     6.63,
     "concession_ct":      1.992,
