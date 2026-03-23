@@ -31,6 +31,14 @@ TARIFF = {
 FIXED_NET_CT = sum(TARIFF.values())   # ct/kWh, excl. VAT
 VAT_RATE     = 0.19
 
+V2G_RECOVERABLE_CURRENT_CT = 0.0
+
+V2G_RECOVERABLE_FUTURE = {
+    "network_fee_ct":     6.63,   # Netzentgelt — exempt under MiSpeL
+    "electricity_tax_ct": 2.05,   # Stromsteuer — exempt for V2G storage
+}
+V2G_RECOVERABLE_FUTURE_CT = sum(V2G_RECOVERABLE_FUTURE.values())  # 8.68 ct/kWh
+
 def to_allin_ct(spot_eur_kwh: np.ndarray) -> np.ndarray:
     """Convert raw SMARD spot price (EUR/kWh) to all-in depot price (ct/kWh)."""
     return (spot_eur_kwh * 100.0 + FIXED_NET_CT) * (1.0 + VAT_RATE)
@@ -43,7 +51,7 @@ from v2g_single_day4 import (
     compute_reefer_costs,
     get_wd_window, build_wd_display,
     run_A_dumb, run_B_smart, run_C_milp, run_D_mpc,
-    make_kpi, plot_kpi_multi, plot_price_profiles,
+    make_kpi, plot_price_profiles,
     soc_ramp,
 )
 
@@ -895,55 +903,111 @@ st.markdown("---")
 # =============================================================================
 #  KPI TABLE HELPER
 # =============================================================================
+def show_kpi_table(results, fixed_price, tru_cycle, rc, label="", buy_d=None):
+    """
+    Shows KPI table under two regulatory tabs:
+      Tab 1 — Current (2025): charging at all-in price, V2G revenue = spot only
+      Tab 2 — Future (MiSpeL): charging at all-in price, V2G revenue = spot + 8.68 ct/kWh
 
-def show_kpi_table(results, fixed_price, tru_cycle, rc, label=""):
-    ref_A    = results[0]
-    ref_cost = ref_A["net_cost"]
+    Financial recalculation uses buy_d (display price array, EUR/kWh raw spot)
+    to derive average all-in and spot prices for scaling stored kWh values.
+    The optimisation schedule (kWh charged/discharged) is identical in both tabs.
+    """
 
-    # ── Scenario F: same kWh as A (dumb) but at fixed tariff price ───────────
-    F_charge_cost = ref_A["charge_kwh"] * fixed_price
-    F_net_cost    = F_charge_cost        # no V2G, no deg cost
-    F_sav_vs_F    = 0.0                  # baseline = itself
+    # ── Derive average prices from display array ──────────────────────────────
+    if buy_d is not None and len(buy_d) > 0:
+        avg_spot_eur     = float(np.mean(buy_d))
+        avg_allin_eur    = float(np.mean(to_allin_ct(buy_d))) / 100.0
+    else:
+        # Fallback: estimate from stored charge_cost / charge_kwh of scenario A
+        ref = results[0]
+        avg_spot_eur  = (ref["charge_cost"] / ref["charge_kwh"]
+                         if ref["charge_kwh"] > 0.01 else 0.10)
+        avg_allin_eur = float(np.mean(to_allin_ct(np.array([avg_spot_eur])))) / 100.0
 
-    rows = []
+    recoverable_eur = {
+        "current": V2G_RECOVERABLE_CURRENT_CT / 100.0,
+        "future":  V2G_RECOVERABLE_FUTURE_CT  / 100.0,
+    }
 
-    # F row first — fixed-price dumb baseline
-    rows.append({
-        "Scenario"                              : f"F — Dumb @ fixed {fixed_price:.2f} EUR/kWh",
-        "EV charge cost (EUR/d)"                : round(F_charge_cost, 4),
-        "V2G revenue (EUR/d)"                   : 0.0,
-        "Net EV cost (EUR/d)"                   : round(F_net_cost, 4),
-        "V2G export (kWh/d)"                    : 0.0,
-        "Daily savings vs F"                    : "--",
-        "Annual savings vs F (x365)"            : "--",
-    })
+    def _build_rows(reg_key):
+        rec_eur  = recoverable_eur[reg_key]
 
-    # A, B, C, D rows
-    for r in results:
-        sav = F_net_cost - r["net_cost"]
+        # Scenario F — dumb charging at fixed tariff (same in both scenarios)
+        ref_A         = results[0]
+        F_charge_cost = ref_A["charge_kwh"] * fixed_price
+        F_net_cost    = F_charge_cost
+
+        rows = []
         rows.append({
-            "Scenario"                              : r["label"],
-            "EV charge cost (EUR/d)"                : round(r["charge_cost"], 4),
-            "V2G revenue (EUR/d)"                   : round(r["v2g_rev"],      4),
-            "Net EV cost (EUR/d)"                   : round(r["net_cost"],     4),
-            "V2G export (kWh/d)"                    : round(r["v2g_kwh"],      2),
-            "Daily savings vs F"                    : f"EUR {sav:+.4f}",
-            "Annual savings vs F (x365)"            : f"EUR {sav*365:+,.0f}",
+            "Scenario"                  : f"F — Dumb @ fixed {fixed_price:.2f} EUR/kWh",
+            "Charge cost (EUR/d)"       : round(F_charge_cost, 4),
+            "V2G revenue (EUR/d)"       : 0.0,
+            "Net cost (EUR/d)"          : round(F_net_cost, 4),
+            "V2G export (kWh/d)"        : 0.0,
+            "Daily saving vs F"         : "--",
+            "Annual saving vs F (×365)" : "--",
         })
 
+        for r in results:
+            # Scale charging cost to all-in price
+            charge_allin = r["charge_kwh"] * avg_allin_eur
+            # V2G revenue = kWh exported × (spot avg + recoverable fees)
+            v2g_rev      = r["v2g_kwh"] * (avg_spot_eur + rec_eur)
+            net          = charge_allin - v2g_rev
+            sav          = F_net_cost - net
+
+            rows.append({
+                "Scenario"                  : r["label"],
+                "Charge cost (EUR/d)"       : round(charge_allin, 4),
+                "V2G revenue (EUR/d)"       : round(v2g_rev,      4),
+                "Net cost (EUR/d)"          : round(net,           4),
+                "V2G export (kWh/d)"        : round(r["v2g_kwh"], 2),
+                "Daily saving vs F"         : f"EUR {sav:+.4f}",
+                "Annual saving vs F (×365)" : f"EUR {sav*365:+,.0f}",
+            })
+        return rows
+
+    # ── Render header ─────────────────────────────────────────────────────────
     hdr = f"**EV Charging KPI{' — ' + label if label else ''}**"
     st.markdown(hdr)
-    st.caption(
-        f"F = fixed tariff baseline @ EUR {fixed_price:.2f}/kWh  |  "
-        f"A = dumb dynamic  |  B/C/D = smart/MILP/MPC on spot prices"
-    )
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
+    tab_cur, tab_fut = st.tabs([
+        "📋 Current Regulation (2025)",
+        "🔮 Future Regulation (MiSpeL)"
+    ])
+
+    with tab_cur:
+        st.caption(
+            f"Charging cost = all-in price (spot + {FIXED_NET_CT:.2f} ct/kWh fixed + "
+            f"{int(VAT_RATE*100)}% VAT, avg ≈ {avg_allin_eur*100:.1f} ct/kWh)  |  "
+            f"V2G revenue = spot only ({avg_spot_eur*100:.1f} ct/kWh avg)  |  "
+            f"No fee recovery on feed-in under current German regulation."
+        )
+        st.dataframe(
+            pd.DataFrame(_build_rows("current")),
+            use_container_width=True, hide_index=True
+        )
+
+    with tab_fut:
+        st.caption(
+            f"Charging cost = same all-in price  |  "
+            f"V2G revenue = spot + {V2G_RECOVERABLE_FUTURE_CT:.2f} ct/kWh recovered "
+            f"(Netzentgelt {V2G_RECOVERABLE_FUTURE['network_fee_ct']} ct + "
+            f"Stromsteuer {V2G_RECOVERABLE_FUTURE['electricity_tax_ct']} ct)  |  "
+            f"Pending EU state aid approval for MiSpeL Pauschaloption (BNetzA 2025)."
+        )
+        st.dataframe(
+            pd.DataFrame(_build_rows("future")),
+            use_container_width=True, hide_index=True
+        )
+
+    # ── TRU table (same in both scenarios — reefer cost unaffected by V2G rules)
     if tru_cycle != "OFF" and rc["E_kWh"] > 0.01:
         st.markdown("**Reefer (TRU) Energy Cost**")
         st.dataframe(pd.DataFrame([
             ["TRU energy (kWh/d)",                        f"{rc['E_kWh']:.2f}"],
-            ["Grid spot price (EUR/d)",                   f"EUR {rc['cost_dynamic']:.3f}"],
+            ["Grid spot cost (EUR/d)",                    f"EUR {rc['cost_dynamic']:.3f}"],
             [f"Fixed @EUR{fixed_price:.2f}/kWh (EUR/d)", f"EUR {rc['E_kWh']*fixed_price:.3f}"],
             ["Diesel genset (EUR/d)",                     f"EUR {rc['cost_diesel']:.3f}"],
             ["Diesel (L/d)",                              f"{rc['diesel_liters']:.2f} L"],
@@ -997,7 +1061,7 @@ if mode == "Specific Date":
         do_B, do_C, do_D, tru_d
     )
     st.markdown("---")
-    show_kpi_table(results, fixed_price, tru_cycle, rc)
+    show_kpi_table(results, fixed_price, tru_cycle, rc, buy_d=buy_d)
 else:
 
     # ── WINTER WEEKDAY ────────────────────────────────────────────────────────
@@ -1085,43 +1149,20 @@ else:
             do_B, do_C, do_D, tru_d_we
         )
         st.markdown("---")
-        show_kpi_table(res_we, fixed_price, tru_cycle, rc_we, lbl)
+        show_kpi_table(res_we, fixed_price, tru_cycle, rc_we, lbl, buy_d=buy_d_we)
         st.markdown("---")
 
     # ── KPI TABLES (winter + summer in tabs) ──────────────────────────────────
     st.subheader("KPI Tables")
     tab_specs = []
-    if res_w is not None: tab_specs.append(("Winter Weekday", res_w, rc_w))
-    if res_s is not None: tab_specs.append(("Summer Weekday", res_s, rc_s))
+    if res_w is not None: tab_specs.append(("Winter Weekday", res_w, rc_w, buy_d_w))
+    if res_s is not None: tab_specs.append(("Summer Weekday", res_s, rc_s, buy_d_s))
 
     if tab_specs:
         tab_objs = st.tabs([t[0] for t in tab_specs])
-        for tab_obj, (lbl, res, rc) in zip(tab_objs, tab_specs):
+        for tab_obj, (lbl, res, rc, buy_d_tab) in zip(tab_objs, tab_specs):
             with tab_obj:
-                show_kpi_table(res, fixed_price, tru_cycle, rc, lbl)
-
-    # ── KPI MULTI-CHART ───────────────────────────────────────────────────────
-    if len(all_season_res_kpi) > 1:
-        st.markdown("---")
-        st.subheader("KPI Comparison Chart -- All Day Types")
-        try:
-            buf = BytesIO()
-            plot_kpi_multi(all_season_res_kpi, v2g, arr_h, dep_h,
-                           run_mpc=do_D, out=buf)
-            buf.seek(0)
-            st.image(buf, use_container_width=True)
-            buf2 = BytesIO()
-            plot_kpi_multi(all_season_res_kpi, v2g, arr_h, dep_h,
-                           run_mpc=do_D, out=buf2)
-            buf2.seek(0)
-            st.download_button(
-                "Download KPI comparison (PNG)",
-                data=buf2, file_name="v2g_KPI_multi.png",
-                mime="image/png", key="dl_kpi"
-            )
-        except Exception as e:
-            st.error(f"KPI chart error: {e}")
-
+                show_kpi_table(res, fixed_price, tru_cycle, rc, lbl, buy_d=buy_d_tab)
 
 # =============================================================================
 #  METHODOLOGY
