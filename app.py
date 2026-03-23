@@ -21,27 +21,31 @@ from pathlib import Path
 
 # ── German all-in tariff components (BNetzA 2024) ─────────────────────────
 TARIFF = {
-    "network_fee_ct":     6.63,    # Netzentgelt
-    "concession_ct":      1.992,   # Konzessionsabgabe
-    "offshore_levy_ct":   0.816,   # Offshore-Netzumlage
-    "chp_levy_ct":        0.277,   # KWKG-Umlage
-    "electricity_tax_ct": 2.05,    # Stromsteuer
-    "nev19_levy_ct":      1.558,   # NEV-19-Umlage
+    "network_fee_ct":     6.63,
+    "concession_ct":      1.992,
+    "offshore_levy_ct":   0.816,
+    "chp_levy_ct":        0.277,
+    "electricity_tax_ct": 2.05,
+    "nev19_levy_ct":      1.558,
 }
-FIXED_NET_CT = sum(TARIFF.values())   # ct/kWh, excl. VAT
+FIXED_NET_CT = sum(TARIFF.values())
 VAT_RATE     = 0.19
 
 V2G_RECOVERABLE_CURRENT_CT = 0.0
 
 V2G_RECOVERABLE_FUTURE = {
-    "network_fee_ct":     6.63,   # Netzentgelt — exempt under MiSpeL
-    "electricity_tax_ct": 2.05,   # Stromsteuer — exempt for V2G storage
+    "network_fee_ct":     6.63,
+    "electricity_tax_ct": 2.05,
 }
-V2G_RECOVERABLE_FUTURE_CT = sum(V2G_RECOVERABLE_FUTURE.values())  # 8.68 ct/kWh
+V2G_RECOVERABLE_FUTURE_CT = sum(V2G_RECOVERABLE_FUTURE.values())
 
-def to_allin_ct(spot_eur_kwh: np.ndarray) -> np.ndarray:
+def to_allin_ct(spot_eur_kwh: np.ndarray,
+                fixed_net_ct: float = None,
+                vat: float = None) -> np.ndarray:
     """Convert raw SMARD spot price (EUR/kWh) to all-in depot price (ct/kWh)."""
-    return (spot_eur_kwh * 100.0 + FIXED_NET_CT) * (1.0 + VAT_RATE)
+    fn  = fixed_net_ct if fixed_net_ct is not None else FIXED_NET_CT
+    vr  = vat          if vat          is not None else VAT_RATE
+    return (spot_eur_kwh * 100.0 + fn) * (1.0 + vr)
 
 from v2g_single_day4 import (
     V2GParams, WINTER_M, SUMMER_M, SC_COL, SC_FILL,
@@ -95,7 +99,6 @@ def fig_to_buf(fig) -> BytesIO:
 # =============================================================================
 
 def _setup_xaxis(ax, is_48h, is_wknd_fullday=False):
-    """Configure x-axis ticks for overnight weekday or 48h weekend."""
     if is_48h:
         pos  = np.arange(0, 49, 4)
         lbls = [f"{'Sat' if h < 24 else 'Sun'}\n{int(h%24):02d}:00" for h in pos]
@@ -114,7 +117,6 @@ def _setup_xaxis(ax, is_48h, is_wknd_fullday=False):
 
 
 def _vlines(ax, arrival_h, departure_h, is_48h, is_wknd_fullday=False):
-    """Add vertical reference lines for arrival, departure, midnight."""
     if is_48h:
         ax.axvline(24, color="#555", lw=1.0, ls="--", alpha=0.55, zorder=6)
         return
@@ -125,6 +127,9 @@ def _vlines(ax, arrival_h, departure_h, is_48h, is_wknd_fullday=False):
     ax.axvline(dx(departure_h), color="#B71C1C", lw=1.0, ls=":", alpha=0.80, zorder=6)
     ax.axvline(dx(0.),          color="#555",    lw=1.0, ls="--", alpha=0.55, zorder=6)
 
+
+# =============================================================================
+#  POWER CHART
 # =============================================================================
 
 def make_power_chart(v2g, hours_d, buy_d, plug_d,
@@ -132,7 +137,8 @@ def make_power_chart(v2g, hours_d, buy_d, plug_d,
                      x_label, x_key,
                      arrival_h, departure_h,
                      is_48h, is_wknd_fullday=False,
-                     tru_d=None):
+                     tru_d=None,
+                     fixed_net_ct=None, vat_rate=None):
 
     col_a  = SC_COL["A"];   fill_a  = SC_FILL["A"]
     col_x  = SC_COL[x_key]; fill_x  = SC_FILL[x_key]
@@ -142,19 +148,16 @@ def make_power_chart(v2g, hours_d, buy_d, plug_d,
     fig.patch.set_facecolor("#F8F9FA")
     ax.set_facecolor("#FFFFFF")
 
-    # Plugged-in background shading
     for t in range(len(hours_d)):
         if plug_d[t] > 0.5:
             ax.axvspan(hours_d[t], hours_d[t] + 0.25,
                        color="gold", alpha=0.14, lw=0, zorder=1)
 
-    # Dumb charging — grey fill + line (always positive)
     ax.fill_between(hours_d, result_A["Pc_d"],
                     step="post", color=fill_a, alpha=0.55, zorder=2)
     h_a, = ax.step(hours_d, result_A["Pc_d"], where="post",
                    color=col_a, lw=1.8, zorder=3, label="A - Dumb charge")
 
-    # Scenario X charging — coloured fill + line
     ax.fill_between(hours_d, result_X["Pc_d"],
                     step="post", color=fill_x, alpha=0.48, zorder=4)
     h_x, = ax.step(hours_d, result_X["Pc_d"], where="post",
@@ -162,7 +165,6 @@ def make_power_chart(v2g, hours_d, buy_d, plug_d,
 
     handles = [h_a, h_x]
 
-    # V2G discharge — below zero, dashed
     if result_X["v2g_kwh"] > 0.05:
         ax.fill_between(hours_d, -result_X["Pd_d"],
                         step="post", color=fill_x, alpha=0.28, zorder=4)
@@ -171,7 +173,6 @@ def make_power_chart(v2g, hours_d, buy_d, plug_d,
                        label=f"{lbl_x} V2G (−)")
         handles.append(h_d)
 
-    # TRU load — dotted red, below zero
     if tru_d is not None and np.any(tru_d > 0.01):
         h_t, = ax.step(hours_d, -tru_d, where="post",
                        color="#C62828", lw=1.2, ls=":", alpha=0.75, zorder=5,
@@ -181,8 +182,7 @@ def make_power_chart(v2g, hours_d, buy_d, plug_d,
     ax.axhline(0, color="black", lw=0.6)
     _vlines(ax, arrival_h, departure_h, is_48h, is_wknd_fullday)
 
-    # Right Y-axis: electricity price
-    buy_d_ct = to_allin_ct(buy_d)   # all-in ct/kWh
+    buy_d_ct = to_allin_ct(buy_d, fixed_net_ct, vat_rate)
     ax2 = ax.twinx()
     h_p, = ax2.step(hours_d, buy_d_ct, where="post",
                     color="#2E7D32", lw=1.4, alpha=0.85, label="Price (all-in)")
@@ -208,8 +208,7 @@ def make_power_chart(v2g, hours_d, buy_d, plug_d,
 
 
 # =============================================================================
-#  PAIRWISE SOC CHART
-#  Dumb (grey) vs one scenario (coloured)
+#  SOC CHART
 # =============================================================================
 
 def make_soc_chart(v2g, hours_d, plug_d,
@@ -226,20 +225,17 @@ def make_soc_chart(v2g, hours_d, plug_d,
     fig.patch.set_facecolor("#F8F9FA")
     ax.set_facecolor("#FFFFFF")
 
-    # Plugged-in background
     for t in range(len(hours_d)):
         if plug_d[t] > 0.5:
             ax.axvspan(hours_d[t], hours_d[t] + 0.25,
                        color="gold", alpha=0.14, lw=0, zorder=1)
 
-    # SoC ramp curves (linear interpolation, no step jumps)
     xA, yA = soc_ramp(hours_d, result_A["soc_d"], result_A["E_init_pct"])
     xX, yX = soc_ramp(hours_d, result_X["soc_d"], result_X["E_init_pct"])
 
     h_a, = ax.plot(xA, yA, color=col_a, lw=2.0, label="A - Dumb SoC")
     h_x, = ax.plot(xX, yX, color=col_x, lw=2.3, label=f"{lbl_x} SoC")
 
-    # Cold-chain floor and departure target
     ax.axhline(v2g.soc_min_pct,       color="#C62828", ls=":", lw=1.2, zorder=3)
     ax.axhline(v2g.soc_departure_pct, color="#0D47A1", ls=":", lw=1.2, zorder=3)
 
@@ -271,24 +267,16 @@ def make_soc_chart(v2g, hours_d, plug_d,
 
 # =============================================================================
 #  RENDER ONE SEASON BLOCK
-#  Layout: LEFT column = 3 power charts (vertical)
-#          RIGHT column = 3 SoC charts (vertical)
-#  Point 5: exactly as requested
 # =============================================================================
 
 def render_season_block(v2g, season_title, color_hex,
                          hours_d, buy_d, plug_d, results,
                          arrival_h, departure_h,
                          is_48h, is_wknd_fullday,
-                         do_B, do_C, do_D, tru_d=None):
-    """
-    Renders 6 compact charts for one season:
-      Left col  : Power charts — Dumb vs Smart / MILP / MPC (3 rows)
-      Right col : SoC   charts — Dumb vs Smart / MILP / MPC (3 rows)
-    """
-    result_A = results[0]
+                         do_B, do_C, do_D, tru_d=None,
+                         fixed_net_ct=None, vat_rate=None):
 
-    # Build list of (result, short_label, key) for each enabled scenario
+    result_A = results[0]
     comparisons = []
     label_map   = {"B": "B - Smart", "C": "C - MILP", "D": "D - MPC"}
     sc_idx = 1
@@ -301,7 +289,6 @@ def render_season_block(v2g, season_title, color_hex,
         st.info(f"{season_title}: enable at least one of B / C / D.")
         return
 
-    # Coloured section header
     st.markdown(
         f"<div style='background:{color_hex};color:white;padding:5px 14px;"
         f"border-radius:5px;font-weight:bold;font-size:14px;margin-bottom:4px;'>"
@@ -311,7 +298,6 @@ def render_season_block(v2g, season_title, color_hex,
 
     col_pow, col_soc = st.columns(2)
 
-    # LEFT: 3 power charts stacked
     with col_pow:
         st.caption("⚡ **Charge / Discharge Power**  "
                    "(left axis = kW  |  right axis = ct/kWh all-in incl. taxes & grid fees)")
@@ -319,11 +305,11 @@ def render_season_block(v2g, season_title, color_hex,
             buf = make_power_chart(
                 v2g, hours_d, buy_d, plug_d,
                 result_A, result_X, x_label, x_key,
-                arrival_h, departure_h, is_48h, is_wknd_fullday, tru_d
+                arrival_h, departure_h, is_48h, is_wknd_fullday, tru_d,
+                fixed_net_ct=fixed_net_ct, vat_rate=vat_rate
             )
             st.image(buf, use_container_width=True)
 
-    # RIGHT: 3 SoC charts stacked
     with col_soc:
         st.caption("🔋 **Battery State of Charge (%)**")
         for result_X, x_label, x_key in comparisons:
@@ -354,60 +340,51 @@ def load_seasonal_profile(months: tuple, is_weekend: bool) -> np.ndarray:
 
 @st.cache_data(show_spinner=False)
 def load_date_profile(date_str: str) -> np.ndarray:
-    """Load 96-slot price profile for a specific calendar date."""
     df     = _load_csv_raw(CSV_PATH)
     target = pd.Timestamp(date_str).date()
     day_df = df[df["date"] == target]
     if len(day_df) == 0:
-        raise ValueError(
-            f"No price data found for {date_str}. "
-            "Check the date exists in your CSV."
-        )
+        raise ValueError(f"No price data found for {date_str}.")
     prices = day_df["price"].values
     if len(prices) == 24:
         return _interpolate_to_15min(prices)
     if len(prices) != 96:
-        raise ValueError(
-            f"Expected 96 price slots for {date_str}, got {len(prices)}."
-        )
+        raise ValueError(f"Expected 96 price slots for {date_str}, got {len(prices)}.")
     return _interpolate_to_15min(prices)
-
 
 
 @st.cache_data(show_spinner=False)
 def load_two_day_profile(date_str: str) -> np.ndarray:
-    """
-    Load 192-slot price array for the overnight window that starts on `date_str`
-    and ends on the following calendar day.
-    Slots 0–95   = prices for day D  (date_str)
-    Slots 96–191 = prices for day D+1
-    """
     day1 = load_date_profile(date_str)
-
-    next_date_str = (
-        pd.Timestamp(date_str) + pd.Timedelta(days=1)
-    ).strftime("%Y-%m-%d")
-
+    next_ts       = pd.Timestamp(date_str) + pd.Timedelta(days=1)
+    next_date_str = next_ts.strftime("%Y-%m-%d")
     try:
         day2 = load_date_profile(next_date_str)
     except ValueError:
-        raise ValueError(
-            f"Next-day price data for **{next_date_str}** was not found in the "
-            f"CSV file. Please select an earlier date so that the full "
-            f"overnight window (arrival on {date_str} → departure on "
-            f"{next_date_str}) is available."
-        )
-
+        fallback_ts       = next_ts.replace(year=next_ts.year - 1)
+        fallback_date_str = fallback_ts.strftime("%Y-%m-%d")
+        try:
+            day2 = load_date_profile(fallback_date_str)
+            st.info(
+                f"ℹ️ Post-midnight prices for **{next_date_str}** are not in the CSV. "
+                f"Using **{fallback_date_str}** (same day, prior year) as a proxy."
+            )
+        except ValueError:
+            raise ValueError(
+                f"Next-day data for **{next_date_str}** not found, and fallback "
+                f"**{fallback_date_str}** is also missing. Check your CSV coverage."
+            )
     return np.concatenate([day1, day2])
 
+
 # =============================================================================
-#  SCENARIO RUNNER — seasonal average
+#  SCENARIO RUNNERS
 # =============================================================================
 
 @st.cache_data(show_spinner=False)
 def run_seasonal(season_key, arrival_h, departure_h,
                  soc_pct, soc_departure_pct, tru_cycle,
-                 do_B, do_C, do_D, mpc_noise_std = 0.0):
+                 do_B, do_C, do_D, mpc_noise_std=0.0):
     months_map = {
         "winter_weekday": (WINTER_M, False, False),
         "summer_weekday": (SUMMER_M, False, False),
@@ -480,10 +457,6 @@ def run_seasonal(season_key, arrival_h, departure_h,
         return results, results, buy_d, plug_d, hours_d, is_wknd, is_48h, tru_d, rc
 
 
-# =============================================================================
-#  SCENARIO RUNNER — specific date
-# =============================================================================
-
 @st.cache_data(show_spinner=False)
 def run_specific_date(date_str, arrival_h, departure_h,
                       soc_pct, soc_departure_pct, tru_cycle,
@@ -493,7 +466,6 @@ def run_specific_date(date_str, arrival_h, departure_h,
     v2g     = V2GParams(soc_departure_pct=soc_departure_pct)
     E_init  = v2g.usable_capacity_kWh * soc_pct / 100.0
 
-    # ── WEEKEND — single day, full 24 h (unchanged) ───────────────────────────
     if is_wknd:
         buy             = load_date_profile(date_str)
         v2gp            = buy.copy()
@@ -508,59 +480,34 @@ def run_specific_date(date_str, arrival_h, departure_h,
         arr, dep        = 0, 96
         is_48h          = False
         is_wknd_fullday = True
-
-    # ── WEEKDAY — overnight window spanning two calendar days ─────────────────
     else:
-        # 192-slot array: [day D (slots 0–95)] + [day D+1 (slots 96–191)]
-        # Raises ValueError with user-readable message if D+1 is missing
         buy_192  = load_two_day_profile(date_str)
         v2gp_192 = buy_192.copy()
-
-        # ROLL = 48 slots = 12 h → display window starts at 12:00 on day D
-        ROLL     = round(12.0 / v2g.dt_h)          # 48
-
-        # Slot indices within the 192-slot array
-        arr_slot = round(arrival_h   / v2g.dt_h) % 96   # e.g. 16:00 → slot 64
-        dep_slot = round(departure_h / v2g.dt_h) % 96   # e.g. 06:00 → slot 24
-
-        # Optimisation window — correct prices for both days
-        buy_w   = buy_192[arr_slot : 96 + dep_slot]
-        v2gp_w  = buy_w.copy()
-        W       = len(buy_w)
-
-        # Display array — 96 slots, 12:00 day D → 12:00 day D+1 (same x-axis style)
-        buy_d   = buy_192[ROLL : ROLL + 96]
-        hours_d = np.arange(96) * v2g.dt_h + 12.0      # 12.00 … 35.75
-
-        # Plugged-in mask on the 12–36 h chart
+        ROLL     = round(12.0 / v2g.dt_h)
+        arr_slot = round(arrival_h   / v2g.dt_h) % 96
+        dep_slot = round(departure_h / v2g.dt_h) % 96
+        buy_w    = buy_192[arr_slot : 96 + dep_slot]
+        v2gp_w   = buy_w.copy()
+        W        = len(buy_w)
+        buy_d    = buy_192[ROLL : ROLL + 96]
+        hours_d  = np.arange(96) * v2g.dt_h + 12.0
         dep_on_chart = (departure_h + 24.0) if departure_h < 12.0 else departure_h
-        plug_d = (
-            (hours_d >= arrival_h) & (hours_d < dep_on_chart)
-        ).astype(float)
-
-        # Display positions for to_display_wd / make_kpi (0-based into 96-slot display)
-        arr_disp = arr_slot - ROLL          # e.g. 64 - 48 = 16
-        dep_disp = ROLL     + dep_slot      # e.g. 48 + 24 = 72
+        plug_d   = ((hours_d >= arrival_h) & (hours_d < dep_on_chart)).astype(float)
+        arr_disp = arr_slot - ROLL
+        dep_disp = ROLL     + dep_slot
         arr, dep = arr_disp, dep_disp
-
-        # TRU display trace
-        tru_w = get_tru_15min_trace(tru_cycle, W, v2g.dt_h)
-        tru_d = np.zeros(96)
-        d_s   = max(0, arr_disp)
-        d_e   = min(96, dep_disp)
-        w_s   = d_s - arr_disp
-        w_e   = w_s + (d_e - d_s)
+        tru_w    = get_tru_15min_trace(tru_cycle, W, v2g.dt_h)
+        tru_d    = np.zeros(96)
+        d_s = max(0, arr_disp); d_e = min(96, dep_disp)
+        w_s = d_s - arr_disp;   w_e = w_s + (d_e - d_s)
         if w_e > w_s:
             tru_d[d_s:d_e] = tru_w[w_s:w_e]
-
         is_48h          = False
         is_wknd_fullday = False
 
-    # ── Run scenarios (identical for both paths) ──────────────────────────────
     Pc, Pd, soc = run_A_dumb(v2g, buy_w, v2gp_w, W, E_init, tru_w)
     results = [make_kpi("A - Dumb", v2g, Pc, Pd, soc,
                         buy_w, v2gp_w, E_init, arr, dep, tru_w=tru_w)]
-
     if do_B:
         Pc, Pd, soc = run_B_smart(v2g, buy_w, v2gp_w, E_init, tru_w)
         results.append(make_kpi("B - Smart (no V2G)", v2g, Pc, Pd, soc,
@@ -620,7 +567,18 @@ DEFAULTS = {
     "fixed_price":   FIXED_PRICE_EUR_KWH,
     "mode":          "Seasonal Average",
     "specific_date": "2025-01-15",
-    "mpc_noise_std":  0.0,
+    "mpc_noise_std": 0.0,
+    # Tariff fields — current regulation
+    "t_network_fee":    6.63,
+    "t_concession":     1.992,
+    "t_offshore":       0.816,
+    "t_chp":            0.277,
+    "t_elec_tax":       2.05,
+    "t_nev19":          1.558,
+    "t_vat":            19.0,
+    # Future — exempt fees
+    "t_fut_network":    6.63,
+    "t_fut_elec_tax":   2.05,
 }
 
 if "cfg" not in st.session_state:
@@ -630,21 +588,16 @@ if "show_output" not in st.session_state:
 
 
 # =============================================================================
-#  INPUT PANEL  — shown first when app opens (Point 1)
+#  INPUT PANEL
 # =============================================================================
 
 def render_input_panel():
     st.title("S.KOe COOL 2.0 - V2G Optimisation")
-    st.caption(
-        "Master's Thesis 2026  |  Kuldip Bhadreshvara"
-    )
+    st.caption("Master's Thesis 2026  |  Kuldip Bhadreshvara")
     st.markdown("---")
 
     if not Path(CSV_PATH).exists():
-        st.error(
-            f"Price CSV '{CSV_PATH}' not found. "
-            "Commit '2025_Electricity_Price.csv' to the repo root."
-        )
+        st.error(f"Price CSV '{CSV_PATH}' not found.")
         st.stop()
 
     cfg = st.session_state.cfg
@@ -652,7 +605,6 @@ def render_input_panel():
     with st.form("input_form", clear_on_submit=False):
         c1, c2, c3, c4 = st.columns([1.15, 1.15, 1.0, 0.9])
 
-        # ── Column 1: Schedule + Analysis Mode (Point 3) ──────────────────────
         with c1:
             st.subheader("Weekday Schedule")
             cfg["arrival_str"]   = st.text_input(
@@ -668,8 +620,8 @@ def render_input_panel():
                 ["Seasonal Average", "Specific Date"],
                 index=0 if cfg.get("mode", "Seasonal Average") == "Seasonal Average" else 1,
                 help=(
-                    "**Seasonal Average:** Graph will be shown for average prices of full 2025.\n\n"
-                    "**Specific Date:** Uses the actual prices for that exact date."
+                    "**Seasonal Average:** Average prices of full 2025.\n\n"
+                    "**Specific Date:** Actual prices for that exact date."
                 )
             )
             cfg["mode"] = mode
@@ -680,7 +632,6 @@ def render_input_panel():
                     value=pd.Timestamp(cfg.get("specific_date", "2025-01-15")),
                     min_value=pd.Timestamp("2025-01-01"),
                     max_value=pd.Timestamp("2025-12-31"),
-                    help="The date must exist in your price CSV"
                 )
                 cfg["specific_date"] = str(date_val)
                 ts_sel  = pd.Timestamp(date_val)
@@ -697,22 +648,16 @@ def render_input_panel():
                 "Fixed price (EUR/kWh)",
                 value=float(cfg["fixed_price"]),
                 min_value=0.05, max_value=1.0, step=0.01,
-                help="Comparison baseline only. Optimisation uses raw SMARD spot prices."
-            )
+                help="Comparison baseline only.")
 
-        # ── Column 2: SoC + scenarios ──────────────────────────────────────────
-        # ── Column 2: SoC + scenarios ──────────────────────────────────────────
         with c2:
             st.subheader("State of Charge")
             cfg["soc_winter"]    = st.slider(
-                "Winter arrival SoC (%)", 20, 100, int(cfg["soc_winter"]),
-                help="Battery % when trailer arrives in winter")
+                "Winter arrival SoC (%)", 20, 100, int(cfg["soc_winter"]))
             cfg["soc_summer"]    = st.slider(
-                "Summer arrival SoC (%)", 20, 100, int(cfg["soc_summer"]),
-                help="Battery % when trailer arrives in summer")
+                "Summer arrival SoC (%)", 20, 100, int(cfg["soc_summer"]))
             cfg["soc_departure"] = st.slider(
-                "Departure target SoC (%)", 50, 100, int(cfg["soc_departure"]),
-                help="Minimum battery % required when leaving depot")
+                "Departure target SoC (%)", 50, 100, int(cfg["soc_departure"]))
 
             st.markdown("##### Scenarios to Run")
             cfg["do_B"] = st.checkbox(
@@ -721,7 +666,8 @@ def render_input_panel():
                 "C -- MILP Day-Ahead + V2G",   bool(cfg["do_C"]), key="form_do_C")
             cfg["do_D"] = st.checkbox(
                 "D -- MPC receding horizon", bool(cfg["do_D"]), key="form_do_D")
-            cfg["mpc_noise_std"] = st.slider(
+            if st.session_state.get("form_do_D", bool(cfg["do_D"])):
+                cfg["mpc_noise_std"] = st.slider(
                     "MPC forecast noise σ (EUR/kWh)",
                     min_value=0.000, max_value=0.050,
                     value=float(cfg.get("mpc_noise_std", 0.0)),
@@ -733,8 +679,10 @@ def render_input_panel():
                     ),
                     key="form_mpc_noise"
                 )
+            else:
+                cfg["mpc_noise_std"] = 0.0
+                st.caption("↑ Enable MPC to set forecast noise")
 
-        # ── Column 3: TRU ─────────────────────────────────────────────────────
         with c3:
             st.subheader("Reefer (TRU) at Depot")
             cycle_choice = st.radio(
@@ -756,7 +704,6 @@ def render_input_panel():
                     f"Charging headroom: **{max(0, 22 - avg_kw):.1f} -- 22 kW**"
                 )
 
-        # ── Column 4: Extras + submit ──────────────────────────────────────────
         with c4:
             st.subheader("Extras")
             cfg["do_wwe"] = st.checkbox(
@@ -773,9 +720,89 @@ def render_input_panel():
             st.caption("22 kW AC bidirectional OBC")
             st.caption("Cold-chain floor: SoC >= 20%")
 
-            st.markdown("")
-            submitted = st.form_submit_button(
-                "Calculate", type="primary", use_container_width=True)
+        # ── Tariff row — full width below the 4 columns ───────────────────────
+        st.markdown("---")
+        st.markdown("##### Tariff Configuration")
+        t1, t2 = st.columns(2)
+
+        with t1:
+            st.markdown(
+                "<div style='background:#1565C0;color:white;padding:3px 10px;"
+                "border-radius:4px;font-size:12px;font-weight:bold;margin-bottom:6px;'>"
+                "📋 Current Regulation — All-in Charges (ct/kWh)</div>",
+                unsafe_allow_html=True
+            )
+            tt1, tt2, tt3 = st.columns(3)
+            with tt1:
+                cfg["t_network_fee"] = st.number_input(
+                    "Netzentgelt", value=float(cfg["t_network_fee"]),
+                    min_value=0.0, max_value=20.0, step=0.01, format="%.3f",
+                    key="ti_nf")
+                cfg["t_concession"]  = st.number_input(
+                    "Konzessionsabgabe", value=float(cfg["t_concession"]),
+                    min_value=0.0, max_value=10.0, step=0.001, format="%.3f",
+                    key="ti_con")
+            with tt2:
+                cfg["t_offshore"]    = st.number_input(
+                    "Offshore levy", value=float(cfg["t_offshore"]),
+                    min_value=0.0, max_value=10.0, step=0.001, format="%.3f",
+                    key="ti_off")
+                cfg["t_chp"]         = st.number_input(
+                    "KWKG levy", value=float(cfg["t_chp"]),
+                    min_value=0.0, max_value=5.0, step=0.001, format="%.3f",
+                    key="ti_chp")
+            with tt3:
+                cfg["t_elec_tax"]    = st.number_input(
+                    "Stromsteuer", value=float(cfg["t_elec_tax"]),
+                    min_value=0.0, max_value=10.0, step=0.01, format="%.3f",
+                    key="ti_et")
+                cfg["t_nev19"]       = st.number_input(
+                    "NEV-19 levy", value=float(cfg["t_nev19"]),
+                    min_value=0.0, max_value=10.0, step=0.001, format="%.3f",
+                    key="ti_nev")
+            cfg["t_vat"] = st.number_input(
+                "VAT (%)", value=float(cfg["t_vat"]),
+                min_value=0.0, max_value=30.0, step=0.1, format="%.1f",
+                key="ti_vat")
+            _fn  = (cfg["t_network_fee"] + cfg["t_concession"] + cfg["t_offshore"]
+                    + cfg["t_chp"] + cfg["t_elec_tax"] + cfg["t_nev19"])
+            _vat = cfg["t_vat"] / 100.0
+            st.caption(f"Fixed net total: **{_fn:.3f} ct/kWh**  |  "
+                       f"VAT: **{cfg['t_vat']:.1f}%**  |  "
+                       f"Example at 10 ct spot: **{(10.0 + _fn)*(1+_vat):.2f} ct/kWh all-in**")
+
+        with t2:
+            st.markdown(
+                "<div style='background:#2E7D32;color:white;padding:3px 10px;"
+                "border-radius:4px;font-size:12px;font-weight:bold;margin-bottom:6px;'>"
+                "🔮 Future Regulation (MiSpeL) — Exempt Fees on V2G Export (ct/kWh)</div>",
+                unsafe_allow_html=True
+            )
+            ft1, ft2 = st.columns(2)
+            with ft1:
+                cfg["t_fut_network"] = st.number_input(
+                    "Netzentgelt exempt", value=float(cfg["t_fut_network"]),
+                    min_value=0.0, max_value=20.0, step=0.01, format="%.3f",
+                    key="tf_nf",
+                    help="Set to 0 to disable this exemption")
+            with ft2:
+                cfg["t_fut_elec_tax"] = st.number_input(
+                    "Stromsteuer exempt", value=float(cfg["t_fut_elec_tax"]),
+                    min_value=0.0, max_value=10.0, step=0.01, format="%.3f",
+                    key="tf_et",
+                    help="Set to 0 to disable this exemption")
+            _fut_total = cfg["t_fut_network"] + cfg["t_fut_elec_tax"]
+            _vat_fut   = cfg["t_vat"] / 100.0
+            st.caption(
+                f"Total exempt: **{_fut_total:.3f} ct/kWh**  |  "
+                f"After VAT: **{_fut_total*(1+_vat_fut):.3f} ct/kWh** added to V2G revenue  |  "
+                f"Source: BNetzA MiSpeL 2025 — pending EU state aid approval"
+            )
+
+        # ── Submit ─────────────────────────────────────────────────────────────
+        st.markdown("")
+        submitted = st.form_submit_button(
+            "Calculate", type="primary", use_container_width=True)
 
         if submitted:
             arr_h = parse_hhmm(cfg["arrival_str"], 16.0)
@@ -792,7 +819,7 @@ def render_input_panel():
 
 
 # =============================================================================
-#  ROUTING — show input panel until Calculate is clicked
+#  ROUTING
 # =============================================================================
 
 if not st.session_state.show_output:
@@ -805,9 +832,7 @@ if not st.session_state.show_output:
 # =============================================================================
 
 st.title("S.KOe COOL 2.0 - V2G Optimisation Results")
-st.caption(
-    "Master's Thesis 2026  |  Kuldip Bhadreshvara"
-)
+st.caption("Master's Thesis 2026  |  Kuldip Bhadreshvara")
 
 cfg           = st.session_state.cfg
 arr_h         = parse_hhmm(cfg["arrival_str"],   16.0)
@@ -822,10 +847,16 @@ s_months      = 6
 do_B          = bool(cfg["do_B"])
 do_C          = bool(cfg["do_C"])
 do_D          = bool(cfg["do_D"])
-mpc_noise_std = float(cfg.get("mpc_noise_std", 0.0))
 fixed_price   = float(cfg["fixed_price"])
 mode          = cfg.get("mode", "Seasonal Average")
 specific_date = cfg.get("specific_date", "2025-01-15")
+
+# Derive tariff values from cfg
+_fixed_net_ct = (cfg["t_network_fee"] + cfg["t_concession"] + cfg["t_offshore"]
+                 + cfg["t_chp"] + cfg["t_elec_tax"] + cfg["t_nev19"])
+_vat_rate     = cfg["t_vat"] / 100.0
+_v2g_double_ct = cfg["t_network_fee"] + cfg["t_elec_tax"]   # current: re-applied on V2G
+_v2g_exempt_ct = cfg["t_fut_network"] + cfg["t_fut_elec_tax"]  # future: exempt on V2G
 
 # ── Sidebar quick-edit ────────────────────────────────────────────────────────
 with st.sidebar:
@@ -856,7 +887,6 @@ with st.sidebar:
         st.session_state.show_output = False
         st.rerun()
     st.session_state.cfg = cfg
-    # Refresh local vars after sidebar edits
     arr_h         = parse_hhmm(cfg["arrival_str"],   16.0)
     dep_h         = parse_hhmm(cfg["departure_str"],  6.0)
     soc_w         = int(cfg["soc_winter"])
@@ -888,7 +918,6 @@ with st.spinner("Loading price data..."):
 v2g     = V2GParams(soc_departure_pct=float(soc_dep))
 tru_avg = tru_avg_kw(tru_cycle)
 
-# Summary metrics banner
 m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("Arrival / Departure",  f"{fmt_hhmm(arr_h)} / {fmt_hhmm(dep_h)}")
 m2.metric("Winter / Summer SoC",  f"{soc_w}% / {soc_s}%")
@@ -903,72 +932,57 @@ st.markdown("---")
 # =============================================================================
 #  KPI TABLE HELPER
 # =============================================================================
+
 def show_kpi_table(results, fixed_price, tru_cycle, rc, label="", buy_d=None):
-    """
-    Shows KPI table under two regulatory tabs:
-      Tab 1 — Current (2025): charging at all-in price, V2G revenue = spot only
-      Tab 2 — Future (MiSpeL): charging at all-in price, V2G revenue = spot + 8.68 ct/kWh
-
-    Financial recalculation uses buy_d (display price array, EUR/kWh raw spot)
-    to derive average all-in and spot prices for scaling stored kWh values.
-    The optimisation schedule (kWh charged/discharged) is identical in both tabs.
-    """
-
-    # ── Derive average prices from display array ──────────────────────────────
     if buy_d is not None and len(buy_d) > 0:
-        avg_spot_eur     = float(np.mean(buy_d))
-        avg_allin_eur    = float(np.mean(to_allin_ct(buy_d))) / 100.0
+        avg_spot_eur  = float(np.mean(buy_d))
+        avg_allin_eur = float(np.mean(to_allin_ct(buy_d, _fixed_net_ct, _vat_rate))) / 100.0
     else:
-        # Fallback: estimate from stored charge_cost / charge_kwh of scenario A
         ref = results[0]
         avg_spot_eur  = (ref["charge_cost"] / ref["charge_kwh"]
                          if ref["charge_kwh"] > 0.01 else 0.10)
-        avg_allin_eur = float(np.mean(to_allin_ct(np.array([avg_spot_eur])))) / 100.0
+        avg_allin_eur = float(np.mean(
+            to_allin_ct(np.array([avg_spot_eur]), _fixed_net_ct, _vat_rate))) / 100.0
 
-    recoverable_eur = {
-        "current": V2G_RECOVERABLE_CURRENT_CT / 100.0,
-        "future":  V2G_RECOVERABLE_FUTURE_CT  / 100.0,
-    }
+    double_tax_eur = _v2g_double_ct / 100.0
+    exempt_eur     = _v2g_exempt_ct / 100.0
 
-    def _build_rows(reg_key):
-        rec_eur  = recoverable_eur[reg_key]
-
-        # Scenario F — dumb charging at fixed tariff (same in both scenarios)
+    def _build_rows(reg):
         ref_A         = results[0]
         F_charge_cost = ref_A["charge_kwh"] * fixed_price
         F_net_cost    = F_charge_cost
 
-        rows = []
-        rows.append({
-            "Scenario"                  : f"F — Dumb @ fixed {fixed_price:.2f} EUR/kWh",
-            "Charge cost (EUR/d)"       : round(F_charge_cost, 4),
-            "V2G revenue (EUR/d)"       : 0.0,
-            "Net cost (EUR/d)"          : round(F_net_cost, 4),
-            "V2G export (kWh/d)"        : 0.0,
-            "Daily saving vs F"         : "--",
-            "Annual saving vs F (×365)" : "--",
-        })
+        rows = [{
+            "Scenario"                  : f"F  Fixed@{fixed_price:.2f}€/kWh",
+            "Charge (€/d)"              : f"{F_charge_cost:.3f}",
+            "V2G Rev (€/d)"             : "0.000",
+            "Net (€/d)"                 : f"{F_charge_cost:.3f}",
+            "Annual vs F"               : "—",
+        }]
 
         for r in results:
-            # Scale charging cost to all-in price
-            charge_allin = r["charge_kwh"] * avg_allin_eur
-            # V2G revenue = kWh exported × (spot avg + recoverable fees)
-            v2g_rev      = r["v2g_kwh"] * (avg_spot_eur + rec_eur)
-            net          = charge_allin - v2g_rev
-            sav          = F_net_cost - net
-
+            charge_cost = r["charge_kwh"] * avg_allin_eur
+            if reg == "current":
+                v2g_rev = max(0.0,
+                    r["v2g_kwh"] * avg_spot_eur
+                    - r["v2g_kwh"] * double_tax_eur * (1.0 + _vat_rate))
+            else:
+                v2g_rev = (r["v2g_kwh"] * avg_spot_eur
+                           + r["v2g_kwh"] * exempt_eur * (1.0 + _vat_rate))
+            net = charge_cost - v2g_rev
+            sav = F_net_cost - net
             rows.append({
-                "Scenario"                  : r["label"],
-                "Charge cost (EUR/d)"       : round(charge_allin, 4),
-                "V2G revenue (EUR/d)"       : round(v2g_rev,      4),
-                "Net cost (EUR/d)"          : round(net,           4),
-                "V2G export (kWh/d)"        : round(r["v2g_kwh"], 2),
-                "Daily saving vs F"         : f"EUR {sav:+.4f}",
-                "Annual saving vs F (×365)" : f"EUR {sav*365:+,.0f}",
+                "Scenario"     : (r["label"]
+                                  .replace(" (no V2G)","")
+                                  .replace(" Day-Ahead","")
+                                  .replace(" (receding)","")),
+                "Charge (€/d)" : f"{charge_cost:.3f}",
+                "V2G Rev (€/d)": f"{v2g_rev:.3f}",
+                "Net (€/d)"    : f"{net:.3f}",
+                "Annual vs F"  : f"€{sav*365:+,.0f}",
             })
         return rows
 
-    # ── Render header ─────────────────────────────────────────────────────────
     hdr = f"**EV Charging KPI{' — ' + label if label else ''}**"
     st.markdown(hdr)
 
@@ -979,30 +993,23 @@ def show_kpi_table(results, fixed_price, tru_cycle, rc, label="", buy_d=None):
 
     with tab_cur:
         st.caption(
-            f"Charging cost = all-in price (spot + {FIXED_NET_CT:.2f} ct/kWh fixed + "
-            f"{int(VAT_RATE*100)}% VAT, avg ≈ {avg_allin_eur*100:.1f} ct/kWh)  |  "
-            f"V2G revenue = spot only ({avg_spot_eur*100:.1f} ct/kWh avg)  |  "
-            f"No fee recovery on feed-in under current German regulation."
+            f"Charge: all-in ≈{avg_allin_eur*100:.1f} ct/kWh  |  "
+            f"V2G: spot minus re-applied Netzentgelt+Stromsteuer "
+            f"({_v2g_double_ct:.2f} ct × 1+VAT = {_v2g_double_ct*(1+_vat_rate):.2f} ct penalty)"
         )
-        st.dataframe(
-            pd.DataFrame(_build_rows("current")),
-            use_container_width=True, hide_index=True
-        )
+        st.dataframe(pd.DataFrame(_build_rows("current")),
+                     use_container_width=True, hide_index=True)
 
     with tab_fut:
         st.caption(
-            f"Charging cost = same all-in price  |  "
-            f"V2G revenue = spot + {V2G_RECOVERABLE_FUTURE_CT:.2f} ct/kWh recovered "
-            f"(Netzentgelt {V2G_RECOVERABLE_FUTURE['network_fee_ct']} ct + "
-            f"Stromsteuer {V2G_RECOVERABLE_FUTURE['electricity_tax_ct']} ct)  |  "
-            f"Pending EU state aid approval for MiSpeL Pauschaloption (BNetzA 2025)."
+            f"Charge: same all-in  |  "
+            f"V2G: spot + exempt fees "
+            f"({_v2g_exempt_ct:.2f} ct × 1+VAT = {_v2g_exempt_ct*(1+_vat_rate):.2f} ct bonus)  |  "
+            f"MiSpeL Pauschaloption — pending EU state aid approval (BNetzA 2025)"
         )
-        st.dataframe(
-            pd.DataFrame(_build_rows("future")),
-            use_container_width=True, hide_index=True
-        )
+        st.dataframe(pd.DataFrame(_build_rows("future")),
+                     use_container_width=True, hide_index=True)
 
-    # ── TRU table (same in both scenarios — reefer cost unaffected by V2G rules)
     if tru_cycle != "OFF" and rc["E_kWh"] > 0.01:
         st.markdown("**Reefer (TRU) Energy Cost**")
         st.dataframe(pd.DataFrame([
@@ -1024,9 +1031,6 @@ def show_kpi_table(results, fixed_price, tru_cycle, rc, label="", buy_d=None):
 all_season_res_kpi = {}
 all_reefer_costs   = {}
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  SPECIFIC DATE MODE  (Point 3)
-# ─────────────────────────────────────────────────────────────────────────────
 if mode == "Specific Date":
     ts_date   = pd.Timestamp(specific_date)
     day_label = ts_date.strftime("%A, %d %B %Y")
@@ -1053,18 +1057,17 @@ if mode == "Specific Date":
         except Exception as e:
             st.error(f"Error: {e}"); st.stop()
 
-    # ── 6 charts: 3 power (left) | 3 SoC (right) ──────────────────────────
     render_season_block(
         v2g, day_label, color_hex,
         hours_d, buy_d, plug_d, results,
         arr_h, dep_h, is_48h, is_wknd_fullday,
-        do_B, do_C, do_D, tru_d
+        do_B, do_C, do_D, tru_d,
+        fixed_net_ct=_fixed_net_ct, vat_rate=_vat_rate
     )
     st.markdown("---")
     show_kpi_table(results, fixed_price, tru_cycle, rc, buy_d=buy_d)
-else:
 
-    # ── WINTER WEEKDAY ────────────────────────────────────────────────────────
+else:
     res_w = None
     with st.spinner("Computing Winter Weekday..."):
         try:
@@ -1086,16 +1089,15 @@ else:
             "#1565C0",
             hours_d_w, buy_d_w, plug_d_w, res_w,
             arr_h, dep_h, False, False,
-            do_B, do_C, do_D, tru_d_w
+            do_B, do_C, do_D, tru_d_w,
+            fixed_net_ct=_fixed_net_ct, vat_rate=_vat_rate
         )
 
-    # Thin divider between winter and summer
     st.markdown(
         "<hr style='border:1px solid #BBBBBB;margin:8px 0 8px 0;'>",
         unsafe_allow_html=True
     )
 
-    # ── SUMMER WEEKDAY (directly below winter — Point 5) ─────────────────────
     res_s = None
     with st.spinner("Computing Summer Weekday..."):
         try:
@@ -1117,12 +1119,12 @@ else:
             "#E65100",
             hours_d_s, buy_d_s, plug_d_s, res_s,
             arr_h, dep_h, False, False,
-            do_B, do_C, do_D, tru_d_s
+            do_B, do_C, do_D, tru_d_s,
+            fixed_net_ct=_fixed_net_ct, vat_rate=_vat_rate
         )
 
     st.markdown("---")
 
-    # ── OPTIONAL WEEKEND BLOCKS ───────────────────────────────────────────────
     weekend_cfgs = []
     if cfg["do_wwe"]:
         weekend_cfgs.append(("winter_weekend","Winter Weekend (48h Sat+Sun)","#6A1B9A",soc_w))
@@ -1146,13 +1148,13 @@ else:
             v2g, lbl, col_hex,
             hours_d_we, buy_d_we, plug_d_we, res_we,
             arr_h, dep_h, is_48h_we, False,
-            do_B, do_C, do_D, tru_d_we
+            do_B, do_C, do_D, tru_d_we,
+            fixed_net_ct=_fixed_net_ct, vat_rate=_vat_rate
         )
         st.markdown("---")
         show_kpi_table(res_we, fixed_price, tru_cycle, rc_we, lbl, buy_d=buy_d_we)
         st.markdown("---")
 
-    # ── KPI TABLES (winter + summer in tabs) ──────────────────────────────────
     st.subheader("KPI Tables")
     tab_specs = []
     if res_w is not None: tab_specs.append(("Winter Weekday", res_w, rc_w, buy_d_w))
@@ -1164,6 +1166,7 @@ else:
             with tab_obj:
                 show_kpi_table(res, fixed_price, tru_cycle, rc, lbl, buy_d=buy_d_tab)
 
+
 # =============================================================================
 #  METHODOLOGY
 # =============================================================================
@@ -1172,10 +1175,14 @@ with st.expander("Methodology & Assumptions", expanded=False):
     st.markdown(f"""
 **Price data:** SMARD DE/LU 15-min day-ahead spot prices.
 
-**Specific Date mode:** Uses actual SMARD prices for the chosen date.
+**Charts:** All-in price = (spot + {_fixed_net_ct:.3f} ct/kWh fixed) × {1+_vat_rate:.2f} VAT.
+
+**Current regulation:** V2G export kWh penalised by re-applied Netzentgelt + Stromsteuer ({_v2g_double_ct:.2f} ct × 1+VAT).
+
+**Future regulation (MiSpeL):** V2G export kWh receives exemption of {_v2g_exempt_ct:.2f} ct/kWh (× 1+VAT). Pending EU state aid approval.
 
 **Cold-chain floor:** SoC >= 20% hard MILP constraint.
-                
+
 **Departure target:** SoC >= {soc_dep}%.
 
 **Battery:** 70 kWh total / 60 kWh usable | eta_c = 0.92 | eta_d = 0.92
