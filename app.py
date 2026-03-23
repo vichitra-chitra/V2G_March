@@ -399,7 +399,7 @@ def load_two_day_profile(date_str: str) -> np.ndarray:
 @st.cache_data(show_spinner=False)
 def run_seasonal(season_key, arrival_h, departure_h,
                  soc_pct, soc_departure_pct, tru_cycle,
-                 do_B, do_C, do_D):
+                 do_B, do_C, do_D, mpc_noise_std = 0.0):
     months_map = {
         "winter_weekday": (WINTER_M, False, False),
         "summer_weekday": (SUMMER_M, False, False),
@@ -433,7 +433,7 @@ def run_seasonal(season_key, arrival_h, departure_h,
             results.append(make_kpi("C - MILP Day-Ahead",v2g,Pc,Pd,soc,
                                     buy48,v2gp48,E_init,is_weekend_48=True,tru_w=tru_w))
         if do_D:
-            Pc,Pd,soc = run_D_mpc(v2g,buy48,v2gp48,E_init,tru_w)
+            Pc,Pd,soc = run_D_mpc(v2g,buy48,v2gp48,E_init,tru_w,noise_std=mpc_noise_std)
             results.append(make_kpi("D - MPC (receding)",v2g,Pc,Pd,soc,
                                     buy48,v2gp48,E_init,is_weekend_48=True,tru_w=tru_w))
 
@@ -464,7 +464,7 @@ def run_seasonal(season_key, arrival_h, departure_h,
             results.append(make_kpi("C - MILP Day-Ahead",v2g,Pc,Pd,soc,
                                     buy_w,v2gp_w,E_init,arr,dep,tru_w=tru_w))
         if do_D:
-            Pc,Pd,soc = run_D_mpc(v2g,buy_w,v2gp_w,E_init,tru_w)
+            Pc,Pd,soc = run_D_mpc(v2g,buy_w,v2gp_w,E_init,tru_w,noise_std=mpc_noise_std)
             results.append(make_kpi("D - MPC (receding)",v2g,Pc,Pd,soc,
                                     buy_w,v2gp_w,E_init,arr,dep,tru_w=tru_w))
 
@@ -479,7 +479,7 @@ def run_seasonal(season_key, arrival_h, departure_h,
 @st.cache_data(show_spinner=False)
 def run_specific_date(date_str, arrival_h, departure_h,
                       soc_pct, soc_departure_pct, tru_cycle,
-                      do_B, do_C, do_D):
+                      do_B, do_C, do_D, mpc_noise_std=0.0):
     ts      = pd.Timestamp(date_str)
     is_wknd = ts.dayofweek >= 5
     v2g     = V2GParams(soc_departure_pct=soc_departure_pct)
@@ -562,7 +562,7 @@ def run_specific_date(date_str, arrival_h, departure_h,
         results.append(make_kpi("C - MILP Day-Ahead", v2g, Pc, Pd, soc,
                                 buy_w, v2gp_w, E_init, arr, dep, tru_w=tru_w))
     if do_D:
-        Pc, Pd, soc = run_D_mpc(v2g, buy_w, v2gp_w, E_init, tru_w)
+        Pc, Pd, soc = run_D_mpc(v2g, buy_w, v2gp_w, E_init, tru_w, noise_std=mpc_noise_std)
         results.append(make_kpi("D - MPC (receding)", v2g, Pc, Pd, soc,
                                 buy_w, v2gp_w, E_init, arr, dep, tru_w=tru_w))
 
@@ -612,6 +612,7 @@ DEFAULTS = {
     "fixed_price":   FIXED_PRICE_EUR_KWH,
     "mode":          "Seasonal Average",
     "specific_date": "2025-01-15",
+    "mpc_noise_std":  0.0,
 }
 
 if "cfg" not in st.session_state:
@@ -712,6 +713,20 @@ def render_input_panel():
             cfg["do_D"] = st.checkbox(
                 "D -- MPC receding horizon",   bool(cfg["do_D"]),
                 help="Adds ~2 min compute — cached after first run")
+            cfg["do_D"] = st.checkbox(
+                "D -- MPC receding horizon",   bool(cfg["do_D"]),
+                help="Adds ~2 min compute — cached after first run")
+            cfg["mpc_noise_std"] = st.slider(
+                "MPC forecast noise σ (EUR/kWh)",
+                min_value=0.000, max_value=0.050,
+                value=float(cfg.get("mpc_noise_std", 0.0)),
+                step=0.001, format="%.3f",
+                help=(
+                    "0.000 = perfect foresight (MPC = MILP).\n\n"
+                    "0.012 = realistic intraday uncertainty (Liu 2023).\n\n"
+                    "Higher = MPC makes worse decisions due to forecast error."
+                )
+            )
 
         # ── Column 3: TRU ─────────────────────────────────────────────────────
         with c3:
@@ -793,11 +808,13 @@ soc_w         = int(cfg["soc_winter"])
 soc_s         = int(cfg["soc_summer"])
 soc_dep       = int(cfg["soc_departure"])
 tru_cycle     = cfg["tru_cycle"]
+mpc_noise_std = float(cfg.get("mpc_noise_std", 0.0))
 w_months      = 6
 s_months      = 6
 do_B          = bool(cfg["do_B"])
 do_C          = bool(cfg["do_C"])
 do_D          = bool(cfg["do_D"])
+mpc_noise_std = float(cfg.get("mpc_noise_std", 0.0))
 fixed_price   = float(cfg["fixed_price"])
 mode          = cfg.get("mode", "Seasonal Average")
 specific_date = cfg.get("specific_date", "2025-01-15")
@@ -991,7 +1008,7 @@ else:
              is_wknd_w, is_48h_w, tru_d_w, rc_w) = run_seasonal(
                 "winter_weekday", arr_h, dep_h,
                 float(soc_w), float(soc_dep),
-                tru_cycle, do_B, do_C, do_D
+                tru_cycle, do_B, do_C, do_D, mpc_noise_std
             )
             all_season_res_kpi["winter_weekday"] = res_w_kpi
             all_reefer_costs["winter_weekday"]    = rc_w
@@ -1022,7 +1039,7 @@ else:
              is_wknd_s, is_48h_s, tru_d_s, rc_s) = run_seasonal(
                 "summer_weekday", arr_h, dep_h,
                 float(soc_s), float(soc_dep),
-                tru_cycle, do_B, do_C, do_D
+                tru_cycle, do_B, do_C, do_D, mpc_noise_std
             )
             all_season_res_kpi["summer_weekday"] = res_s_kpi
             all_reefer_costs["summer_weekday"]    = rc_s

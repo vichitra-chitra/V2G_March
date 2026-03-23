@@ -369,29 +369,62 @@ def run_C_milp(v2g, buy_w, v2gp_w, E_init, tru_w=None):
                       allow_discharge=True, tru_w=tru_w)
 
 
-def run_D_mpc(v2g, buy_w, v2gp_w, E_init, tru_w=None):
-    W  = len(buy_w)
-    dt = v2g.dt_h
-    s  = E_init
+def run_D_mpc(v2g, buy_w, v2gp_w, E_init, tru_w=None,
+              noise_std: float = 0, seed: int = 42,
+              buy_tomorrow: np.ndarray = None):
+    W   = len(buy_w)
+    dt  = v2g.dt_h
+    s   = E_init
+    rng = np.random.default_rng(seed)
+
     Pc_all  = np.zeros(W)
     Pd_all  = np.zeros(W)
     soc_all = np.zeros(W)
+
     for t in range(W):
+        # Today's remaining slots
+        buy_fc  = buy_w[t:].copy()
+        v2gp_fc = v2gp_w[t:].copy()
+
+        # Append tomorrow if provided
+        if buy_tomorrow is not None:
+            buy_fc  = np.concatenate([buy_fc,  buy_tomorrow])
+            v2gp_fc = np.concatenate([v2gp_fc, buy_tomorrow])
+
+        # Add forecast noise to today's remaining slots only
+        # (tomorrow DA is already known — no noise on it)
+        if noise_std > 0:
+            n_today = W - t
+            noise   = rng.normal(0, noise_std, size=n_today)
+            buy_fc[:n_today]  = np.maximum(0.001, buy_fc[:n_today]  + noise)
+            v2gp_fc[:n_today] = np.maximum(buy_fc[:n_today], v2gp_fc[:n_today] + noise)
+
         tw_t = tru_w[t:] if tru_w is not None else None
-        Pcw, Pdw, _ = solve_milp(v2g, buy_w[t:], v2gp_w[t:],
-                                  s, v2g.E_fin, allow_discharge=True, tru_w=tw_t)
+        # tru for tomorrow — zeros if not available
+        if buy_tomorrow is not None:
+            tru_tomorrow = np.zeros(96) if tru_w is None else get_tru_15min_trace(
+                "Continuous", 96, v2g.dt_h)
+            tw_t = np.concatenate([tw_t, tru_tomorrow]) if tw_t is not None else None
+
+        Pcw, Pdw, _ = solve_milp(v2g, buy_fc, v2gp_fc,
+                                  s, v2g.E_fin,
+                                  allow_discharge=True, tru_w=tw_t)
+
         pc = float(np.clip(Pcw[0], 0, v2g.charge_power_kW))
         pd = float(np.clip(Pdw[0], 0, v2g.discharge_power_kW))
+
         if pc > 1e-6 and pd > 1e-6:
             pc, pd = (0.0, pd) if v2gp_w[t] > buy_w[t] else (pc, 0.0)
+
         s = float(np.clip(
             s + pc * v2g.eta_charge * dt - pd / v2g.eta_discharge * dt,
             v2g.E_min, v2g.E_max))
+
         Pc_all[t]  = pc
         Pd_all[t]  = pd
         soc_all[t] = s
-    return Pc_all, Pd_all, soc_all
 
+    return Pc_all, Pd_all, soc_all
 
 # =============================================================================
 #  9. KPI BUILDER
