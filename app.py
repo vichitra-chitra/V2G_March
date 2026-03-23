@@ -946,6 +946,13 @@ if mode == "Specific Date":
     )
     st.markdown("---")
     show_kpi_table(results, fixed_price, tru_cycle, rc)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SEASONAL AVERAGE MODE
+#  Points 2, 4, 5: Winter 6 charts on top, Summer 6 charts below
+#  Each block: LEFT col = 3 power charts | RIGHT col = 3 SoC charts
+# ─────────────────────────────────────────────────────────────────────────────
+else:
     st.markdown("---")
 
     # ── WINTER WEEKDAY ────────────────────────────────────────────────────────
