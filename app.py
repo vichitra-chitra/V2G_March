@@ -712,20 +712,24 @@ def render_input_panel():
             cfg["do_C"] = st.checkbox(
                 "C -- MILP Day-Ahead + V2G",   bool(cfg["do_C"]), key="form_do_C")
             cfg["do_D"] = st.checkbox(
-                "D -- MPC receding horizon",   bool(cfg["do_D"]),
+                "D -- MPC receding horizon", bool(cfg["do_D"]),
                 help="Adds ~2 min compute — cached after first run", key="form_do_D")
-            cfg["mpc_noise_std"] = st.slider(
-                "MPC forecast noise σ (EUR/kWh)",
-                min_value=0.00, max_value=0.05,
-                value=float(cfg.get("mpc_noise_std", 0.0)),
-                step=0.01, format="%.2f",
-                help=(
-                    "0.000 = perfect foresight (MPC = MILP).\n\n"
-                    "0.012 = realistic intraday uncertainty (Liu 2023).\n\n"
-                    "Higher = MPC makes worse decisions due to forecast error."
-                ),
-                key="form_mpc_noise"
-            )
+            if cfg["do_D"]:
+                cfg["mpc_noise_std"] = st.slider(
+                    "MPC forecast noise σ (EUR/kWh)",
+                    min_value=0.000, max_value=0.050,
+                    value=float(cfg.get("mpc_noise_std", 0.0)),
+                    step=0.001, format="%.3f",
+                    help=(
+                        "0.000 = perfect foresight (MPC = MILP).\n\n"
+                        "0.012 = realistic intraday uncertainty (Liu 2023).\n\n"
+                        "Higher = MPC makes worse decisions due to forecast error."
+                    ),
+                    key="form_mpc_noise"
+                )
+            else:
+                cfg["mpc_noise_std"] = 0.0
+                st.caption("↑ Enable MPC to set forecast noise")
 
         # ── Column 3: TRU ─────────────────────────────────────────────────────
         with c3:
