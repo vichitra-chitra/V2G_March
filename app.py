@@ -349,6 +349,33 @@ def load_date_profile(date_str: str) -> np.ndarray:
     return _interpolate_to_15min(prices)
 
 
+
+@st.cache_data(show_spinner=False)
+def load_two_day_profile(date_str: str) -> np.ndarray:
+    """
+    Load 192-slot price array for the overnight window that starts on `date_str`
+    and ends on the following calendar day.
+    Slots 0–95   = prices for day D  (date_str)
+    Slots 96–191 = prices for day D+1
+    """
+    day1 = load_date_profile(date_str)
+
+    next_date_str = (
+        pd.Timestamp(date_str) + pd.Timedelta(days=1)
+    ).strftime("%Y-%m-%d")
+
+    try:
+        day2 = load_date_profile(next_date_str)
+    except ValueError:
+        raise ValueError(
+            f"Next-day price data for **{next_date_str}** was not found in the "
+            f"CSV file. Please select an earlier date so that the full "
+            f"overnight window (arrival on {date_str} → departure on "
+            f"{next_date_str}) is available."
+        )
+
+    return np.concatenate([day1, day2])
+
 # =============================================================================
 #  SCENARIO RUNNER — seasonal average
 # =============================================================================
@@ -437,16 +464,18 @@ def run_seasonal(season_key, arrival_h, departure_h,
 def run_specific_date(date_str, arrival_h, departure_h,
                       soc_pct, soc_departure_pct, tru_cycle,
                       do_B, do_C, do_D):
-    buy     = load_date_profile(date_str)
-    v2gp    = buy.copy()
     ts      = pd.Timestamp(date_str)
     is_wknd = ts.dayofweek >= 5
     v2g     = V2GParams(soc_departure_pct=soc_departure_pct)
     E_init  = v2g.usable_capacity_kWh * soc_pct / 100.0
 
+    # ── WEEKEND — single day, full 24 h (unchanged) ───────────────────────────
     if is_wknd:
+        buy             = load_date_profile(date_str)
+        v2gp            = buy.copy()
         W               = 96
-        buy_w           = buy; v2gp_w = v2gp
+        buy_w           = buy
+        v2gp_w          = v2gp
         tru_w           = get_tru_15min_trace(tru_cycle, W, v2g.dt_h)
         buy_d           = buy
         plug_d          = np.ones(96)
@@ -455,30 +484,71 @@ def run_specific_date(date_str, arrival_h, departure_h,
         arr, dep        = 0, 96
         is_48h          = False
         is_wknd_fullday = True
+
+    # ── WEEKDAY — overnight window spanning two calendar days ─────────────────
     else:
-        win, arr, dep, W = get_wd_window(v2g, arrival_h, departure_h)
-        buy_w  = buy[win]; v2gp_w = v2gp[win]
-        tru_w  = get_tru_15min_trace(tru_cycle, W, v2g.dt_h)
-        buy_d, plug_d, hours_d = build_wd_display(v2g, buy, arrival_h, departure_h)
-        tru_d           = np.zeros(v2g.n_slots)
-        tru_d[arr:dep]  = tru_w[:dep - arr]
+        # 192-slot array: [day D (slots 0–95)] + [day D+1 (slots 96–191)]
+        # Raises ValueError with user-readable message if D+1 is missing
+        buy_192  = load_two_day_profile(date_str)
+        v2gp_192 = buy_192.copy()
+
+        # ROLL = 48 slots = 12 h → display window starts at 12:00 on day D
+        ROLL     = round(12.0 / v2g.dt_h)          # 48
+
+        # Slot indices within the 192-slot array
+        arr_slot = round(arrival_h   / v2g.dt_h) % 96   # e.g. 16:00 → slot 64
+        dep_slot = round(departure_h / v2g.dt_h) % 96   # e.g. 06:00 → slot 24
+
+        # Optimisation window — correct prices for both days
+        buy_w   = buy_192[arr_slot : 96 + dep_slot]
+        v2gp_w  = buy_w.copy()
+        W       = len(buy_w)
+
+        # Display array — 96 slots, 12:00 day D → 12:00 day D+1 (same x-axis style)
+        buy_d   = buy_192[ROLL : ROLL + 96]
+        hours_d = np.arange(96) * v2g.dt_h + 12.0      # 12.00 … 35.75
+
+        # Plugged-in mask on the 12–36 h chart
+        dep_on_chart = (departure_h + 24.0) if departure_h < 12.0 else departure_h
+        plug_d = (
+            (hours_d >= arrival_h) & (hours_d < dep_on_chart)
+        ).astype(float)
+
+        # Display positions for to_display_wd / make_kpi (0-based into 96-slot display)
+        arr_disp = arr_slot - ROLL          # e.g. 64 - 48 = 16
+        dep_disp = ROLL     + dep_slot      # e.g. 48 + 24 = 72
+        arr, dep = arr_disp, dep_disp
+
+        # TRU display trace
+        tru_w = get_tru_15min_trace(tru_cycle, W, v2g.dt_h)
+        tru_d = np.zeros(96)
+        d_s   = max(0, arr_disp)
+        d_e   = min(96, dep_disp)
+        w_s   = d_s - arr_disp
+        w_e   = w_s + (d_e - d_s)
+        if w_e > w_s:
+            tru_d[d_s:d_e] = tru_w[w_s:w_e]
+
         is_48h          = False
         is_wknd_fullday = False
 
-    Pc,Pd,soc = run_A_dumb(v2g,buy_w,v2gp_w,W,E_init,tru_w)
-    results = [make_kpi("A - Dumb",v2g,Pc,Pd,soc,buy_w,v2gp_w,E_init,arr,dep,tru_w=tru_w)]
+    # ── Run scenarios (identical for both paths) ──────────────────────────────
+    Pc, Pd, soc = run_A_dumb(v2g, buy_w, v2gp_w, W, E_init, tru_w)
+    results = [make_kpi("A - Dumb", v2g, Pc, Pd, soc,
+                        buy_w, v2gp_w, E_init, arr, dep, tru_w=tru_w)]
+
     if do_B:
-        Pc,Pd,soc = run_B_smart(v2g,buy_w,v2gp_w,E_init,tru_w)
-        results.append(make_kpi("B - Smart (no V2G)",v2g,Pc,Pd,soc,
-                                buy_w,v2gp_w,E_init,arr,dep,tru_w=tru_w))
+        Pc, Pd, soc = run_B_smart(v2g, buy_w, v2gp_w, E_init, tru_w)
+        results.append(make_kpi("B - Smart (no V2G)", v2g, Pc, Pd, soc,
+                                buy_w, v2gp_w, E_init, arr, dep, tru_w=tru_w))
     if do_C:
-        Pc,Pd,soc = run_C_milp(v2g,buy_w,v2gp_w,E_init,tru_w)
-        results.append(make_kpi("C - MILP Day-Ahead",v2g,Pc,Pd,soc,
-                                buy_w,v2gp_w,E_init,arr,dep,tru_w=tru_w))
+        Pc, Pd, soc = run_C_milp(v2g, buy_w, v2gp_w, E_init, tru_w)
+        results.append(make_kpi("C - MILP Day-Ahead", v2g, Pc, Pd, soc,
+                                buy_w, v2gp_w, E_init, arr, dep, tru_w=tru_w))
     if do_D:
-        Pc,Pd,soc = run_D_mpc(v2g,buy_w,v2gp_w,E_init,tru_w)
-        results.append(make_kpi("D - MPC (receding)",v2g,Pc,Pd,soc,
-                                buy_w,v2gp_w,E_init,arr,dep,tru_w=tru_w))
+        Pc, Pd, soc = run_D_mpc(v2g, buy_w, v2gp_w, E_init, tru_w)
+        results.append(make_kpi("D - MPC (receding)", v2g, Pc, Pd, soc,
+                                buy_w, v2gp_w, E_init, arr, dep, tru_w=tru_w))
 
     rc = compute_reefer_costs(tru_w, buy_w, v2g.dt_h)
     return (results, buy_d, plug_d, hours_d,
