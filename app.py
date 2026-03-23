@@ -576,9 +576,14 @@ DEFAULTS = {
     "t_elec_tax":       2.05,
     "t_nev19":          1.559,
     "t_vat":            19.0,
-    # Future — exempt fees
+    # Future — exempt fees (MiSpeL)
     "t_fut_network":    6.63,
+    "t_fut_concession": 1.992,
+    "t_fut_offshore":   0.941,
+    "t_fut_chp":        0.446,
     "t_fut_elec_tax":   2.05,
+    "t_fut_nev19":      1.559,
+    "t_fut_vat":        19.0,
 }
 
 if "cfg" not in st.session_state:
@@ -699,28 +704,52 @@ def render_input_panel():
             )
 
             # ── Future Regulation (MiSpeL) ─────────────────────────────────
+            # ── Future Regulation (MiSpeL) ─────────────────────────────────
             st.markdown(
                 "<div style='background:#2E7D32;color:white;padding:2px 8px;"
                 "border-radius:4px;font-size:11px;font-weight:bold;"
                 "margin-bottom:4px;margin-top:6px;'>"
-                "🔮 Future (MiSpeL) — V2G Exempt Fees (ct/kWh)</div>",
+                "🔮 Future (MiSpeL) — Exempt Fees on V2G Export (ct/kWh)</div>",
                 unsafe_allow_html=True
             )
-            _fc, _fd = st.columns(2)
-            with _fc:
+            _fe, _ff = st.columns(2)
+            with _fe:
                 cfg["t_fut_network"] = st.number_input(
-                    "Netzentgelt exempt", value=float(cfg["t_fut_network"]),
+                    "Netzentgelt", value=float(cfg.get("t_fut_network", 6.63)),
                     min_value=0.0, max_value=20.0, step=0.01, format="%.3f",
-                    key="tf_nf", help="Set to 0 to disable")
-            with _fd:
+                    key="tf_nf", help="Set to 0 to remove exemption")
+                cfg["t_fut_concession"] = st.number_input(
+                    "Konzession", value=float(cfg.get("t_fut_concession", 1.992)),
+                    min_value=0.0, max_value=10.0, step=0.001, format="%.3f",
+                    key="tf_con", help="Set to 0 to remove exemption")
+                cfg["t_fut_offshore"] = st.number_input(
+                    "Offshore", value=float(cfg.get("t_fut_offshore", 0.941)),
+                    min_value=0.0, max_value=10.0, step=0.001, format="%.3f",
+                    key="tf_off", help="Set to 0 to remove exemption")
+            with _ff:
+                cfg["t_fut_chp"] = st.number_input(
+                    "KWKG", value=float(cfg.get("t_fut_chp", 0.446)),
+                    min_value=0.0, max_value=5.0, step=0.001, format="%.3f",
+                    key="tf_chp", help="Set to 0 to remove exemption")
                 cfg["t_fut_elec_tax"] = st.number_input(
-                    "Stromsteuer exempt", value=float(cfg["t_fut_elec_tax"]),
+                    "Stromsteuer", value=float(cfg.get("t_fut_elec_tax", 2.05)),
                     min_value=0.0, max_value=10.0, step=0.01, format="%.3f",
-                    key="tf_et", help="Set to 0 to disable")
-            _fut_total = cfg["t_fut_network"] + cfg["t_fut_elec_tax"]
+                    key="tf_et", help="Set to 0 to remove exemption")
+                cfg["t_fut_nev19"] = st.number_input(
+                    "NEV-19", value=float(cfg.get("t_fut_nev19", 1.559)),
+                    min_value=0.0, max_value=10.0, step=0.001, format="%.3f",
+                    key="tf_nev", help="Set to 0 to remove exemption")
+            cfg["t_fut_vat"] = st.number_input(
+                "VAT on exempt (%)", value=float(cfg.get("t_fut_vat", 19.0)),
+                min_value=0.0, max_value=30.0, step=0.1, format="%.1f",
+                key="tf_vat")
+            _fut_total = (cfg["t_fut_network"] + cfg["t_fut_concession"]
+                          + cfg["t_fut_offshore"] + cfg["t_fut_chp"]
+                          + cfg["t_fut_elec_tax"] + cfg["t_fut_nev19"])
+            _vat_fut = cfg["t_fut_vat"] / 100.0
             st.caption(
-                f"Exempt: **{_fut_total:.3f} ct/kWh** "
-                f"(+VAT: **{_fut_total * (1 + _vat):.3f} ct**) added to V2G rev | "
+                f"Total exempt: **{_fut_total:.3f} ct/kWh** "
+                f"(+VAT: **{_fut_total * (1 + _vat_fut):.3f} ct**) added to V2G rev | "
                 f"Pending EU state aid approval (BNetzA 2025)"
             )
 
@@ -851,7 +880,9 @@ _fixed_net_ct = (cfg["t_network_fee"] + cfg["t_concession"] + cfg["t_offshore"]
                  + cfg["t_chp"] + cfg["t_elec_tax"] + cfg["t_nev19"])
 _vat_rate     = cfg["t_vat"] / 100.0
 _v2g_double_ct = cfg["t_network_fee"] + cfg["t_elec_tax"]   # current: re-applied on V2G
-_v2g_exempt_ct = cfg["t_fut_network"] + cfg["t_fut_elec_tax"]  # future: exempt on V2G
+_v2g_exempt_ct = (cfg.get("t_fut_network", 6.63) + cfg.get("t_fut_concession", 1.992)
+                  + cfg.get("t_fut_offshore", 0.941) + cfg.get("t_fut_chp", 0.446)
+                  + cfg.get("t_fut_elec_tax", 2.05) + cfg.get("t_fut_nev19", 1.559))
 
 # ── Sidebar quick-edit ────────────────────────────────────────────────────────
 with st.sidebar:
