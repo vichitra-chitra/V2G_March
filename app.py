@@ -349,30 +349,41 @@ def load_date_profile(date_str: str) -> np.ndarray:
     return _interpolate_to_15min(prices)
 
 
-
 @st.cache_data(show_spinner=False)
 def load_two_day_profile(date_str: str) -> np.ndarray:
     """
-    Load 192-slot price array for the overnight window that starts on `date_str`
-    and ends on the following calendar day.
-    Slots 0–95   = prices for day D  (date_str)
+    Load 192-slot price array for the overnight window starting on `date_str`.
+    Slots 0–95   = prices for day D
     Slots 96–191 = prices for day D+1
+    If D+1 is not in the CSV (e.g. Dec 31 → Jan 1 next year),
+    falls back to the same calendar date one year earlier and shows a notice.
     """
     day1 = load_date_profile(date_str)
 
-    next_date_str = (
-        pd.Timestamp(date_str) + pd.Timedelta(days=1)
-    ).strftime("%Y-%m-%d")
+    next_ts       = pd.Timestamp(date_str) + pd.Timedelta(days=1)
+    next_date_str = next_ts.strftime("%Y-%m-%d")
 
     try:
         day2 = load_date_profile(next_date_str)
+
     except ValueError:
-        raise ValueError(
-            f"Next-day price data for **{next_date_str}** was not found in the "
-            f"CSV file. Please select an earlier date so that the full "
-            f"overnight window (arrival on {date_str} → departure on "
-            f"{next_date_str}) is available."
-        )
+        # D+1 not in CSV — try same date one year back (e.g. 2026-01-01 → 2025-01-01)
+        fallback_ts       = next_ts.replace(year=next_ts.year - 1)
+        fallback_date_str = fallback_ts.strftime("%Y-%m-%d")
+
+        try:
+            day2 = load_date_profile(fallback_date_str)
+            st.info(
+                f"ℹ️ Post-midnight prices (00:00–{departure_h:.0f}:00) for "
+                f"**{next_date_str}** are not in the CSV.  "
+                f"Using **{fallback_date_str}** (same day, prior year) as a proxy."
+            )
+        except ValueError:
+            raise ValueError(
+                f"Next-day price data for **{next_date_str}** was not found, "
+                f"and the fallback date **{fallback_date_str}** is also missing. "
+                f"Please check your CSV coverage."
+            )
 
     return np.concatenate([day1, day2])
 
