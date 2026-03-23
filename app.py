@@ -1,8 +1,3 @@
-"""
-S.KOe COOL -- V2G Optimisation  |  Streamlit App (v7)
-TU Dortmund IE3 x Schmitz Cargobull AG | 2026
-"""
-
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -349,40 +344,30 @@ def load_date_profile(date_str: str) -> np.ndarray:
     return _interpolate_to_15min(prices)
 
 
+
 @st.cache_data(show_spinner=False)
 def load_two_day_profile(date_str: str) -> np.ndarray:
     """
-    Load 192-slot price array for the overnight window starting on `date_str`.
-    Slots 0–95   = prices for day D
+    Load 192-slot price array for the overnight window that starts on `date_str`
+    and ends on the following calendar day.
+    Slots 0–95   = prices for day D  (date_str)
     Slots 96–191 = prices for day D+1
-    If D+1 is not in the CSV (e.g. Dec 31 → Jan 1 next year),
-    falls back to the same calendar date one year earlier and shows a notice.
     """
     day1 = load_date_profile(date_str)
 
-    next_ts       = pd.Timestamp(date_str) + pd.Timedelta(days=1)
-    next_date_str = next_ts.strftime("%Y-%m-%d")
+    next_date_str = (
+        pd.Timestamp(date_str) + pd.Timedelta(days=1)
+    ).strftime("%Y-%m-%d")
 
     try:
         day2 = load_date_profile(next_date_str)
-
     except ValueError:
-        # D+1 not in CSV — try same date one year back (e.g. 2026-01-01 → 2025-01-01)
-        fallback_ts       = next_ts.replace(year=next_ts.year - 1)
-        fallback_date_str = fallback_ts.strftime("%Y-%m-%d")
-
-        try:
-            day2 = load_date_profile(fallback_date_str)
-            st.info(
-                f"ℹ️ Post-midnight prices for **{next_date_str}** are not in the CSV.  "
-                f"Using **{fallback_date_str}** (same day, prior year) as a proxy."
-            )
-        except ValueError:
-            raise ValueError(
-                f"Next-day price data for **{next_date_str}** was not found, "
-                f"and the fallback date **{fallback_date_str}** is also missing. "
-                f"Please check your CSV coverage."
-            )
+        raise ValueError(
+            f"Next-day price data for **{next_date_str}** was not found in the "
+            f"CSV file. Please select an earlier date so that the full "
+            f"overnight window (arrival on {date_str} → departure on "
+            f"{next_date_str}) is available."
+        )
 
     return np.concatenate([day1, day2])
 
@@ -603,7 +588,6 @@ DEFAULTS = {
     "do_D":          False,
     "do_wwe":        False,
     "do_swe":        False,
-    "do_price":      False,
     "fixed_price":   FIXED_PRICE_EUR_KWH,
     "wd_per_month":  22.0,
     "mode":          "Seasonal Average",
@@ -621,9 +605,8 @@ if "show_output" not in st.session_state:
 # =============================================================================
 
 def render_input_panel():
-    st.title("S.KOe COOL -- V2G Optimisation")
+    st.title("S.KOe COOL 2.0 - V2G Optimisation")
     st.caption(
-        "TU Dortmund IE3 x Schmitz Cargobull AG  |  "
         "Master's Thesis 2026  |  Kuldip Bhadreshvara"
     )
     st.markdown("---")
@@ -681,11 +664,6 @@ def render_input_panel():
                     f"{'Weekend — full 24h' if dow_sel >= 5 else 'Weekday — overnight window'}  |  "
                     f"{'Winter' if mth_sel in WINTER_M else 'Summer'}"
                 )
-
-            st.markdown("##### Season Split")
-            cfg["winter_months"] = st.slider(
-                "Winter months", 1, 11, int(cfg["winter_months"]))
-            st.caption(f"Summer months auto: **{12 - int(cfg['winter_months'])}**")
 
             st.markdown("##### Fixed-Tariff Benchmark")
             cfg["fixed_price"] = st.number_input(
@@ -754,8 +732,6 @@ def render_input_panel():
                 help="Adds a 48h Sat+Sun block below the weekday charts")
             cfg["do_swe"]   = st.checkbox(
                 "Summer weekend (48h)", bool(cfg["do_swe"]))
-            cfg["do_price"] = st.checkbox(
-                "Price profile analysis", bool(cfg["do_price"]))
 
             st.markdown("---")
             st.markdown("**S.KOe COOL specs**")
@@ -808,8 +784,8 @@ soc_w         = int(cfg["soc_winter"])
 soc_s         = int(cfg["soc_summer"])
 soc_dep       = int(cfg["soc_departure"])
 tru_cycle     = cfg["tru_cycle"]
-w_months      = int(cfg["winter_months"])
-s_months      = 12 - w_months
+w_months      = 6
+s_months      = 6
 do_B          = bool(cfg["do_B"])
 do_C          = bool(cfg["do_C"])
 do_D          = bool(cfg["do_D"])
@@ -826,7 +802,6 @@ with st.sidebar:
     cfg["soc_winter"]    = st.slider("Winter arrival SoC (%)",   20, 100, soc_w)
     cfg["soc_summer"]    = st.slider("Summer arrival SoC (%)",   20, 100, soc_s)
     cfg["soc_departure"] = st.slider("Departure target SoC (%)", 50, 100, soc_dep)
-    cfg["winter_months"] = st.slider("Winter months", 1, 11, w_months)
     cfg["tru_cycle"]     = st.radio(
         "TRU cycle", ["Continuous", "Start-Stop", "OFF"],
         index=["Continuous", "Start-Stop", "OFF"].index(tru_cycle))
@@ -854,8 +829,8 @@ with st.sidebar:
     soc_s         = int(cfg["soc_summer"])
     soc_dep       = int(cfg["soc_departure"])
     tru_cycle     = cfg["tru_cycle"]
-    w_months      = int(cfg["winter_months"])
-    s_months      = 12 - w_months
+    w_months      = 6
+    s_months      = 6
     mode          = cfg["mode"]
     specific_date = cfg.get("specific_date", "2025-01-15")
 
@@ -1150,27 +1125,6 @@ else:
         except Exception as e:
             st.error(f"KPI chart error: {e}")
 
-    # ── PRICE ANALYSIS ────────────────────────────────────────────────────────
-    if cfg["do_price"]:
-        st.markdown("---")
-        st.subheader("Electricity Price Analysis")
-        with st.spinner("Building price charts..."):
-            try:
-                buf = BytesIO()
-                plot_price_profiles(CSV_PATH, buf)
-                buf.seek(0)
-                st.image(buf, use_container_width=True)
-                buf2 = BytesIO()
-                plot_price_profiles(CSV_PATH, buf2)
-                buf2.seek(0)
-                st.download_button(
-                    "Download price analysis (PNG)",
-                    data=buf2, file_name="v2g_price_profiles.png",
-                    mime="image/png", key="dl_price"
-                )
-            except Exception as e:
-                st.error(f"Price analysis error: {e}")
-
 
 # =============================================================================
 #  METHODOLOGY
@@ -1181,31 +1135,15 @@ with st.expander("Methodology & Assumptions", expanded=False):
 **Price data:** Raw SMARD DE/LU 15-min day-ahead spot prices.
 No tariff surcharges or VAT added. Both charge cost and V2G revenue use the raw spot price.
 
-**Chart layout (Seasonal Average mode):**
-- Winter block on top: LEFT = 3 Power charts vertical | RIGHT = 3 SoC charts vertical
-- Summer block directly below with identical structure
-- Power charts: dual Y-axis — kW (left), EUR/MWh price (right)
-- Each pairwise: Dumb (grey) vs Smart / MILP / MPC
-
 **Specific Date mode:** Uses actual SMARD prices for the chosen date.
-Weekday shows the overnight depot window. Weekend shows full 24h.
-
-**Optimisation:** MILP with binary charge/discharge mutex.
-
-**TRU modelling ({tru_cycle}):** Competes with charger on 22 kW grid connection.
-Effective charging = max(0, 22 kW minus TRU load). TRU does NOT drain the battery.
-- Continuous: 7.6 / 0.7 kW (1717 s / 292 s), avg **{tru_avg_kw("Continuous"):.1f} kW**
-- Start-Stop: 9.7 / 0.65 / 0 kW, avg **{tru_avg_kw("Start-Stop"):.1f} kW**
 
 **Cold-chain floor:** SoC >= 20% hard MILP constraint.
+                
 **Departure target:** SoC >= {soc_dep}%.
+
 **Battery:** 70 kWh total / 60 kWh usable | eta_c = 0.92 | eta_d = 0.92
+
 **Yearly extrapolation:** {int(cfg['wd_per_month'])} working days/month x seasonal split.
+
 **Fixed-tariff benchmark:** EUR {fixed_price:.2f}/kWh (comparison only).
     """)
-
-st.caption(
-    "S.KOe COOL V2G Optimisation  -  "
-    "TU Dortmund IE3 x Schmitz Cargobull AG  -  "
-    "Thesis 2026  -  Confidential"
-)
