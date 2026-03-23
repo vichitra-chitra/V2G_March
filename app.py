@@ -299,8 +299,6 @@ def render_season_block(v2g, season_title, color_hex,
     col_pow, col_soc = st.columns(2)
 
     with col_pow:
-        st.caption("⚡ **Charge / Discharge Power**  "
-                   "(left axis = kW  |  right axis = ct/kWh all-in incl. taxes & grid fees)")
         for result_X, x_label, x_key in comparisons:
             buf = make_power_chart(
                 v2g, hours_d, buy_d, plug_d,
@@ -1180,7 +1178,7 @@ def show_kpi_table(results, fixed_price, tru_cycle, rc, label="", buy_d=None):
             })
         return rows
 
-    hdr = f"**EV Charging KPI{' — ' + label if label else ''}**"
+    hdr = f"**Charging KPI{' — ' + label if label else ''}**"
     st.markdown(hdr)
 
     tab_cur, tab_fut = st.tabs([
@@ -1189,21 +1187,10 @@ def show_kpi_table(results, fixed_price, tru_cycle, rc, label="", buy_d=None):
     ])
 
     with tab_cur:
-        st.caption(
-            f"Charge: all-in ≈{avg_allin_eur*100:.1f} ct/kWh  |  "
-            f"V2G: spot minus re-applied Netzentgelt+Stromsteuer "
-            f"({_v2g_double_ct:.2f} ct × 1+VAT = {_v2g_double_ct*(1+_vat_rate):.2f} ct penalty)"
-        )
         st.dataframe(pd.DataFrame(_build_rows("current")),
                      use_container_width=True, hide_index=True)
 
     with tab_fut:
-        st.caption(
-            f"Charge: same all-in  |  "
-            f"V2G: spot + exempt fees "
-            f"({_v2g_exempt_ct:.2f} ct × 1+VAT = {_v2g_exempt_ct*(1+_vat_rate):.2f} ct bonus)  |  "
-            f"MiSpeL Pauschaloption — pending EU state aid approval (BNetzA 2025)"
-        )
         st.dataframe(pd.DataFrame(_build_rows("future")),
                      use_container_width=True, hide_index=True)
 
@@ -1387,7 +1374,7 @@ with st.expander("Methodology & Assumptions", expanded=False):
     st.markdown(f"""
 **Price data:** SMARD DE/LU 15-min day-ahead spot prices.
 
-**Charts:** All-in price = (spot + {_fixed_net_ct:.3f} ct/kWh fixed) × {1+_vat_rate:.2f} VAT.
+**Charts:** All-in price = (spot + {_fixed_net_ct:.3f} ct/kWh Tax & Levy) × {1+_vat_rate:.2f} VAT.
 
 **Current regulation:** V2G export kWh penalised by re-applied Netzentgelt + Stromsteuer ({_v2g_double_ct:.2f} ct × 1+VAT).
 
@@ -1397,7 +1384,7 @@ with st.expander("Methodology & Assumptions", expanded=False):
 
 **Departure target:** SoC >= {soc_dep}%.
 
-**Battery:** 70 kWh total / 60 kWh usable | eta_c = 0.92 | eta_d = 0.92
+**Battery:** 70 kWh total / 60 kWh usable
 
-**Fixed-tariff benchmark:** EUR {fixed_price:.2f}/kWh (comparison only).
+**Fixed-tariff benchmark:** EUR {fixed_price:.2f}/kWh.
     """)
