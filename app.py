@@ -527,6 +527,106 @@ def run_specific_date(date_str, arrival_h, departure_h,
 
 
 # =============================================================================
+#  ANNUAL COMPUTATION — all days in CSV individually
+# =============================================================================
+
+@st.cache_data(show_spinner=False)
+def run_annual_all_days(
+    arrival_h, departure_h,
+    soc_w, soc_s, soc_dep,
+    tru_cycle, do_B, do_C, do_D, mpc_noise_std,
+    fixed_net_ct, vat_rate,
+    v2g_double_ct, v2g_exempt_ct, vat_fut_rate,
+    fixed_price_eur,
+):
+    """
+    Runs optimisation for every available date in the 2025 CSV individually.
+    Winter = Oct-Mar (months 10,11,12,1,2,3).
+    Summer = Apr-Sep (months 4,5,6,7,8,9).
+    Weekdays : overnight window arrival_h -> departure_h next morning.
+    Weekends : full 24h plugged-in.
+    Missing dates silently skipped.
+    F benchmark uses Scenario A charge_kwh x fixed_price_eur (no V2G).
+    Charge cost uses all-in price (spot + fixed fees + VAT).
+    V2G rev current : max(0, v2g_kwh x avg_spot - v2g_kwh x double_tax x (1+VAT)).
+    V2G rev future  : v2g_kwh x avg_spot + v2g_kwh x exempt_ct x (1+VAT_fut).
+    Annual = raw sum of all valid days (no averaging).
+    """
+    df_all    = _load_csv_raw(CSV_PATH)
+    all_dates = sorted(df_all["date"].unique())
+
+    sc_keys = ["A"]
+    if do_B: sc_keys.append("B")
+    if do_C: sc_keys.append("C")
+    if do_D: sc_keys.append("D")
+
+    double_tax_eur = v2g_double_ct / 100.0
+    exempt_eur     = v2g_exempt_ct / 100.0
+
+    acc = {sc: {"charge_cost": 0.0, "v2g_rev_cur": 0.0, "v2g_rev_fut": 0.0}
+           for sc in sc_keys}
+    acc["F"] = {"charge_cost": 0.0, "v2g_rev_cur": 0.0, "v2g_rev_fut": 0.0}
+
+    n_valid = 0
+
+    for date in all_dates:
+        date_str = str(date)
+        ts       = pd.Timestamp(date_str)
+        is_win   = ts.month in WINTER_M
+        soc_init = float(soc_w) if is_win else float(soc_s)
+
+        try:
+            (results, buy_d, _plug, _hours,
+             _is_wknd, _is_48h, _is_wknd_fd, _tru_d, _rc) = run_specific_date(
+                date_str, arrival_h, departure_h,
+                soc_init, float(soc_dep),
+                tru_cycle, do_B, do_C, do_D, mpc_noise_std,
+            )
+        except Exception:
+            continue  # skip missing / broken dates silently
+
+        avg_spot_eur  = float(np.mean(buy_d))
+        avg_allin_eur = float(np.mean(
+            to_allin_ct(buy_d, fixed_net_ct, vat_rate))) / 100.0
+
+        result_A = results[0]
+
+        # F benchmark: A's charge_kwh at fixed tariff, no V2G
+        acc["F"]["charge_cost"] += result_A["charge_kwh"] * fixed_price_eur
+
+        # Scenarios A ... D
+        for i, sc in enumerate(sc_keys):
+            r           = results[i]
+            charge_cost = r["charge_kwh"] * avg_allin_eur
+            v2g_rev_cur = max(0.0,
+                r["v2g_kwh"] * avg_spot_eur
+                - r["v2g_kwh"] * double_tax_eur * (1.0 + vat_rate))
+            v2g_rev_fut = (
+                r["v2g_kwh"] * avg_spot_eur
+                + r["v2g_kwh"] * exempt_eur * (1.0 + vat_fut_rate))
+
+            acc[sc]["charge_cost"] += charge_cost
+            acc[sc]["v2g_rev_cur"] += v2g_rev_cur
+            acc[sc]["v2g_rev_fut"] += v2g_rev_fut
+
+        n_valid += 1
+
+    out_scenarios = ["F"] + sc_keys
+    out = {"n_days": n_valid, "scenarios": out_scenarios}
+    for sc in out_scenarios:
+        cc     = acc[sc]["charge_cost"]
+        vr_cur = acc[sc]["v2g_rev_cur"]
+        vr_fut = acc[sc]["v2g_rev_fut"]
+        out[sc] = {
+            "charge_cost": cc,
+            "v2g_rev_cur": vr_cur,
+            "v2g_rev_fut": vr_fut,
+            "net_cur":     cc - vr_cur,
+            "net_fut":     cc - vr_fut,
+        }
+    return out
+
+# =============================================================================
 #  AUTHENTICATION
 # =============================================================================
 
@@ -883,6 +983,7 @@ _v2g_double_ct = cfg["t_network_fee"] + cfg["t_elec_tax"]   # current: re-applie
 _v2g_exempt_ct = (cfg.get("t_fut_network", 6.63) + cfg.get("t_fut_concession", 1.992)
                   + cfg.get("t_fut_offshore", 0.941) + cfg.get("t_fut_chp", 0.446)
                   + cfg.get("t_fut_elec_tax", 2.05) + cfg.get("t_fut_nev19", 1.559))
+_vat_fut_rate  = cfg.get("t_fut_vat", 19.0) / 100.0
 
 # ── Sidebar quick-edit ────────────────────────────────────────────────────────
 with st.sidebar:
@@ -955,6 +1056,87 @@ m5.metric("Mode", "Seasonal avg" if mode == "Seasonal Average"
 st.markdown("---")
 
 
+
+# =============================================================================
+#  ANNUAL GRAPHS
+# =============================================================================
+
+def make_annual_graphs(annual_data):
+    """3 side-by-side bar charts: Charge Cost | V2G Revenue | Net Cost."""
+    sc_list  = annual_data["scenarios"]   # ["F","A", ...]
+    n_days   = annual_data["n_days"]
+
+    SC_COLOR_MAP = {"F": "#78909C", "A": SC_COL["A"],
+                    "B": SC_COL.get("B","#F57C00"), "C": SC_COL.get("C","#6A1B9A"),
+                    "D": SC_COL.get("D","#00838F")}
+    sc_labels = {"F": "F\nFixed", "A": "A\nDumb",
+                 "B": "B\nSmart", "C": "C\nMILP", "D": "D\nMPC"}
+    x_labels  = [sc_labels.get(sc, sc) for sc in sc_list]
+    colors    = [SC_COLOR_MAP.get(sc, "#888888") for sc in sc_list]
+
+    st.markdown(
+        "<div style='background:#37474F;color:white;padding:5px 14px;"
+        "border-radius:5px;font-weight:bold;font-size:14px;margin-bottom:6px;'>"
+        f"📊 Annual Summary — {n_days} days computed (2025, day-by-day optimisation)"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    tab_cur, tab_fut = st.tabs([
+        "📋 Current Regulation (2025)",
+        "🔮 Future Regulation (MiSpeL)",
+    ])
+
+    for tab, reg, reg_lbl in [
+        (tab_cur, "cur", "Current Regulation"),
+        (tab_fut, "fut", "Future Regulation (MiSpeL)"),
+    ]:
+        with tab:
+            charge_vals = [annual_data[sc]["charge_cost"]       for sc in sc_list]
+            v2g_vals    = [annual_data[sc][f"v2g_rev_{reg}"]    for sc in sc_list]
+            net_vals    = [annual_data[sc][f"net_{reg}"]        for sc in sc_list]
+
+            graph_specs = [
+                ("Annual Charge Cost (€/year)",   charge_vals),
+                ("Annual V2G Revenue (€/year)",   v2g_vals),
+                ("Annual Net Cost (€/year)",      net_vals),
+            ]
+
+            fig, axes = plt.subplots(1, 3, figsize=(14, 4.5))
+            fig.patch.set_facecolor("#F8F9FA")
+
+            for ax, (title, vals) in zip(axes, graph_specs):
+                ax.set_facecolor("#FFFFFF")
+                bars = ax.bar(
+                    x_labels, vals, color=colors,
+                    edgecolor="white", linewidth=0.8,
+                    zorder=3, width=0.55,
+                )
+                ax.set_title(f"{title}\n{reg_lbl}",
+                             fontsize=9, fontweight="bold", pad=5)
+                ax.set_ylabel("EUR / year", fontsize=8)
+                ax.yaxis.set_major_formatter(
+                    plt.FuncFormatter(lambda x, _: f"€{x:,.0f}"))
+                ax.grid(True, axis="y", alpha=0.22, zorder=0)
+                ax.axhline(0, color="black", lw=0.6)
+                ax.tick_params(axis="x", labelsize=8)
+                ax.tick_params(axis="y", labelsize=7)
+
+                for bar, val in zip(bars, vals):
+                    h = bar.get_height()
+                    offset = max(abs(h) * 0.01, 8)
+                    if h >= 0:
+                        ypos, va = h + offset, "bottom"
+                    else:
+                        ypos, va = h - offset, "top"
+                    ax.text(bar.get_x() + bar.get_width() / 2,
+                            ypos, f"€{val:,.0f}",
+                            ha="center", va=va, fontsize=7, fontweight="bold")
+
+            plt.tight_layout(pad=0.8)
+            st.image(fig_to_buf(fig), use_container_width=True)
+
+
 # =============================================================================
 #  KPI TABLE HELPER
 # =============================================================================
@@ -982,8 +1164,7 @@ def show_kpi_table(results, fixed_price, tru_cycle, rc, label="", buy_d=None):
             "Scenario"                  : f"F  Fixed@{fixed_price:.2f}€/kWh",
             "Charge (€/d)"              : f"{F_charge_cost:.3f}",
             "V2G Rev (€/d)"             : "0.000",
-            "Net (€/d)"                 : f"{F_charge_cost:.3f}",
-            "Annual vs F"               : "—",
+            "Net (€/d)"                 : f"{F_charge_cost:.3f}"
         }]
 
         for r in results:
@@ -996,7 +1177,6 @@ def show_kpi_table(results, fixed_price, tru_cycle, rc, label="", buy_d=None):
                 v2g_rev = (r["v2g_kwh"] * avg_spot_eur
                            + r["v2g_kwh"] * exempt_eur * (1.0 + _vat_rate))
             net = charge_cost - v2g_rev
-            sav = F_net_cost - net
             rows.append({
                 "Scenario"     : (r["label"]
                                   .replace(" (no V2G)","")
@@ -1004,8 +1184,7 @@ def show_kpi_table(results, fixed_price, tru_cycle, rc, label="", buy_d=None):
                                   .replace(" (receding)","")),
                 "Charge (€/d)" : f"{charge_cost:.3f}",
                 "V2G Rev (€/d)": f"{v2g_rev:.3f}",
-                "Net (€/d)"    : f"{net:.3f}",
-                "Annual vs F"  : f"€{sav*365:+,.0f}",
+                "Net (€/d)"    : f"{net:.3f}"
             })
         return rows
 
@@ -1179,6 +1358,21 @@ else:
         )
         st.markdown("---")
         show_kpi_table(res_we, fixed_price, tru_cycle, rc_we, lbl, buy_d=buy_d_we)
+        st.markdown("---")
+# ── Annual graphs ──────────────────────────────────────────────────────────
+        with st.spinner("Running annual day-by-day optimisation for all 365 days..."):
+            try:
+                annual_data = run_annual_all_days(
+                    arr_h, dep_h,
+                    soc_w, soc_s, soc_dep,
+                    tru_cycle, do_B, do_C, do_D, mpc_noise_std,
+                    _fixed_net_ct, _vat_rate,
+                    _v2g_double_ct, _v2g_exempt_ct, _vat_fut_rate,
+                    fixed_price,
+                )
+                make_annual_graphs(annual_data)
+            except Exception as e:
+                st.warning(f"Annual computation error: {e}")
         st.markdown("---")
 
     st.subheader("KPI Tables")
