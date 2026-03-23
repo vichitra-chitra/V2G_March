@@ -693,6 +693,7 @@ def render_input_panel():
             )
 
         # ── Column 2: SoC + scenarios ──────────────────────────────────────────
+        # ── Column 2: SoC + scenarios ──────────────────────────────────────────
         with c2:
             st.subheader("State of Charge")
             cfg["soc_winter"]    = st.slider(
@@ -707,15 +708,12 @@ def render_input_panel():
 
             st.markdown("##### Scenarios to Run")
             cfg["do_B"] = st.checkbox(
-                "B -- Smart charging (no V2G)", bool(cfg["do_B"]))
+                "B -- Smart charging (no V2G)", bool(cfg["do_B"]), key="form_do_B")
             cfg["do_C"] = st.checkbox(
-                "C -- MILP Day-Ahead + V2G",   bool(cfg["do_C"]))
+                "C -- MILP Day-Ahead + V2G",   bool(cfg["do_C"]), key="form_do_C")
             cfg["do_D"] = st.checkbox(
                 "D -- MPC receding horizon",   bool(cfg["do_D"]),
-                help="Adds ~2 min compute — cached after first run")
-            cfg["do_D"] = st.checkbox(
-                "D -- MPC receding horizon",   bool(cfg["do_D"]),
-                help="Adds ~2 min compute — cached after first run")
+                help="Adds ~2 min compute — cached after first run", key="form_do_D")
             cfg["mpc_noise_std"] = st.slider(
                 "MPC forecast noise σ (EUR/kWh)",
                 min_value=0.000, max_value=0.050,
@@ -725,7 +723,8 @@ def render_input_panel():
                     "0.000 = perfect foresight (MPC = MILP).\n\n"
                     "0.012 = realistic intraday uncertainty (Liu 2023).\n\n"
                     "Higher = MPC makes worse decisions due to forecast error."
-                )
+                ),
+                key="form_mpc_noise"
             )
 
         # ── Column 3: TRU ─────────────────────────────────────────────────────
@@ -753,11 +752,13 @@ def render_input_panel():
         # ── Column 4: Extras + submit ──────────────────────────────────────────
         with c4:
             st.subheader("Extras")
-            cfg["do_wwe"]   = st.checkbox(
+            cfg["do_wwe"] = st.checkbox(
                 "Winter weekend (48h)", bool(cfg["do_wwe"]),
-                help="Adds a 48h Sat+Sun block below the weekday charts")
-            cfg["do_swe"]   = st.checkbox(
-                "Summer weekend (48h)", bool(cfg["do_swe"]))
+                help="Adds a 48h Sat+Sun block below the weekday charts",
+                key="form_do_wwe")
+            cfg["do_swe"] = st.checkbox(
+                "Summer weekend (48h)", bool(cfg["do_swe"]),
+                key="form_do_swe")
 
             st.markdown("---")
             st.markdown("**S.KOe COOL specs**")
