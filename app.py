@@ -769,9 +769,8 @@ if not st.session_state.show_output:
 #  RESULTS PAGE
 # =============================================================================
 
-st.title("S.KOe COOL -- V2G Optimisation Results")
+st.title("S.KOe COOL 2.0 - V2G Optimisation Results")
 st.caption(
-    "TU Dortmund IE3 x Schmitz Cargobull AG  |  "
     "Master's Thesis 2026  |  Kuldip Bhadreshvara"
 )
 
@@ -843,9 +842,6 @@ with st.spinner("Loading price data..."):
         n_days  = len(df_info) // 96
         st.success(
             f"2025 SMARD DE/LU spot prices  |  {n_days} days  |  "
-            f"{df_info.index[0].date()} to {df_info.index[-1].date()}  |  "
-            f"Range: {df_info['price'].min()*1000:.0f} -- "
-            f"{df_info['price'].max()*1000:.0f} EUR/MWh  |  "
             f"Mode: **{mode}**"
             + (f"  |  Date: **{specific_date}**" if mode == "Specific Date" else "")
         )
@@ -950,19 +946,6 @@ if mode == "Specific Date":
     )
     st.markdown("---")
     show_kpi_table(results, fixed_price, tru_cycle, rc)
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  SEASONAL AVERAGE MODE
-#  Points 2, 4, 5: Winter 6 charts on top, Summer 6 charts below
-#  Each block: LEFT col = 3 power charts | RIGHT col = 3 SoC charts
-# ─────────────────────────────────────────────────────────────────────────────
-else:
-    st.markdown(
-        "**Chart layout:** Each row below = one season.  "
-        "**Left half** of each row = ⚡ Power charts (Dumb vs Smart / MILP / MPC).  "
-        "**Right half** = 🔋 SoC charts.  "
-        "Each power chart has **dual Y-axis** (kW left | EUR/MWh right)."
-    )
     st.markdown("---")
 
     # ── WINTER WEEKDAY ────────────────────────────────────────────────────────
