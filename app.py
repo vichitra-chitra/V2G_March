@@ -374,8 +374,7 @@ def load_two_day_profile(date_str: str) -> np.ndarray:
         try:
             day2 = load_date_profile(fallback_date_str)
             st.info(
-                f"ℹ️ Post-midnight prices (00:00–{departure_h:.0f}:00) for "
-                f"**{next_date_str}** are not in the CSV.  "
+                f"ℹ️ Post-midnight prices for **{next_date_str}** are not in the CSV.  "
                 f"Using **{fallback_date_str}** (same day, prior year) as a proxy."
             )
         except ValueError:
