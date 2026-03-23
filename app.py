@@ -880,36 +880,59 @@ st.markdown("---")
 # =============================================================================
 
 def show_kpi_table(results, fixed_price, tru_cycle, rc, label=""):
-    ref  = results[0]["net_cost"]
+    ref_A    = results[0]
+    ref_cost = ref_A["net_cost"]
+
+    # ── Scenario F: same kWh as A (dumb) but at fixed tariff price ───────────
+    F_charge_cost = ref_A["charge_kwh"] * fixed_price
+    F_net_cost    = F_charge_cost        # no V2G, no deg cost
+    F_sav_vs_F    = 0.0                  # baseline = itself
+
     rows = []
+
+    # F row first — fixed-price dumb baseline
+    rows.append({
+        "Scenario"                              : f"F — Dumb @ fixed {fixed_price:.2f} EUR/kWh",
+        "EV charge cost (EUR/d)"                : round(F_charge_cost, 4),
+        "V2G revenue (EUR/d)"                   : 0.0,
+        "Net EV cost (EUR/d)"                   : round(F_net_cost, 4),
+        "V2G export (kWh/d)"                    : 0.0,
+        "Daily savings vs F"                    : "--",
+        "Annual savings vs F (x365)"            : "--",
+    })
+
+    # A, B, C, D rows
     for r in results:
-        sav      = ref - r["net_cost"]
-        fixed_ev = r["charge_kwh"] * fixed_price
+        sav = F_net_cost - r["net_cost"]
         rows.append({
-            "Scenario"                               : r["label"],
-            "EV charge cost (EUR/d)"                 : round(r["charge_cost"],  4),
-            "V2G revenue (EUR/d)"                    : round(r["v2g_rev"],       4),
-            "Net EV cost (EUR/d)"                    : round(r["net_cost"],      4),
-            f"Fixed @{fixed_price:.2f}/kWh (EUR/d)"  : round(fixed_ev,           4),
-            "V2G export (kWh/d)"                     : round(r["v2g_kwh"],       2),
-            "Daily savings vs Dumb"                  : "--" if sav == 0 else f"EUR {sav:+.4f}",
-            "Annual savings (x365)"                  : "--" if sav == 0 else f"EUR {sav*365:+,.0f}",
+            "Scenario"                              : r["label"],
+            "EV charge cost (EUR/d)"                : round(r["charge_cost"], 4),
+            "V2G revenue (EUR/d)"                   : round(r["v2g_rev"],      4),
+            "Net EV cost (EUR/d)"                   : round(r["net_cost"],     4),
+            "V2G export (kWh/d)"                    : round(r["v2g_kwh"],      2),
+            "Daily savings vs F"                    : f"EUR {sav:+.4f}",
+            "Annual savings vs F (x365)"            : f"EUR {sav*365:+,.0f}",
         })
+
     hdr = f"**EV Charging KPI{' — ' + label if label else ''}**"
     st.markdown(hdr)
+    st.caption(
+        f"F = fixed tariff baseline @ EUR {fixed_price:.2f}/kWh  |  "
+        f"A = dumb dynamic  |  B/C/D = smart/MILP/MPC on spot prices"
+    )
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
     if tru_cycle != "OFF" and rc["E_kWh"] > 0.01:
         st.markdown("**Reefer (TRU) Energy Cost**")
         st.dataframe(pd.DataFrame([
-            ["TRU energy (kWh/d)",                         f"{rc['E_kWh']:.2f}"],
-            ["Grid spot price (EUR/d)",                    f"EUR {rc['cost_dynamic']:.3f}"],
-            [f"Fixed @EUR{fixed_price:.2f}/kWh (EUR/d)",  f"EUR {rc['E_kWh']*fixed_price:.3f}"],
-            ["Diesel genset (EUR/d)",                      f"EUR {rc['cost_diesel']:.3f}"],
-            ["Diesel (L/d)",                               f"{rc['diesel_liters']:.2f} L"],
+            ["TRU energy (kWh/d)",                        f"{rc['E_kWh']:.2f}"],
+            ["Grid spot price (EUR/d)",                   f"EUR {rc['cost_dynamic']:.3f}"],
+            [f"Fixed @EUR{fixed_price:.2f}/kWh (EUR/d)", f"EUR {rc['E_kWh']*fixed_price:.3f}"],
+            ["Diesel genset (EUR/d)",                     f"EUR {rc['cost_diesel']:.3f}"],
+            ["Diesel (L/d)",                              f"{rc['diesel_liters']:.2f} L"],
             ["Grid vs diesel saving (EUR/d)",
              f"EUR {rc['cost_diesel'] - rc['cost_dynamic']:+.3f}"],
-        ], columns=["Metric","Value"]),
+        ], columns=["Metric", "Value"]),
         use_container_width=True, hide_index=True)
 
 
