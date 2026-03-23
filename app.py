@@ -712,9 +712,8 @@ def render_input_panel():
             cfg["do_C"] = st.checkbox(
                 "C -- MILP Day-Ahead + V2G",   bool(cfg["do_C"]), key="form_do_C")
             cfg["do_D"] = st.checkbox(
-                "D -- MPC receding horizon", bool(cfg["do_D"]),
-                help="Adds ~2 min compute — cached after first run", key="form_do_D")
-            if st.session_state.get("form_do_D", bool(cfg["do_D"])):
+                "D -- MPC receding horizon", bool(cfg["do_D"]), key="form_do_D")
+            if  cfg["do_D"]:
                 cfg["mpc_noise_std"] = st.slider(
                     "MPC forecast noise σ (EUR/kWh)",
                     min_value=0.000, max_value=0.050,
@@ -727,9 +726,6 @@ def render_input_panel():
                     ),
                     key="form_mpc_noise"
                 )
-            else:
-                cfg["mpc_noise_std"] = 0.0
-                st.caption("↑ Enable MPC to set forecast noise")
 
         # ── Column 3: TRU ─────────────────────────────────────────────────────
         with c3:
