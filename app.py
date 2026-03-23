@@ -4,6 +4,16 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib as mpl
+mpl.rcParams.update({
+    "font.size":        9,
+    "axes.titlesize":   10,
+    "axes.labelsize":   9,
+    "xtick.labelsize":  8,
+    "ytick.labelsize":  8,
+    "legend.fontsize":  8,
+    "lines.linewidth":  2.0,
+})
 import matplotlib.patches as mpatches
 from matplotlib.lines import Line2D
 from io import BytesIO
@@ -15,7 +25,6 @@ from v2g_single_day4 import (
     _interpolate_to_15min, _load_csv_raw,
     get_tru_15min_trace, tru_avg_kw,
     compute_reefer_costs,
-    yearly_extrapolation,
     get_wd_window, build_wd_display,
     run_A_dumb, run_B_smart, run_C_milp, run_D_mpc,
     make_kpi, plot_kpi_multi, plot_price_profiles,
@@ -51,7 +60,7 @@ def fmt_hhmm(h: float) -> str:
 
 def fig_to_buf(fig) -> BytesIO:
     buf = BytesIO()
-    fig.savefig(buf, dpi=120, bbox_inches="tight", facecolor=fig.get_facecolor())
+    fig.savefig(buf, dpi=300, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
     buf.seek(0)
     return buf
@@ -76,7 +85,7 @@ def _setup_xaxis(ax, is_48h, is_wknd_fullday=False):
         lbls = [f"{int(h%24):02d}:00" for h in pos]
         ax.set_xlim(12, 36)
     ax.set_xticks(pos)
-    ax.set_xticklabels(lbls, fontsize=6, rotation=30, ha="right")
+    ax.set_xticklabels(lbls, fontsize=8, rotation=30, ha="right")
     ax.grid(True, alpha=0.20, zorder=0)
 
 
@@ -110,7 +119,7 @@ def make_power_chart(v2g, hours_d, buy_d, plug_d,
     col_x  = SC_COL[x_key]; fill_x  = SC_FILL[x_key]
     lbl_x  = result_X["label"].split("(")[0].strip()
 
-    fig, ax = plt.subplots(figsize=(6.2, 2.7))
+    fig, ax = plt.subplots(figsize=(9.0, 3.5))
     fig.patch.set_facecolor("#F8F9FA")
     ax.set_facecolor("#FFFFFF")
 
@@ -159,20 +168,20 @@ def make_power_chart(v2g, hours_d, buy_d, plug_d,
                     color="#2E7D32", lw=1.4, alpha=0.85, label="Price")
     ax2.fill_between(hours_d, buy_d * 1000,
                      step="post", color="#2E7D32", alpha=0.07)
-    ax2.set_ylabel("EUR/MWh", fontsize=6, color="#2E7D32")
-    ax2.tick_params(axis="y", labelcolor="#2E7D32", labelsize=5.5)
+    ax2.set_ylabel("EUR/MWh", fontsize=8, color="#2E7D32")
+    ax2.tick_params(axis="y", labelcolor="#2E7D32", labelsize=8)
     ax2.set_ylim(bottom=min(0, (buy_d * 1000).min() - 5))
     handles.append(h_p)
 
-    ax.set_ylabel("Power (kW)", fontsize=7)
+    ax.set_ylabel("Power (kW)", fontsize=9)
     ax.set_title(f"Power — Dumb vs {x_label}",
-                 fontsize=7.5, fontweight="bold", loc="left", pad=2)
+                 fontsize=10, fontweight="bold", loc="left", pad=4)
     _setup_xaxis(ax, is_48h, is_wknd_fullday)
 
-    ax.legend(handles=handles, fontsize=5.5, ncol=len(handles),
-              loc="upper center", bbox_to_anchor=(0.5, -0.32),
-              framealpha=0.92, edgecolor="#CCC", handlelength=1.0,
-              borderpad=0.3, columnspacing=0.8)
+    ax.legend(handles=handles, fontsize=8, ncol=len(handles),
+              loc="upper center", bbox_to_anchor=(0.5, -0.28),
+              framealpha=0.92, edgecolor="#CCC", handlelength=1.2,
+              borderpad=0.4, columnspacing=1.0)
 
     plt.tight_layout(pad=0.3)
     return fig_to_buf(fig)
@@ -193,7 +202,7 @@ def make_soc_chart(v2g, hours_d, plug_d,
     col_x = SC_COL[x_key]
     lbl_x = result_X["label"].split("(")[0].strip()
 
-    fig, ax = plt.subplots(figsize=(6.2, 2.7))
+    fig, ax = plt.subplots(figsize=(9.0, 3.5))
     fig.patch.set_facecolor("#F8F9FA")
     ax.set_facecolor("#FFFFFF")
 
@@ -225,16 +234,16 @@ def make_soc_chart(v2g, hours_d, plug_d,
         mpatches.Patch(color="gold", alpha=0.40, label="Plugged-in"),
     ]
 
-    ax.set_ylabel("SoC (%)", fontsize=7)
+    ax.set_ylabel("SoC (%)", fontsize=9)
     ax.set_ylim(0, 115)
     ax.set_title(f"SoC — Dumb vs {x_label}",
-                 fontsize=7.5, fontweight="bold", loc="left", pad=2)
+                 fontsize=10, fontweight="bold", loc="left", pad=4)
     _setup_xaxis(ax, is_48h, is_wknd_fullday)
 
-    ax.legend(handles=handles, fontsize=5.5, ncol=5,
-              loc="upper center", bbox_to_anchor=(0.5, -0.32),
-              framealpha=0.92, edgecolor="#CCC", handlelength=1.0,
-              borderpad=0.3, columnspacing=0.8)
+    ax.legend(handles=handles, fontsize=8, ncol=5,
+              loc="upper center", bbox_to_anchor=(0.5, -0.28),
+              framealpha=0.92, edgecolor="#CCC", handlelength=1.2,
+              borderpad=0.4, columnspacing=1.0)
 
     plt.tight_layout(pad=0.3)
     return fig_to_buf(fig)
@@ -726,9 +735,8 @@ def render_input_panel():
             st.markdown("---")
             st.markdown("**S.KOe COOL specs**")
             st.caption("70 kWh total / 60 kWh usable")
-            st.caption("22 kW AC bidirectional (ISO 15118-20)")
+            st.caption("22 kW AC bidirectional OBC")
             st.caption("Cold-chain floor: SoC >= 20%")
-            st.caption("CCS2 / OCPP 2.1")
 
             st.markdown("")
             submitted = st.form_submit_button(
