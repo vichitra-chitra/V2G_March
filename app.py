@@ -713,8 +713,7 @@ def render_input_panel():
                 "C -- MILP Day-Ahead + V2G",   bool(cfg["do_C"]), key="form_do_C")
             cfg["do_D"] = st.checkbox(
                 "D -- MPC receding horizon", bool(cfg["do_D"]), key="form_do_D")
-            if  cfg["do_D"]:
-                cfg["mpc_noise_std"] = st.slider(
+            cfg["mpc_noise_std"] = st.slider(
                     "MPC forecast noise σ (EUR/kWh)",
                     min_value=0.000, max_value=0.050,
                     value=float(cfg.get("mpc_noise_std", 0.0)),
