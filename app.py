@@ -714,7 +714,7 @@ def render_input_panel():
             cfg["do_D"] = st.checkbox(
                 "D -- MPC receding horizon", bool(cfg["do_D"]),
                 help="Adds ~2 min compute — cached after first run", key="form_do_D")
-            if cfg["do_D"]:
+            if st.session_state.get("form_do_D", bool(cfg["do_D"])):
                 cfg["mpc_noise_std"] = st.slider(
                     "MPC forecast noise σ (EUR/kWh)",
                     min_value=0.000, max_value=0.050,
