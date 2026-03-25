@@ -1,9 +1,9 @@
 import streamlit as st
-from v2g_single_day4 import (
+from v2g import (
     V2GParams, WINTER_M, SUMMER_M, SC_COL, SC_FILL,
     FIXED_PRICE_EUR_KWH,
-    _interpolate_to_15min, _load_csv_raw,
-    get_tru_15min_trace, tru_avg_kw,
+    _passthrough_profile, _load_csv_raw,
+    get_tru_1h_trace, tru_avg_kw,
     compute_reefer_costs,
     get_wd_window, build_wd_display,
     run_A_dumb, run_B_smart, run_C_milp, run_D_mpc,
@@ -332,9 +332,9 @@ def load_seasonal_profile(months: tuple, is_weekend: bool) -> np.ndarray:
     if len(sub) == 0:
         raise ValueError(f"No data for months={months}, weekend={is_weekend}")
     profile = sub.groupby("slot")["price"].mean().values
-    if len(profile) != 96:
-        raise ValueError(f"Expected 96 slots, got {len(profile)}")
-    return _interpolate_to_15min(profile)
+    if len(profile) != 24:
+        raise ValueError(f"Expected 24 slots, got {len(profile)}")
+    return _passthrough_profile(profile)
 
 
 @st.cache_data(show_spinner=False)
@@ -345,11 +345,9 @@ def load_date_profile(date_str: str) -> np.ndarray:
     if len(day_df) == 0:
         raise ValueError(f"No price data found for {date_str}.")
     prices = day_df["price"].values
-    if len(prices) == 24:
-        return _interpolate_to_15min(prices)
-    if len(prices) != 96:
-        raise ValueError(f"Expected 96 price slots for {date_str}, got {len(prices)}.")
-    return _interpolate_to_15min(prices)
+    if len(prices) != 24:
+        raise ValueError(f"Expected 24 price slots for {date_str}, got {len(prices)}.")
+    return _passthrough_profile(prices)
 
 
 @st.cache_data(show_spinner=False)
@@ -399,8 +397,8 @@ def run_seasonal(season_key, arrival_h, departure_h,
     if is_48h:
         buy48   = np.concatenate([buy, buy])
         v2gp48  = buy48.copy()
-        W       = 192
-        tru_w   = get_tru_15min_trace(tru_cycle, W, v2g.dt_h)
+        W       = 48
+        tru_w   = get_tru_1h_trace(tru_cycle, W, v2g.dt_h)
         hours_d = np.arange(W) * v2g.dt_h
         plug_d  = np.ones(W)
         buy_d   = buy48
@@ -427,13 +425,13 @@ def run_seasonal(season_key, arrival_h, departure_h,
             "total_cost":r["total_cost"]/2,"v2g_kwh":r["v2g_kwh"]/2,
             "charge_kwh":r["charge_kwh"]/2,
         } for r in results]
-        rc = compute_reefer_costs(tru_w[:96], buy[:96], v2g.dt_h)
+        rc = compute_reefer_costs(tru_w[:24], buy[:24], v2g.dt_h)
         return results, results_kpi, buy_d, plug_d, hours_d, is_wknd, is_48h, tru_w, rc
 
     else:
         win, arr, dep, W = get_wd_window(v2g, arrival_h, departure_h)
         buy_w  = buy[win]; v2gp_w = v2gp[win]
-        tru_w  = get_tru_15min_trace(tru_cycle, W, v2g.dt_h)
+        tru_w  = get_tru_1h_trace(tru_cycle, W, v2g.dt_h)
         buy_d, plug_d, hours_d = build_wd_display(v2g, buy, arrival_h, departure_h)
         tru_d = np.zeros(v2g.n_slots); tru_d[arr:dep] = tru_w[:dep - arr]
 
@@ -468,36 +466,36 @@ def run_specific_date(date_str, arrival_h, departure_h,
     if is_wknd:
         buy             = load_date_profile(date_str)
         v2gp            = buy.copy()
-        W               = 96
+        W               = 24
         buy_w           = buy
         v2gp_w          = v2gp
-        tru_w           = get_tru_15min_trace(tru_cycle, W, v2g.dt_h)
+        tru_w           = get_tru_1h_trace(tru_cycle, W, v2g.dt_h)
         buy_d           = buy
-        plug_d          = np.ones(96)
-        hours_d         = np.arange(96) * v2g.dt_h
+        plug_d          = np.ones(24)
+        hours_d         = np.arange(24) * v2g.dt_h
         tru_d           = tru_w
-        arr, dep        = 0, 96
+        arr, dep        = 0, 24
         is_48h          = False
         is_wknd_fullday = True
     else:
-        buy_192  = load_two_day_profile(date_str)
-        v2gp_192 = buy_192.copy()
+        buy_48  = load_two_day_profile(date_str)
+        v2gp_48 = buy_48.copy()
         ROLL     = round(12.0 / v2g.dt_h)
-        arr_slot = round(arrival_h   / v2g.dt_h) % 96
-        dep_slot = round(departure_h / v2g.dt_h) % 96
-        buy_w    = buy_192[arr_slot : 96 + dep_slot]
+        arr_slot = round(arrival_h   / v2g.dt_h) % 24
+        dep_slot = round(departure_h / v2g.dt_h) % 24
+        buy_w    = buy_48[arr_slot : 96 + dep_slot]
         v2gp_w   = buy_w.copy()
         W        = len(buy_w)
-        buy_d    = buy_192[ROLL : ROLL + 96]
-        hours_d  = np.arange(96) * v2g.dt_h + 12.0
+        buy_d    = buy_48[ROLL : ROLL + 24]
+        hours_d  = np.arange(24) * v2g.dt_h + 12.0
         dep_on_chart = (departure_h + 24.0) if departure_h < 12.0 else departure_h
         plug_d   = ((hours_d >= arrival_h) & (hours_d < dep_on_chart)).astype(float)
         arr_disp = arr_slot - ROLL
         dep_disp = ROLL     + dep_slot
         arr, dep = arr_disp, dep_disp
-        tru_w    = get_tru_15min_trace(tru_cycle, W, v2g.dt_h)
-        tru_d    = np.zeros(96)
-        d_s = max(0, arr_disp); d_e = min(96, dep_disp)
+        tru_w    = get_tru_1h_trace(tru_cycle, W, v2g.dt_h)
+        tru_d    = np.zeros(24)
+        d_s = max(0, arr_disp); d_e = min(24, dep_disp)
         w_s = d_s - arr_disp;   w_e = w_s + (d_e - d_s)
         if w_e > w_s:
             tru_d[d_s:d_e] = tru_w[w_s:w_e]

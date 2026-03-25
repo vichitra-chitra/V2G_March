@@ -56,8 +56,8 @@ class V2GParams:
     eta_charge           : float = 0.92
     eta_discharge        : float = 0.92
     deg_cost_eur_kwh     : float = 0.0
-    dt_h                 : float = 0.25
-    n_slots              : int   = 96
+    dt_h                 : float = 1
+    n_slots              : int   = 24
 
     @property
     def E_min(self):
@@ -93,15 +93,15 @@ def _reefer_hi_res(cycle_type, N, dt_sec=10):
     return np.tile(pw, reps)[:N]
 
 
-def get_tru_15min_trace(cycle_type, W, dt_h=0.25):
+def get_tru_1h_trace(cycle_type, W, dt_h=1.0):
     if cycle_type.strip().lower() in ("off", "noreeferstationary"):
         return np.zeros(W)
-    dt_sec_hi       = 10
-    slots_per_15min = int(dt_h * 3600 / dt_sec_hi)
-    N_hi            = W * slots_per_15min
-    P_hi            = _reefer_hi_res(cycle_type, N_hi, dt_sec_hi)
+    dt_sec_hi      = 10
+    slots_per_1h   = int(dt_h * 3600 / dt_sec_hi)   # 360 samples per hour
+    N_hi           = W * slots_per_1h
+    P_hi           = _reefer_hi_res(cycle_type, N_hi, dt_sec_hi)
     return np.array([
-        float(np.mean(P_hi[i * slots_per_15min:(i + 1) * slots_per_15min]))
+        float(np.mean(P_hi[i * slots_per_1h:(i + 1) * slots_per_1h]))
         for i in range(W)
     ])
 
@@ -178,7 +178,7 @@ def _load_csv_raw(csv_path):
     df = df.dropna(subset=["dt", "price_eur_mwh"])
     df["price"] = pd.to_numeric(df["price_eur_mwh"], errors="coerce") / 1000.0
     df = df.dropna(subset=["price"]).set_index("dt").sort_index()
-    df["slot"]       = df.index.hour * 4 + df.index.minute // 15
+    df["slot"]       = df.index.hour
     df["is_weekend"] = df.index.dayofweek >= 5
     df["month"]      = df.index.month
     df["date"]       = df.index.date
@@ -187,11 +187,7 @@ def _load_csv_raw(csv_path):
     return df
 
 
-def _interpolate_to_15min(profile: np.ndarray) -> np.ndarray:
-    n    = len(profile)
-    flat = sum(1 for i in range(0, n, 4) if np.ptp(profile[i:i+4]) < 1e-9)
-    if (n // 4) > 0 and flat / (n // 4) > 0.55:
-        return profile
+def _passthrough_profile(profile: np.ndarray) -> np.ndarray:
     return profile
 
 
@@ -202,9 +198,9 @@ def load_avg_profile(csv_path, months, is_weekend):
     if len(sub) == 0:
         raise ValueError(f"No data for months={months}, weekend={is_weekend}")
     profile = sub.groupby("slot")["price"].mean().values
-    if len(profile) != 96:
-        raise ValueError(f"Expected 96 slots, got {len(profile)}")
-    return _interpolate_to_15min(profile)
+    if len(profile) != 24:
+        raise ValueError(f"Expected 24 slots, got {len(profile)}")
+    return _passthrough_profile(profile)
 
 
 # =============================================================================
@@ -402,8 +398,7 @@ def run_D_mpc(v2g, buy_w, v2gp_w, E_init, tru_w=None,
         tw_t = tru_w[t:] if tru_w is not None else None
         # tru for tomorrow — zeros if not available
         if buy_tomorrow is not None:
-            tru_tomorrow = np.zeros(96) if tru_w is None else get_tru_15min_trace(
-                "Continuous", 96, v2g.dt_h)
+            tru_tomorrow = np.zeros(24) if tru_w is None else get_tru_1h_trace("Continuous", 24, v2g.dt_h)
             tw_t = np.concatenate([tw_t, tru_tomorrow]) if tw_t is not None else None
 
         Pcw, Pdw, _ = solve_milp(v2g, buy_fc, v2gp_fc,
@@ -616,7 +611,7 @@ def plot_kpi_multi(all_res, v2g, arrival_h, departure_h, run_mpc, out):
 
 def plot_price_profiles(csv_path, out):
     df   = _load_csv_raw(csv_path)
-    h_ax = np.arange(96) * 0.25
+    h_ax = np.arange(24)
     w_wd = load_avg_profile(csv_path, WINTER_M, False)
     s_wd = load_avg_profile(csv_path, SUMMER_M, False)
     w_we = load_avg_profile(csv_path, WINTER_M, True)
