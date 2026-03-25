@@ -1,4 +1,19 @@
 import streamlit as st
+from v2g_single_day4 import (
+    V2GParams, WINTER_M, SUMMER_M, SC_COL, SC_FILL,
+    FIXED_PRICE_EUR_KWH,
+    _interpolate_to_15min, _load_csv_raw,
+    get_tru_15min_trace, tru_avg_kw,
+    compute_reefer_costs,
+    get_wd_window, build_wd_display,
+    run_A_dumb, run_B_smart, run_C_milp, run_D_mpc,
+    make_kpi, plot_price_profiles,
+    soc_ramp,
+)
+import matplotlib.patches as mpatches
+from matplotlib.lines import Line2D
+from io import BytesIO
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -14,10 +29,7 @@ mpl.rcParams.update({
     "legend.fontsize":  8,
     "lines.linewidth":  2.0,
 })
-import matplotlib.patches as mpatches
-from matplotlib.lines import Line2D
-from io import BytesIO
-from pathlib import Path
+
 
 # ── German all-in tariff components (BNetzA 2024) ───────────────────────
 TARIFF = {
@@ -47,17 +59,6 @@ def to_allin_ct(spot_eur_kwh: np.ndarray,
     vr  = vat          if vat          is not None else VAT_RATE
     return (spot_eur_kwh * 100.0 + fn) * (1.0 + vr)
 
-from v2g_single_day4 import (
-    V2GParams, WINTER_M, SUMMER_M, SC_COL, SC_FILL,
-    FIXED_PRICE_EUR_KWH,
-    _interpolate_to_15min, _load_csv_raw,
-    get_tru_15min_trace, tru_avg_kw,
-    compute_reefer_costs,
-    get_wd_window, build_wd_display,
-    run_A_dumb, run_B_smart, run_C_milp, run_D_mpc,
-    make_kpi, plot_price_profiles,
-    soc_ramp,
-)
 
 CSV_PATH = "2025_Electricity_Price.csv"
 
