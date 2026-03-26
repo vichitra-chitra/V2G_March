@@ -133,6 +133,7 @@ def _vlines(ax, arrival_h, departure_h, is_48h, is_wknd_fullday=False):
 #  POWER CHART
 # =============================================================================
 
+# ── REPLACE ENTIRE make_power_chart FUNCTION ──────────────────────────────
 def make_power_chart(v2g, hours_d, buy_d, plug_d,
                      result_A, result_X,
                      x_label, x_key,
@@ -144,14 +145,20 @@ def make_power_chart(v2g, hours_d, buy_d, plug_d,
     col_a  = SC_COL["A"];   fill_a  = SC_FILL["A"]
     col_x  = SC_COL[x_key]; fill_x  = SC_FILL[x_key]
     lbl_x  = result_X["label"].split("(")[0].strip()
+    # MPC gets dashed line so it's visually distinct from MILP
+    ls_x   = "--" if x_key == "D" else "-"
+
+    # Infer slot width from hours_d spacing (works for both 15-min and 1h)
+    dt_plot = float(hours_d[1] - hours_d[0]) if len(hours_d) > 1 else 1.0
 
     fig, ax = plt.subplots(figsize=(9.0, 3.5))
     fig.patch.set_facecolor("#F8F9FA")
     ax.set_facecolor("#FFFFFF")
 
+    # FIX 1a: use dt_plot instead of hard-coded 0.25
     for t in range(len(hours_d)):
         if plug_d[t] > 0.5:
-            ax.axvspan(hours_d[t], hours_d[t] + 0.25,
+            ax.axvspan(hours_d[t], hours_d[t] + dt_plot,
                        color="gold", alpha=0.14, lw=0, zorder=1)
 
     ax.fill_between(hours_d, result_A["Pc_d"],
@@ -162,7 +169,7 @@ def make_power_chart(v2g, hours_d, buy_d, plug_d,
     ax.fill_between(hours_d, result_X["Pc_d"],
                     step="post", color=fill_x, alpha=0.48, zorder=4)
     h_x, = ax.step(hours_d, result_X["Pc_d"], where="post",
-                   color=col_x, lw=2.0, zorder=5, label=f"{lbl_x} charge")
+                   color=col_x, lw=2.0, ls=ls_x, zorder=5, label=f"{lbl_x} charge")
 
     handles = [h_a, h_x]
 
@@ -170,7 +177,7 @@ def make_power_chart(v2g, hours_d, buy_d, plug_d,
         ax.fill_between(hours_d, -result_X["Pd_d"],
                         step="post", color=fill_x, alpha=0.28, zorder=4)
         h_d, = ax.step(hours_d, -result_X["Pd_d"], where="post",
-                       color=col_x, lw=2.0, ls="--", alpha=0.90, zorder=5,
+                       color=col_x, lw=2.0, ls=":", alpha=0.90, zorder=5,
                        label=f"{lbl_x} V2G (−)")
         handles.append(h_d)
 
@@ -185,9 +192,14 @@ def make_power_chart(v2g, hours_d, buy_d, plug_d,
 
     buy_d_ct = to_allin_ct(buy_d, fixed_net_ct, vat_rate)
     ax2 = ax.twinx()
-    h_p, = ax2.step(hours_d, buy_d_ct, where="post",
+
+    # FIX 1b: extend by one slot so the LAST hour's price is visible
+    hours_ext    = np.append(hours_d, hours_d[-1] + dt_plot)
+    buy_d_ct_ext = np.append(buy_d_ct, buy_d_ct[-1])
+
+    h_p, = ax2.step(hours_ext, buy_d_ct_ext, where="post",
                     color="#2E7D32", lw=1.4, alpha=0.85, label="Price (all-in)")
-    ax2.fill_between(hours_d, buy_d_ct,
+    ax2.fill_between(hours_ext, buy_d_ct_ext,
                      step="post", color="#2E7D32", alpha=0.07)
     ax2.set_ylabel("ct/kWh (all-in)", fontsize=8, color="#2E7D32")
     ax2.tick_params(axis="y", labelcolor="#2E7D32", labelsize=8)
@@ -221,21 +233,26 @@ def make_soc_chart(v2g, hours_d, plug_d,
     col_a = SC_COL["A"]
     col_x = SC_COL[x_key]
     lbl_x = result_X["label"].split("(")[0].strip()
+    ls_x  = "--" if x_key == "D" else "-"
+
+    # Infer slot width
+    dt_plot = float(hours_d[1] - hours_d[0]) if len(hours_d) > 1 else 1.0
 
     fig, ax = plt.subplots(figsize=(9.0, 3.5))
     fig.patch.set_facecolor("#F8F9FA")
     ax.set_facecolor("#FFFFFF")
 
+    # FIX 1a: use dt_plot instead of hard-coded 0.25
     for t in range(len(hours_d)):
         if plug_d[t] > 0.5:
-            ax.axvspan(hours_d[t], hours_d[t] + 0.25,
+            ax.axvspan(hours_d[t], hours_d[t] + dt_plot,
                        color="gold", alpha=0.14, lw=0, zorder=1)
 
     xA, yA = soc_ramp(hours_d, result_A["soc_d"], result_A["E_init_pct"])
     xX, yX = soc_ramp(hours_d, result_X["soc_d"], result_X["E_init_pct"])
 
     h_a, = ax.plot(xA, yA, color=col_a, lw=2.0, label="A - Dumb SoC")
-    h_x, = ax.plot(xX, yX, color=col_x, lw=2.3, label=f"{lbl_x} SoC")
+    h_x, = ax.plot(xX, yX, color=col_x, lw=2.3, ls=ls_x, label=f"{lbl_x} SoC")
 
     ax.axhline(v2g.soc_min_pct,       color="#C62828", ls=":", lw=1.2, zorder=3)
     ax.axhline(v2g.soc_departure_pct, color="#0D47A1", ls=":", lw=1.2, zorder=3)
@@ -768,19 +785,35 @@ def render_input_panel():
                 "B -- Smart charging (no V2G)", bool(cfg["do_B"]), key="form_do_B")
             cfg["do_C"] = st.checkbox(
                 "C -- MILP Day-Ahead + V2G",   bool(cfg["do_C"]), key="form_do_C")
+            
             cfg["do_D"] = st.checkbox(
                 "D -- MPC receding horizon", bool(cfg["do_D"]), key="form_do_D")
             cfg["mpc_noise_std"] = st.slider(
                 "MPC forecast noise σ (EUR/kWh)",
-                min_value=0.000, max_value=0.050,
+                min_value=0.000, max_value=0.100,          # extended from 0.050
                 value=float(cfg.get("mpc_noise_std", 0.0)),
                 step=0.001, format="%.3f",
                 help=(
-                    "0.000 = perfect foresight (MPC = MILP).\n\n"
-                    "0.012 = realistic intraday uncertainty (Liu 2023).\n\n"
-                    "Higher = MPC makes worse decisions due to forecast error."
+                    "0.000 = perfect foresight → MPC ≡ MILP (identical graphs by design).\n\n"
+                    "0.015–0.030 = realistic EPEX intraday uncertainty (Liu 2023).\n\n"
+                    "0.050–0.100 = high uncertainty; MPC decisions visibly diverge from MILP.\n\n"
+                    "MPC line is shown dashed (---) to help distinguish it from MILP."
                 ),
                 key="form_mpc_noise")
+            # Noise status hint
+            _noise = float(cfg.get("mpc_noise_std", 0.0))
+            if cfg["do_D"] and cfg["do_C"]:
+                if _noise == 0.0:
+                    st.info(
+                        "ℹ️ Noise = 0 → MPC and MILP graphs will be **identical** "
+                        "(perfect foresight). Set σ ≥ 0.030 to see divergence.",
+                        icon=None)
+                elif _noise < 0.020:
+                    st.caption(f"⚠️ σ = {_noise:.3f} EUR/kWh — may be too small to flip "
+                               "hourly decisions on a smooth seasonal profile. Try ≥ 0.030.")
+                else:
+                    st.success(f"🔊 MPC noise active: σ = {_noise:.3f} EUR/kWh — "
+                               "MPC line (dashed) should diverge from MILP.")
 
         with c3:
             st.subheader("Reefer (TRU) at Depot")
@@ -912,6 +945,94 @@ def render_input_panel():
                 f"(+VAT: **{_fut_total * (1 + _vat_fut):.3f} ct**) added to V2G rev | "
                 f"Pending EU state aid approval (BNetzA 2025)"
             )
+
+
+            # ── ADD THIS block inside the st.form, just before the Submit button ─────
+        # ── System Parameters (read-only reference) ──────────────────────
+        with st.expander("📋 System Parameters & Pre-defined Values", expanded=False):
+            st.markdown("These values are fixed in the model. They are shown here "
+                        "for transparency — no input needed.")
+            col_sp1, col_sp2, col_sp3 = st.columns(3)
+
+            with col_sp1:
+                st.markdown("**🔋 Battery (S.KOe COOL)**")
+                st.caption("Total capacity: **70 kWh**")
+                st.caption("Usable capacity: **60 kWh**")
+                st.caption("Charge power: **22 kW**")
+                st.caption("Discharge power: **22 kW**")
+                st.caption("Charge efficiency η: **0.92**")
+                st.caption("Discharge efficiency η: **0.92**")
+                st.caption("Cold-chain SoC floor: **20 %**")
+                st.caption("Degradation cost: **€0.00/kWh** (not yet active)")
+
+            with col_sp2:
+                st.markdown("**❄️ TRU Reefer Cycle Power**")
+                st.caption("Continuous — High: **7.6 kW** for 1,717 s")
+                st.caption("Continuous — Low:  **0.7 kW** for 292 s")
+                st.caption("Continuous avg: **~6.6 kW**")
+                st.caption("Start-Stop — High: **9.7 kW** for 975 s")
+                st.caption("Start-Stop — Mid:  **0.65 kW** for 295 s")
+                st.caption("Start-Stop — Off:  **0.0 kW** for 1,207 s")
+                st.caption("Start-Stop avg: **~3.9 kW**")
+                st.caption("Hi-res simulation: **10-second** intervals → averaged to 1h")
+
+            with col_sp3:
+                st.markdown("**⚡ Fixed Diesel Benchmark**")
+                st.caption("Diesel price: **€1.80/L**")
+                st.caption("Diesel energy: **9.8 kWh/L**")
+                st.caption("Genset efficiency: **30%**")
+                st.markdown("**📅 Seasonality**")
+                st.caption("Winter: **Oct–Mar** (months 1,2,3,10,11,12)")
+                st.caption("Summer: **Apr–Sep** (months 4,5,6,7,8,9)")
+                st.markdown("**🔧 Optimisation**")
+                st.caption("MILP solver: **scipy.optimize.milp** (HiGHS)")
+                st.caption("Time limit per solve: **60 s**")
+                st.caption("Price resolution: **hourly** (SMARD DE/LU 2025)")
+                st.caption("MPC seed: **42** (deterministic noise)")
+
+        # ── Methodology (mirrored from bottom of results page) ────────────
+        with st.expander("📐 Methodology & Assumptions", expanded=False):
+            _fn_disp  = (cfg["t_network_fee"] + cfg["t_concession"] + cfg["t_offshore"]
+                         + cfg["t_chp"] + cfg["t_elec_tax"] + cfg["t_nev19"])
+            _vat_disp = cfg["t_vat"] / 100.0
+            _fut_disp = (cfg.get("t_fut_network", 6.63) + cfg.get("t_fut_concession", 1.992)
+                         + cfg.get("t_fut_offshore", 0.941) + cfg.get("t_fut_chp", 0.446)
+                         + cfg.get("t_fut_elec_tax", 2.05) + cfg.get("t_fut_nev19", 1.559))
+            _dep_disp = int(cfg.get("soc_departure", 100))
+            _fp_disp  = float(cfg.get("fixed_price", 0.35))
+            st.markdown(f"""
+**Price data:** SMARD DE/LU hourly day-ahead spot prices (2025).
+
+**All-in depot price:** `(spot + {_fn_disp:.3f} ct/kWh taxes & levies) × {1+_vat_disp:.2f} VAT`
+
+**Scenario A — Dumb:** Greedy charge from arrival until target SoC reached. No price awareness.
+
+**Scenario B — Smart:** MILP, charge-only (`allow_discharge=False`). Schedules charging at cheapest hours while meeting departure SoC.
+
+**Scenario C — MILP Day-Ahead:** Full MILP with V2G. Optimises both charge and discharge over the full overnight window using perfect price foresight.
+
+**Scenario D — MPC Receding Horizon:** Re-solves MILP at every hour using remaining horizon (+ optional forecast noise). MPC ≡ MILP when noise = 0.
+
+**Scenario F — Fixed Tariff Benchmark:** Applies a flat rate of €{_fp_disp:.2f}/kWh to Scenario A's charge volume. No V2G.
+
+**Current regulation V2G cost:** Re-applied Netzentgelt + Stromsteuer on each exported kWh (double taxation).
+
+**Future regulation (MiSpeL):** Exported kWh receives fee exemption of {_fut_disp:.3f} ct/kWh (×VAT). **Pending EU state aid approval** — BNetzA 2025.
+
+**Cold-chain floor:** SoC ≥ 20 % hard MILP constraint (cold-chain integrity — highest priority).
+
+**Departure SoC target:** ≥ {_dep_disp} % at end of overnight window.
+
+**Battery:** 70 kWh total / 60 kWh usable. Charge/discharge: 22 kW AC bidirectional.
+
+**MILP slot-use penalty:** 1×10⁻⁴ EUR per active charging slot (consolidates charging into contiguous blocks; negligible effect on costs).
+            """)
+
+# ── THEN immediately after those two expanders, keep the existing lines: ──
+        st.markdown("")
+        submitted = st.form_submit_button(
+            "Calculate", type="primary", use_container_width=True)
+        
         # ── Submit ─────────────────────────────────────────────────────────────
         st.markdown("")
         submitted = st.form_submit_button(

@@ -285,6 +285,10 @@ def solve_milp(v2g, buy_w, v2gp_w, E_init, E_fin,
     c[ic]  = buy_w * dt
     if allow_discharge:
         c[id_] = -v2gp_w * dt
+    # Small penalty per active charging slot — encourages contiguous blocks
+    # and eliminates physically meaningless alternating on/off patterns.
+    # 1e-4 is ~0.01 ct/kWh: negligible on cost results, decisive on tie-breaking.
+    c[izc] += 1e-4
 
     lb = np.zeros(nv)
     ub = np.full(nv, np.inf)
