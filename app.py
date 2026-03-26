@@ -1027,11 +1027,6 @@ def render_input_panel():
 
 **MILP slot-use penalty:** 1×10⁻⁴ EUR per active charging slot (consolidates charging into contiguous blocks; negligible effect on costs).
             """)
-
-# ── THEN immediately after those two expanders, keep the existing lines: ──
-        st.markdown("")
-        submitted = st.form_submit_button(
-            "Calculate", type="primary", use_container_width=True)
         
         # ── Submit ─────────────────────────────────────────────────────────────
         st.markdown("")
