@@ -22,6 +22,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 import plotly.graph_objects as go
+import plotly.express as px
+
 mpl.rcParams.update({
     "font.size":        9,
     "axes.titlesize":   10,
