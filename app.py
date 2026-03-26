@@ -841,26 +841,6 @@ def run_annual_all_days(
         }
     return out
 
-# =============================================================================
-#  AUTHENTICATION
-# =============================================================================
-
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-
-if not st.session_state.authenticated:
-    st.title("S.KOe COOL -- Access Restricted")
-    with st.form("login_form"):
-        user = st.text_input("Username")
-        pwd  = st.text_input("Password", type="password")
-        if st.form_submit_button("Login", type="primary"):
-            if user == "admin" and pwd == "dontshare":
-                st.session_state.authenticated = True
-                st.rerun()
-            else:
-                st.error("Invalid credentials.")
-    st.stop()
-
 
 # =============================================================================
 #  SESSION STATE DEFAULTS
