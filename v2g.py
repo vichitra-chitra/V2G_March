@@ -257,6 +257,47 @@ def soc_ramp(hours, soc_pct, init_pct):
         y[2*i+1] = soc_pct[i]
     return x, y
 
+# =============================================================================
+#  6b. MINUTE-RESOLUTION EXPANDER
+# =============================================================================
+
+def expand_to_minutes(v2g, Pc_w, Pd_w, E_init):
+    """
+    Expand hourly window arrays (length W) to minute resolution (length W×60).
+
+    Strategy:
+      - Pc_min, Pd_min : each hourly value repeated 60× (step-hold within hour)
+      - soc_pct        : re-integrated minute-by-minute from E_init using
+                         dt = 1/60 h, so SoC ramps smoothly within each hour
+                         rather than jumping. Clipped to [E_min, E_max].
+
+    Returns
+    -------
+    t_min   : np.ndarray shape (W*60,)  — time in hours from window start
+    Pc_min  : np.ndarray shape (W*60,)  — charge power (kW)
+    Pd_min  : np.ndarray shape (W*60,)  — discharge power (kW)
+    soc_pct : np.ndarray shape (W*60,)  — SoC in %
+    """
+    W    = len(Pc_w)
+    N    = W * 60
+    dt_m = 1.0 / 60.0                      # 1 minute expressed in hours
+
+    Pc_min = np.repeat(Pc_w.astype(float), 60)
+    Pd_min = np.repeat(Pd_w.astype(float), 60)
+
+    soc_kwh = np.empty(N)
+    s = float(E_init)
+    for i in range(N):
+        s = float(np.clip(
+            s + Pc_min[i] * v2g.eta_charge  * dt_m
+              - Pd_min[i] / v2g.eta_discharge * dt_m,
+            v2g.E_min, v2g.E_max,
+        ))
+        soc_kwh[i] = s
+
+    t_min   = np.arange(N, dtype=float) * dt_m   # 0, 1/60, 2/60, …
+    soc_pct = soc_kwh * 100.0 / v2g.usable_capacity_kWh
+    return t_min, Pc_min, Pd_min, soc_pct
 
 # =============================================================================
 #  7. MILP SOLVER
