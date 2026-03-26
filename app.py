@@ -1,7 +1,7 @@
 import streamlit as st
 from v2g import (
     V2GParams, WINTER_M, SUMMER_M, SC_COL, SC_FILL,
-     expand_to_minutes,
+    expand_to_minutes,
     FIXED_PRICE_EUR_KWH,
     _passthrough_profile, _load_csv_raw,
     get_tru_1h_trace, tru_avg_kw,
@@ -35,7 +35,7 @@ mpl.rcParams.update({
 })
 
 
-# ── German all-in tariff components (BNetzA 2024) ───────────────────────
+# ── German all-in tariff components ───────────────────────
 TARIFF = {
     "network_fee_ct":     6.63,
     "concession_ct":      1.992,
@@ -136,8 +136,6 @@ def _vlines(ax, arrival_h, departure_h, is_48h, is_wknd_fullday=False):
 # =============================================================================
 #  POWER CHART
 # =============================================================================
-
-# ── REPLACE ENTIRE make_power_chart FUNCTION ──────────────────────────────
 def make_power_chart(v2g, hours_d, buy_d, plug_d,
                      result_A, result_X,
                      x_label, x_key,
@@ -1652,27 +1650,3 @@ else:
         for tab_obj, (lbl, res, rc, buy_d_tab) in zip(tab_objs, tab_specs):
             with tab_obj:
                 show_kpi_table(res, fixed_price, tru_cycle, rc, lbl, buy_d=buy_d_tab)
-
-
-# =============================================================================
-#  METHODOLOGY
-# =============================================================================
-
-with st.expander("Methodology & Assumptions", expanded=False):
-    st.markdown(f"""
-**Price data:** SMARD DE/LU 15-min day-ahead spot prices.
-
-**Charts:** All-in price = (spot + {_fixed_net_ct:.3f} ct/kWh Tax & Levy) × {1+_vat_rate:.2f} VAT.
-
-**Current regulation:** V2G export kWh penalised by re-applied Netzentgelt + Stromsteuer ({_v2g_double_ct:.2f} ct × 1+VAT).
-
-**Future regulation (MiSpeL):** V2G export kWh receives exemption of {_v2g_exempt_ct:.2f} ct/kWh (× 1+VAT). Pending EU state aid approval.
-
-**Cold-chain floor:** SoC >= 20% hard MILP constraint.
-
-**Departure target:** SoC >= {soc_dep}%.
-
-**Battery:** 70 kWh total / 60 kWh usable
-
-**Fixed-tariff benchmark:** EUR {fixed_price:.2f}/kWh.
-    """)
