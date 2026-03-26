@@ -473,7 +473,6 @@ def render_season_block(v2g, season_title, color_hex,
             st.image(buf, use_container_width=True)
 
     with col_soc:
-        st.caption("🔋 **Battery State of Charge (%)**")
         for result_X, x_label, x_key in comparisons:
             buf = make_soc_chart(
                 v2g, hours_d, plug_d,
