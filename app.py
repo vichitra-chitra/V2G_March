@@ -122,17 +122,28 @@ def _setup_xaxis(ax, is_48h, is_wknd_fullday=False):
     ax.grid(True, alpha=0.20, zorder=0)
 
 
-def _vlines(ax, arrival_h, departure_h, is_48h, is_wknd_fullday=False):
+def _vlines(ax, arrival_h, departure_h, is_48h, is_wknd_fullday=False,
+            arrival_act_h=None, departure_act_h=None):
     if is_48h:
         ax.axvline(24, color="#555", lw=1.0, ls="--", alpha=0.55, zorder=6)
         return
     if is_wknd_fullday:
         return
-    def dx(h): return h if h >= 12. else h + 24.
-    ax.axvline(dx(arrival_h),   color="#1B5E20", lw=1.0, ls=":", alpha=0.80, zorder=6)
-    ax.axvline(dx(departure_h), color="#B71C1C", lw=1.0, ls=":", alpha=0.80, zorder=6)
-    ax.axvline(dx(0.),          color="#555",    lw=1.0, ls="--", alpha=0.55, zorder=6)
 
+    def dx(h): return h if h >= 12. else h + 24.
+
+    # ── Planned times (dotted) — always shown ─────────────────────────────
+    ax.axvline(dx(arrival_h),   color="#1B5E20", lw=1.0, ls=":",  alpha=0.50, zorder=6)
+    ax.axvline(dx(departure_h), color="#B71C1C", lw=1.0, ls=":",  alpha=0.50, zorder=6)
+    ax.axvline(dx(0.),          color="#555",    lw=1.0, ls="--", alpha=0.50, zorder=6)
+
+    # ── Actual times (solid) — only when deviation is non-zero ────────────
+    if arrival_act_h is not None and abs(arrival_act_h - arrival_h) > 1e-9:
+        ax.axvline(dx(arrival_act_h),   color="#1B5E20", lw=2.0, ls="-", alpha=0.90, zorder=7,
+                   label=f"Actual arrival {int(arrival_act_h):02d}:00")
+    if departure_act_h is not None and abs(departure_act_h - departure_h) > 1e-9:
+        ax.axvline(dx(departure_act_h), color="#B71C1C", lw=2.0, ls="-", alpha=0.90, zorder=7,
+                   label=f"Actual departure {int(departure_act_h):02d}:00")
 
 # =============================================================================
 #  POWER CHART
@@ -143,7 +154,8 @@ def make_power_chart(v2g, hours_d, buy_d, plug_d,
                      arrival_h, departure_h,
                      is_48h, is_wknd_fullday=False,
                      tru_d=None,
-                     fixed_net_ct=None, vat_rate=None):
+                     fixed_net_ct=None, vat_rate=None,
+                     arrival_act_h=None, departure_act_h=None):
 
     col_a  = SC_COL["A"]
     fill_a  = SC_FILL["A"]
@@ -193,7 +205,8 @@ def make_power_chart(v2g, hours_d, buy_d, plug_d,
         handles.append(h_t)
 
     ax.axhline(0, color="black", lw=0.6)
-    _vlines(ax, arrival_h, departure_h, is_48h, is_wknd_fullday)
+    _vlines(ax, arrival_h, departure_h, is_48h, is_wknd_fullday,
+            arrival_act_h=arrival_act_h, departure_act_h=departure_act_h)
 
     buy_d_ct = to_allin_ct(buy_d, fixed_net_ct, vat_rate)
     ax2 = ax.twinx()
@@ -233,7 +246,8 @@ def make_soc_chart(v2g, hours_d, plug_d,
                    result_A, result_X,
                    x_label, x_key,
                    arrival_h, departure_h,
-                   is_48h, is_wknd_fullday=False):
+                   is_48h, is_wknd_fullday=False,
+                   arrival_act_h=None, departure_act_h=None):
 
     col_a = SC_COL["A"]
     col_x = SC_COL[x_key]
@@ -262,7 +276,8 @@ def make_soc_chart(v2g, hours_d, plug_d,
     ax.axhline(v2g.soc_min_pct,       color="#C62828", ls=":", lw=1.2, zorder=3)
     ax.axhline(v2g.soc_departure_pct, color="#0D47A1", ls=":", lw=1.2, zorder=3)
 
-    _vlines(ax, arrival_h, departure_h, is_48h, is_wknd_fullday)
+    _vlines(ax, arrival_h, departure_h, is_48h, is_wknd_fullday,
+            arrival_act_h=arrival_act_h, departure_act_h=departure_act_h)
 
     handles = [
         h_a, h_x,
@@ -442,7 +457,8 @@ def render_season_block(v2g, season_title, color_hex,
                          arrival_h, departure_h,
                          is_48h, is_wknd_fullday,
                          do_B, do_C, do_D, tru_d=None,
-                         fixed_net_ct=None, vat_rate=None):
+                         fixed_net_ct=None, vat_rate=None,
+                         arrival_act_h=None, departure_act_h=None):
 
     result_A = results[0]
     comparisons = []
@@ -472,7 +488,8 @@ def render_season_block(v2g, season_title, color_hex,
                 v2g, hours_d, buy_d, plug_d,
                 result_A, result_X, x_label, x_key,
                 arrival_h, departure_h, is_48h, is_wknd_fullday, tru_d,
-                fixed_net_ct=fixed_net_ct, vat_rate=vat_rate
+                fixed_net_ct=fixed_net_ct, vat_rate=vat_rate,
+                arrival_act_h=arrival_act_h, departure_act_h=departure_act_h,
             )
             st.image(buf, use_container_width=True)
 
@@ -481,7 +498,8 @@ def render_season_block(v2g, season_title, color_hex,
             buf = make_soc_chart(
                 v2g, hours_d, plug_d,
                 result_A, result_X, x_label, x_key,
-                arrival_h, departure_h, is_48h, is_wknd_fullday
+                arrival_h, departure_h, is_48h, is_wknd_fullday,
+                arrival_act_h=arrival_act_h, departure_act_h=departure_act_h,
             )
             st.image(buf, use_container_width=True)
 
@@ -741,60 +759,6 @@ def run_seasonal(season_key, arrival_h, departure_h,
     # Re-solves MILP at every hour using only the remaining actual horizon.
     # No pre-committed plan → adapts automatically to late or early arrival.
     # Always runs on ACTUAL window; no realize step is needed.
-    if do_D:
-        Pc, Pd, soc = run_D_mpc(v2g, buy_w_act, v2gp_w_act, E_init, tru_w_act,
-                                noise_std=mpc_noise_std)
-        results.append(make_kpi("D - MPC (receding)", v2g, Pc, Pd, soc,
-                                buy_w_act, v2gp_w_act, E_init,
-                                arr_act, dep_act, tru_w=tru_w_act))
-
-    rc = compute_reefer_costs(tru_w_act, buy_w_act, v2g.dt_h)
-
-    return results, results, buy_d, plug_d, hours_d, is_wknd, is_48h, tru_d, rc
-
-    # ---------------------------------------------------------
-    # SCENARIO RUNNERS
-    # ---------------------------------------------------------
-
-    # A - DUMB
-    Pc, Pd, soc = run_A_dumb(v2g, buy_w_plan, v2gp_w_plan, W_plan, E_init, tru_w_plan)
-    if abnormal:
-        Pc, Pd, soc = realize_planned_window_under_actual_times(
-            v2g, Pc, Pd, E_init,
-            arrival_h, departure_h,
-            arrival_act_h, departure_act_h
-        )
-    results.append(make_kpi("A - Dumb", v2g, Pc, Pd, soc,
-                            buy_w_act, v2gp_w_act, E_init,
-                            arr_act, dep_act, tru_w=tru_w_act))
-
-    # B - SMART
-    if do_B:
-        Pc, Pd, soc = run_B_smart(v2g, buy_w_plan, v2gp_w_plan, E_init, tru_w_plan)
-        if abnormal:
-            Pc, Pd, soc = realize_planned_window_under_actual_times(
-                v2g, Pc, Pd, E_init,
-                arrival_h, departure_h,
-                arrival_act_h, departure_act_h
-            )
-        results.append(make_kpi("B - Smart (no V2G)", v2g, Pc, Pd, soc,
-                                buy_w_act, v2gp_w_act, E_init,
-                                arr_act, dep_act, tru_w=tru_w_act))
-
-    # C - MILP
-    if do_C:
-        Pc, Pd, soc = run_C_milp(v2g, buy_w_plan, v2gp_w_plan, E_init, tru_w_plan)
-        if abnormal:
-            Pc, Pd, soc = realize_planned_window_under_actual_times(
-                v2g, Pc, Pd, E_init,
-                arrival_h, departure_h,
-                arrival_act_h, departure_act_h
-            )
-        results.append(make_kpi("C - MILP Day-Ahead", v2g, Pc, Pd, soc,
-                                buy_w_act, v2gp_w_act, E_init,
-                                arr_act, dep_act, tru_w=tru_w_act))
-
-    # D - MPC
     if do_D:
         Pc, Pd, soc = run_D_mpc(v2g, buy_w_act, v2gp_w_act, E_init, tru_w_act,
                                 noise_std=mpc_noise_std)
@@ -1582,6 +1546,10 @@ with st.sidebar:
     if st.button("Back to Input", use_container_width=True):
         st.session_state.show_output = False
         st.rerun()
+    if st.button("🗑️ Clear Cache & Recompute", use_container_width=True,
+                 help="Forces fresh computation — use after changing deviation sliders"):
+        st.cache_data.clear()
+        st.rerun()
     st.session_state.cfg = cfg
     arr_h         = parse_hhmm(cfg["arrival_str"],   16.0)
     dep_h         = parse_hhmm(cfg["departure_str"],  6.0)
@@ -1857,6 +1825,9 @@ else:
             st.error(f"Winter weekday error: {e}")
 
     if res_w is not None:
+        # Compute actual times for chart annotation (None = no deviation)
+        _arr_act_w = (arr_h + arrival_dev_h) % 24 if abs(arrival_dev_h) > 1e-9 else None
+        _dep_act_w = (dep_h + departure_dev_h) % 24 if abs(departure_dev_h) > 1e-9 else None
         render_season_block(
             v2g,
             "Winter Weekday  (Oct – Mar average)",
@@ -1864,7 +1835,8 @@ else:
             hours_d_w, buy_d_w, plug_d_w, res_w,
             arr_h, dep_h, False, False,
             do_B, do_C, do_D, tru_d_w,
-            fixed_net_ct=_fixed_net_ct, vat_rate=_vat_rate
+            fixed_net_ct=_fixed_net_ct, vat_rate=_vat_rate,
+            arrival_act_h=_arr_act_w, departure_act_h=_dep_act_w,
         )
 
     st.markdown(
@@ -1889,6 +1861,8 @@ else:
             st.error(f"Summer weekday error: {e}")
 
     if res_s is not None:
+        _arr_act_s = (arr_h + arrival_dev_h) % 24 if abs(arrival_dev_h) > 1e-9 else None
+        _dep_act_s = (dep_h + departure_dev_h) % 24 if abs(departure_dev_h) > 1e-9 else None
         render_season_block(
             v2g,
             "Summer Weekday  (Apr – Sep average)",
@@ -1896,7 +1870,8 @@ else:
             hours_d_s, buy_d_s, plug_d_s, res_s,
             arr_h, dep_h, False, False,
             do_B, do_C, do_D, tru_d_s,
-            fixed_net_ct=_fixed_net_ct, vat_rate=_vat_rate
+            fixed_net_ct=_fixed_net_ct, vat_rate=_vat_rate,
+            arrival_act_h=_arr_act_s, departure_act_h=_dep_act_s,
         )
 
     st.markdown("---")
