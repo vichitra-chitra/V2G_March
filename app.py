@@ -639,11 +639,31 @@ def run_seasonal(season_key, arrival_h, departure_h,
         rc = compute_reefer_costs(tru_w[:24], buy[:24], v2g.dt_h)
         return results, results_kpi, buy_d, plug_d, hours_d, is_wknd, is_48h, tru_w, rc
 
+# ---------------------------------------------------------
+    # WEEKDAY: planned window (day-ahead) vs actual window (real execution)
+    #
+    # Scenario A  — Dumb   : runs on ACTUAL window. No schedule exists;
+    #               trailer charges greedily the moment it physically arrives.
+    #
+    # Scenario B  — Smart  : optimised day-ahead on PLANNED window (cheapest
+    #               hours, charge-only). Realized on ACTUAL window:
+    #               slots missed because trailer was not yet plugged in are
+    #               simply skipped. No re-optimisation after deviation.
+    #
+    # Scenario C  — MILP   : same plan-then-realize logic as B. MILP commits
+    #               to a schedule before the trailer moves. If it arrives late
+    #               and misses cheap overnight slots, those slots are lost
+    #               (SoC target may not be met — this is intentional and is
+    #               a key finding to highlight in the thesis).
+    #
+    # Scenario D  — MPC    : re-solves MILP every hour on the remaining ACTUAL
+    #               horizon. No pre-committed plan, so it adapts automatically
+    #               to early or late arrival.
     # ---------------------------------------------------------
-    # WEEKDAY ABNORMALITY HANDLING
-    # ---------------------------------------------------------
+
     abnormal = (abs(arrival_dev_h) > 1e-12) or (abs(departure_dev_h) > 1e-12)
 
+    # Actual arrival/departure after applying real-world deviation
     arrival_act_h   = (arrival_h   + arrival_dev_h)   % 24.0
     departure_act_h = (departure_h + departure_dev_h) % 24.0
 
@@ -654,24 +674,83 @@ def run_seasonal(season_key, arrival_h, departure_h,
     if abs(arrival_act_h - departure_act_h) < 1e-12:
         raise ValueError("Actual arrival and departure cannot be equal.")
 
-    # Planned window
+    # ── PLANNED window — what B and C optimise against (day-ahead commitment)
     win_plan, _, _, W_plan = get_wd_window(v2g, arrival_h, departure_h)
     buy_w_plan  = buy[win_plan]
     v2gp_w_plan = v2gp[win_plan]
     tru_w_plan  = get_tru_1h_trace(tru_cycle, W_plan, v2g.dt_h)
 
-    # Actual window
+    # ── ACTUAL window — the real plug-in period; used by A, D, and for KPI eval
     win_act, arr_act, dep_act, W_act = get_wd_window(v2g, arrival_act_h, departure_act_h)
     buy_w_act  = buy[win_act]
     v2gp_w_act = v2gp[win_act]
     tru_w_act  = get_tru_1h_trace(tru_cycle, W_act, v2g.dt_h)
 
+    # ── Display: gold band = ACTUAL plug-in window
     buy_d, plug_d, hours_d = build_wd_display(v2g, buy, arrival_act_h, departure_act_h)
 
+    # TRU display: reefer only draws grid power while physically plugged in
     tru_d = np.zeros(v2g.n_slots)
-    tru_d[arr_act:dep_act] = tru_w_act[:dep_act-arr_act]
+    tru_d[arr_act:dep_act] = tru_w_act[:dep_act - arr_act]
 
     results = []
+
+    # ── A — DUMB ──────────────────────────────────────────────────────────────
+    # No price awareness, no pre-committed schedule.
+    # Always runs on ACTUAL window — deviation affects it immediately and fully.
+    Pc, Pd, soc = run_A_dumb(v2g, buy_w_act, v2gp_w_act, W_act, E_init, tru_w_act)
+    results.append(make_kpi("A - Dumb", v2g, Pc, Pd, soc,
+                            buy_w_act, v2gp_w_act, E_init,
+                            arr_act, dep_act, tru_w=tru_w_act))
+
+    # ── B — SMART (no V2G) ────────────────────────────────────────────────────
+    # Optimised day-ahead on PLANNED window (cheapest hours, charge-only).
+    # When abnormal: plan is fixed; realized on ACTUAL window.
+    # Slots that fall outside the actual plug-in period are skipped.
+    if do_B:
+        Pc, Pd, soc = run_B_smart(v2g, buy_w_plan, v2gp_w_plan, E_init, tru_w_plan)
+        if abnormal:
+            Pc, Pd, soc = realize_planned_window_under_actual_times(
+                v2g, Pc, Pd, E_init,
+                arrival_h,     departure_h,
+                arrival_act_h, departure_act_h,
+            )
+        results.append(make_kpi("B - Smart (no V2G)", v2g, Pc, Pd, soc,
+                                buy_w_act, v2gp_w_act, E_init,
+                                arr_act, dep_act, tru_w=tru_w_act))
+
+    # ── C — MILP Day-Ahead ────────────────────────────────────────────────────
+    # Full MILP with V2G, optimised day-ahead on PLANNED window.
+    # Same plan-then-realize logic as B. If the trailer arrives late and misses
+    # the cheapest charging slots (e.g. 02:00–04:00), those slots are simply
+    # lost — the plan cannot be retroactively changed. This exposes the
+    # key weakness of open-loop day-ahead MILP under schedule uncertainty.
+    if do_C:
+        Pc, Pd, soc = run_C_milp(v2g, buy_w_plan, v2gp_w_plan, E_init, tru_w_plan)
+        if abnormal:
+            Pc, Pd, soc = realize_planned_window_under_actual_times(
+                v2g, Pc, Pd, E_init,
+                arrival_h,     departure_h,
+                arrival_act_h, departure_act_h,
+            )
+        results.append(make_kpi("C - MILP Day-Ahead", v2g, Pc, Pd, soc,
+                                buy_w_act, v2gp_w_act, E_init,
+                                arr_act, dep_act, tru_w=tru_w_act))
+
+    # ── D — MPC Receding Horizon ──────────────────────────────────────────────
+    # Re-solves MILP at every hour using only the remaining actual horizon.
+    # No pre-committed plan → adapts automatically to late or early arrival.
+    # Always runs on ACTUAL window; no realize step is needed.
+    if do_D:
+        Pc, Pd, soc = run_D_mpc(v2g, buy_w_act, v2gp_w_act, E_init, tru_w_act,
+                                noise_std=mpc_noise_std)
+        results.append(make_kpi("D - MPC (receding)", v2g, Pc, Pd, soc,
+                                buy_w_act, v2gp_w_act, E_init,
+                                arr_act, dep_act, tru_w=tru_w_act))
+
+    rc = compute_reefer_costs(tru_w_act, buy_w_act, v2g.dt_h)
+
+    return results, results, buy_d, plug_d, hours_d, is_wknd, is_48h, tru_d, rc
 
     # ---------------------------------------------------------
     # SCENARIO RUNNERS
@@ -726,48 +805,6 @@ def run_seasonal(season_key, arrival_h, departure_h,
     rc = compute_reefer_costs(tru_w_act, buy_w_act, v2g.dt_h)
 
     return results, results, buy_d, plug_d, hours_d, is_wknd, is_48h, tru_d, rc
-
-    # ---------------------------------------------------------
-    # WEEKDAY ABNORMALITY HANDLING
-    # ---------------------------------------------------------
-    abnormal = (abs(arrival_dev_h) > 1e-12) or (abs(departure_dev_h) > 1e-12)
-
-    arrival_act_h   = (arrival_h   + arrival_dev_h)   % 24.0
-    departure_act_h = (departure_h + departure_dev_h) % 24.0
-
-    if not (12.0 <= arrival_act_h < 24.0):
-        raise ValueError("Actual weekday arrival must be 12:00–23:59.")
-
-    if not (0.0 <= departure_act_h < 12.0):
-        raise ValueError("Actual weekday departure must be 00:00–11:59.")
-
-    if abs(arrival_act_h - departure_act_h) < 1e-12:
-        raise ValueError("Actual arrival and departure cannot be equal.")
-
-    # -----------------
-    # Planned window
-    # -----------------
-    win_plan, _, _, W_plan = get_wd_window(v2g, arrival_h, departure_h)
-    buy_w_plan  = buy[win_plan]
-    v2gp_w_plan = v2gp[win_plan]
-    tru_w_plan  = get_tru_1h_trace(tru_cycle, W_plan, v2g.dt_h)
-
-    # -----------------
-    # Actual window
-    # -----------------
-    win_act, arr_act, dep_act, W_act = get_wd_window(v2g, arrival_act_h, departure_act_h)
-    buy_w_act  = buy[win_act]
-    v2gp_w_act = v2gp[win_act]
-    tru_w_act  = get_tru_1h_trace(tru_cycle, W_act, v2g.dt_h)
-
-    buy_d, plug_d, hours_d = build_wd_display(v2g, buy, arrival_act_h, departure_act_h)
-
-    tru_d = np.zeros(v2g.n_slots)
-    tru_d[arr_act:dep_act] = tru_w_act[:dep_act-arr_act]
-
-    results = []
-
-    # (SCENARIO RUNNERS WILL BE PASTED RIGHT HERE)
 
 @st.cache_data(show_spinner=False)
 def run_specific_date(date_str, arrival_h, departure_h,
@@ -902,14 +939,10 @@ def run_specific_date(date_str, arrival_h, departure_h,
     # -------------------------------------------------------
     results = []
 
-    # A - DUMB
-    Pc, Pd, soc = run_A_dumb(v2g, buy_w_plan, v2gp_w_plan, len(slots_plan), E_init, tru_w_plan)
-    if abnormal:
-        Pc, Pd, soc = realize_planned_window_under_actual_times(
-            v2g, Pc, Pd, E_init,
-            arrival_h, departure_h,
-            arrival_act_h, departure_act_h
-        )
+# ── A — DUMB
+    # No schedule, no price awareness. Charges greedily from actual arrival.
+    # Runs directly on ACTUAL window — no plan to realize.
+    Pc, Pd, soc = run_A_dumb(v2g, buy_w_act, v2gp_w_act, len(slots_act), E_init, tru_w_act)
     results.append(make_kpi("A - Dumb", v2g, Pc, Pd, soc,
                             buy_w_act, v2gp_w_act, E_init,
                             arr, dep, tru_w=tru_w_act))
@@ -1814,7 +1847,9 @@ else:
              is_wknd_w, is_48h_w, tru_d_w, rc_w) = run_seasonal(
                 "winter_weekday", arr_h, dep_h,
                 float(soc_w), float(soc_dep),
-                tru_cycle, do_B, do_C, do_D, mpc_noise_std
+                tru_cycle, do_B, do_C, do_D, mpc_noise_std,
+                arrival_dev_h=arrival_dev_h,        # pass real-world deviation
+                departure_dev_h=departure_dev_h,    # pass real-world deviation
             )
             all_season_res_kpi["winter_weekday"] = res_w_kpi
             all_reefer_costs["winter_weekday"]    = rc_w
@@ -1844,7 +1879,9 @@ else:
              is_wknd_s, is_48h_s, tru_d_s, rc_s) = run_seasonal(
                 "summer_weekday", arr_h, dep_h,
                 float(soc_s), float(soc_dep),
-                tru_cycle, do_B, do_C, do_D, mpc_noise_std
+                tru_cycle, do_B, do_C, do_D, mpc_noise_std,
+                arrival_dev_h=arrival_dev_h,        # pass real-world deviation
+                departure_dev_h=departure_dev_h,    # pass real-world deviation
             )
             all_season_res_kpi["summer_weekday"] = res_s_kpi
             all_reefer_costs["summer_weekday"]    = rc_s
