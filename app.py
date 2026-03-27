@@ -11,6 +11,7 @@ from v2g import (
     soc_ramp,
     realize_planned_window_under_actual_times,
 )
+
 import matplotlib.patches as mpatches
 from matplotlib.lines import Line2D
 from io import BytesIO
