@@ -6,10 +6,8 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from matplotlib.lines import Line2D
 from dataclasses import dataclass
 from pathlib import Path
-from datetime import timedelta
 
 SC_COL   = {"A": "#999999", "B": "#2196F3", "C": "#00ACC1", "D": "#FF7700", "price": "#2E7D32"}
 SC_FILL  = {"A": "#CCCCCC", "B": "#A5D6A7", "C": "#80DEEA", "D": "#FFCC80"}
@@ -299,12 +297,76 @@ def expand_to_minutes(v2g, Pc_w, Pd_w, E_init):
     soc_pct = soc_kwh * 100.0 / v2g.usable_capacity_kWh
     return t_min, Pc_min, Pd_min, soc_pct
 
+def realize_planned_window_under_actual_times(
+    v2g,
+    Pc_plan,
+    Pd_plan,
+    E_init,
+    planned_arrival_h,
+    planned_departure_h,
+    actual_arrival_h,
+    actual_departure_h,
+):
+
+    def _abs_slots(arrival_h, departure_h):
+        n = v2g.n_slots
+        dt = v2g.dt_h
+        a = round(arrival_h / dt) % n
+        d = round(departure_h / dt) % n
+
+        if a == d:
+            raise ValueError("Arrival and departure times cannot be equal.")
+
+        if d <= a:
+            # Overnight window, e.g. 16:00 -> 06:00
+            return list(range(a, n)) + list(range(n, n + d))
+        else:
+            # Same-day window (robust fallback)
+            return list(range(a, d))
+
+    plan_slots = _abs_slots(planned_arrival_h, planned_departure_h)
+    act_slots  = _abs_slots(actual_arrival_h, actual_departure_h)
+
+    horizon = max(max(plan_slots), max(act_slots)) + 1
+
+    Pc_abs = np.zeros(horizon)
+    Pd_abs = np.zeros(horizon)
+
+    n_map_c = min(len(Pc_plan), len(plan_slots))
+    n_map_d = min(len(Pd_plan), len(plan_slots))
+
+    for k in range(n_map_c):
+        Pc_abs[plan_slots[k]] = float(Pc_plan[k])
+
+    for k in range(n_map_d):
+        Pd_abs[plan_slots[k]] = float(Pd_plan[k])
+
+    # Only the part inside the ACTUAL plugged-in interval can actually be executed
+    Pc_act = Pc_abs[act_slots]
+    Pd_act = Pd_abs[act_slots]
+
+    # Re-integrate SoC over ACTUAL window
+    dt = v2g.dt_h
+    soc_act = np.zeros(len(act_slots))
+    s = float(E_init)
+
+    for t in range(len(act_slots)):
+        s = float(np.clip(
+            s
+            + Pc_act[t] * v2g.eta_charge * dt
+            - Pd_act[t] / v2g.eta_discharge * dt,
+            v2g.E_min,
+            v2g.E_max,
+        ))
+        soc_act[t] = s
+
+    return Pc_act, Pd_act, soc_act
+
 # =============================================================================
 #  7. MILP SOLVER
 # =============================================================================
 
-def solve_milp(v2g, buy_w, v2gp_w, E_init, E_fin,
-               allow_discharge=True, tru_w=None):
+def solve_milp(v2g, buy_w, v2gp_w, E_init, E_fin, allow_discharge=True, tru_w=None):
     from scipy.optimize import milp, LinearConstraint, Bounds
     from scipy.sparse import lil_matrix, csc_matrix
 
@@ -337,8 +399,10 @@ def solve_milp(v2g, buy_w, v2gp_w, E_init, E_fin,
     ub[id_] = v2g.discharge_power_kW if allow_discharge else 0.0
     lb[ie]  = v2g.E_min
     ub[ie]  = v2g.E_max
-    lb[izc] = 0.0;  ub[izc] = 1.0
-    lb[izd] = 0.0;  ub[izd] = 1.0
+    lb[izc] = 0.0
+    ub[izc] = 1.0
+    lb[izd] = 0.0
+    ub[izd] = 1.0
     integ = np.zeros(nv)
     integ[izc] = 1
     integ[izd] = 1
@@ -358,9 +422,12 @@ def solve_milp(v2g, buy_w, v2gp_w, E_init, E_fin,
         lo[t] = hi[t] = rhs
 
     for t in range(W):
-        A[W+t,   ic[t]]  =  1.0;  A[W+t,   izc[t]] = -v2g.charge_power_kW
-        A[2*W+t, id_[t]] =  1.0;  A[2*W+t, izd[t]] = -v2g.discharge_power_kW
-        A[3*W+t, izc[t]] =  1.0;  A[3*W+t, izd[t]] =  1.0
+        A[W+t,   ic[t]]  =  1.0
+        A[W+t,   izc[t]] = -v2g.charge_power_kW
+        A[2*W+t, id_[t]] =  1.0
+        A[2*W+t, izd[t]] = -v2g.discharge_power_kW
+        A[3*W+t, izc[t]] =  1.0
+        A[3*W+t, izd[t]] =  1.0
         hi[W+t] = hi[2*W+t] = 0.0
         hi[3*W+t] = 1.0
 
@@ -807,7 +874,8 @@ def main():
         buy   = load_avg_profile(csv_path, months, False)
         v2gp  = buy.copy()
         win, arr, dep, W = get_wd_window(v2g, arrival_h, departure_h)
-        buy_w = buy[win]; v2gp_w = v2gp[win]
+        buy_w = buy[win]
+        v2gp_w = v2gp[win]
         E_init = v2g.usable_capacity_kWh * soc_pct / 100.0
 
         Pc,Pd,soc = run_A_dumb(v2g, buy_w, v2gp_w, W, E_init)
