@@ -27,7 +27,7 @@ GERMAN_TARIFF = {
     "OffshoreGridLevy_ct": 0.816,
     "CHPLevy_ct":          0.277,
     "ElectricityTax_ct":   2.05,
-    "NEV19Levy_ct":        1.558,
+    "NEV19Levy_ct":        1.559,
     "NetworkUsageFees_ct": 6.63,
     "VAT_pc":             19.0,
 }

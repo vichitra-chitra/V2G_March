@@ -416,7 +416,8 @@ def load_two_day_profile(date_str: str) -> np.ndarray:
 def run_seasonal(season_key, arrival_h, departure_h,
                  soc_pct, soc_departure_pct, tru_cycle,
                  do_B, do_C, do_D, mpc_noise_std=0.0,
-                 arrival_dev_h=0.0, departure_dev_h=0.0):
+                 arrival_dev_h=0.0, departure_dev_h=0.0,
+                 aux_power_w=400, bat_heat_w=100):
     
     months_map = {
         "winter_weekday": (WINTER_M, False, False),
@@ -430,6 +431,12 @@ def run_seasonal(season_key, arrival_h, departure_h,
     v2g  = V2GParams(soc_departure_pct=soc_departure_pct)
     E_init = v2g.usable_capacity_kWh * soc_pct / 100.0
 
+    # Parasitic constant loads while plugged in
+    is_winter_season = any(m in WINTER_M for m in months)
+    _aux_kw  = aux_power_w / 1000.0
+    _heat_kw = (bat_heat_w / 1000.0) if is_winter_season else 0.0
+    _parasitic_kw = _aux_kw + _heat_kw
+
     # ---------------------------------------------------------
     # WEEKEND 48H CASE (unchanged)
     # ---------------------------------------------------------
@@ -437,7 +444,7 @@ def run_seasonal(season_key, arrival_h, departure_h,
         buy48  = np.concatenate([buy, buy])
         v2gp48 = buy48.copy()
         W      = 48
-        tru_w  = get_tru_1h_trace(tru_cycle, W, v2g.dt_h)
+        tru_w  = get_tru_1h_trace(tru_cycle, W, v2g.dt_h) + _parasitic_kw
 
         hours_d = np.arange(W) * v2g.dt_h
         plug_d  = np.ones(W)
@@ -502,13 +509,13 @@ def run_seasonal(season_key, arrival_h, departure_h,
     win_plan, _, _, W_plan = get_wd_window(v2g, arrival_h, departure_h)
     buy_w_plan  = buy[win_plan]
     v2gp_w_plan = v2gp[win_plan]
-    tru_w_plan  = get_tru_1h_trace(tru_cycle, W_plan, v2g.dt_h)
+    tru_w_plan  = get_tru_1h_trace(tru_cycle, W_plan, v2g.dt_h) + _parasitic_kw
 
     # ── ACTUAL window — the real plug-in period; used by A, D, and for KPI eval
     win_act, arr_act, dep_act, W_act = get_wd_window(v2g, arrival_act_h, departure_act_h)
     buy_w_act  = buy[win_act]
     v2gp_w_act = v2gp[win_act]
-    tru_w_act  = get_tru_1h_trace(tru_cycle, W_act, v2g.dt_h)
+    tru_w_act  = get_tru_1h_trace(tru_cycle, W_act, v2g.dt_h) + _parasitic_kw
 
     # ── Display: gold band = ACTUAL plug-in window
     buy_d, plug_d, hours_d = build_wd_display(v2g, buy, arrival_act_h, departure_act_h)
@@ -580,12 +587,19 @@ def run_seasonal(season_key, arrival_h, departure_h,
 def run_specific_date(date_str, arrival_h, departure_h,
                       soc_pct, soc_departure_pct, tru_cycle,
                       do_B, do_C, do_D, mpc_noise_std=0.0,
-                      arrival_dev_h=0.0, departure_dev_h=0.0):
+                      arrival_dev_h=0.0, departure_dev_h=0.0,
+                      aux_power_w=400, bat_heat_w=100):
 
     ts = pd.Timestamp(date_str)
-    is_wknd = ts.dayofweek >= 5
+    is_wknd  = ts.dayofweek >= 5
+    is_winter_date = ts.month in WINTER_M
     v2g = V2GParams(soc_departure_pct=soc_departure_pct)
     E_init = v2g.usable_capacity_kWh * soc_pct / 100.0
+
+    # Parasitic loads
+    _aux_kw      = aux_power_w / 1000.0
+    _heat_kw     = (bat_heat_w / 1000.0) if is_winter_date else 0.0
+    _parasitic_kw = _aux_kw + _heat_kw
 
     # -------------------------------------------------------
     # Weekend = simple 24h plug-in, abnormality NOT applied
@@ -597,7 +611,7 @@ def run_specific_date(date_str, arrival_h, departure_h,
 
         buy_w = buy
         v2gp_w = v2gp
-        tru_w = get_tru_1h_trace(tru_cycle, W, v2g.dt_h)
+        tru_w = get_tru_1h_trace(tru_cycle, W, v2g.dt_h) + _parasitic_kw
 
         buy_d = buy
         plug_d = np.ones(24)
@@ -669,13 +683,13 @@ def run_specific_date(date_str, arrival_h, departure_h,
     slots_plan = _slots_48(arrival_h, departure_h)
     buy_w_plan = buy_48[slots_plan]
     v2gp_w_plan = v2gp_48[slots_plan]
-    tru_w_plan = get_tru_1h_trace(tru_cycle, len(slots_plan), v2g.dt_h)
+    tru_w_plan = get_tru_1h_trace(tru_cycle, len(slots_plan), v2g.dt_h) + _parasitic_kw
 
     # Actual window (real execution + MPC)
     slots_act = _slots_48(arrival_act_h, departure_act_h)
     buy_w_act = buy_48[slots_act]
     v2gp_w_act = v2gp_48[slots_act]
-    tru_w_act = get_tru_1h_trace(tru_cycle, len(slots_act), v2g.dt_h)
+    tru_w_act = get_tru_1h_trace(tru_cycle, len(slots_act), v2g.dt_h) + _parasitic_kw
 
     # 24h display window: 12:00 -> next 12:00
     ROLL = round(12.0 / v2g.dt_h)
@@ -902,6 +916,8 @@ DEFAULTS = {
     "t_fut_vat":        19.0,
     "arrival_dev_h": 0.0,
     "departure_dev_h": 0.0,
+    "aux_power_w": 400,
+    "bat_heat_w":  100,
 }
 
 if "cfg" not in st.session_state:
@@ -1041,6 +1057,18 @@ def render_input_panel():
 
         with c3:
             st.subheader("Reefer (TRU) at Depot")
+            cfg["aux_power_w"] = st.number_input(
+                "Auxiliary power loss (W)",
+                min_value=0, max_value=2000,
+                value=int(cfg.get("aux_power_w", 400)), step=10,
+                help="Constant grid draw while trailer is plugged in "
+                     "(charger standby, lighting, control systems, etc.)")
+            cfg["bat_heat_w"] = st.number_input(
+                "Battery heating (W) — Winter only",
+                min_value=0, max_value=1000,
+                value=int(cfg.get("bat_heat_w", 100)), step=10,
+                help="Constant power to keep battery warm in winter months (Oct–Mar). "
+                     "Added only when is_winter=True.")
             cycle_choice = st.radio(
                 "TRU cycle while plugged in",
                 ["Continuous", "Start-Stop", "OFF"],
@@ -1297,6 +1325,8 @@ tru_cycle     = cfg["tru_cycle"]
 mpc_noise_std = float(cfg.get("mpc_noise_std", 0.0))
 arrival_dev_h = float(cfg.get("arrival_dev_h", 0.0))
 departure_dev_h = float(cfg.get("departure_dev_h", 0.0))
+aux_power_w     = int(cfg.get("aux_power_w", 400))
+bat_heat_w      = int(cfg.get("bat_heat_w",  100))
 w_months      = 6
 s_months      = 6
 do_B          = bool(cfg["do_B"])
@@ -1330,6 +1360,21 @@ with st.sidebar:
         "Departure deviation (h)", -4.0, 4.0,
         float(cfg.get("departure_dev_h", 0.0)), 1.0
     )
+    cfg["aux_power_w"] = st.number_input(
+        "Aux power loss (W)", min_value=0, max_value=2000,
+        value=int(cfg.get("aux_power_w", 400)), step=10, key="sb_aux")
+    cfg["bat_heat_w"] = st.number_input(
+        "Bat heating (W, winter)", min_value=0, max_value=1000,
+        value=int(cfg.get("bat_heat_w", 100)), step=10, key="sb_heat")
+
+    # ── Auto-clear cache when deviation or parasitic loads change ──────────
+    _watch = (cfg["arrival_dev_h"], cfg["departure_dev_h"],
+              cfg["aux_power_w"], cfg["bat_heat_w"])
+    if st.session_state.get("_watch_prev") != _watch:
+        st.session_state["_watch_prev"] = _watch
+        st.cache_data.clear()
+        st.rerun()
+
     cfg["soc_winter"]    = st.slider("Winter arrival SoC (%)",   20, 100, soc_w)
     cfg["soc_summer"]    = st.slider("Summer arrival SoC (%)",   20, 100, soc_s)
     cfg["soc_departure"] = st.slider("Departure target SoC (%)", 50, 100, soc_dep)
@@ -1556,7 +1601,7 @@ def show_kpi_table(results, fixed_price, tru_cycle, rc, label="", buy_d=None):
                      use_container_width=True, hide_index=True)
 
     if tru_cycle != "OFF" and rc["E_kWh"] > 0.01:
-        st.markdown("**Reefer (TRU) Energy Cost**")
+        st.markdown("**Reefer + Aux + Heating Energy Cost**")
         st.dataframe(pd.DataFrame([
             ["TRU energy (kWh/d)",                        f"{rc['E_kWh']:.2f}"],
             ["Grid spot cost (EUR/d)",                    f"EUR {rc['cost_dynamic']:.3f}"],
@@ -1597,7 +1642,9 @@ if mode == "Specific Date":
              is_wknd_r, is_48h, is_wknd_fullday, tru_d, rc) = run_specific_date(
                 specific_date, arr_h, dep_h,
                 float(soc_init), float(soc_dep),
-                tru_cycle, do_B, do_C, do_D
+                tru_cycle, do_B, do_C, do_D,
+                aux_power_w=aux_power_w,
+                bat_heat_w=bat_heat_w,
             )
         except Exception as e:
             st.error(f"Error: {e}")
@@ -1622,8 +1669,10 @@ else:
                 "winter_weekday", arr_h, dep_h,
                 float(soc_w), float(soc_dep),
                 tru_cycle, do_B, do_C, do_D, mpc_noise_std,
-                arrival_dev_h=arrival_dev_h,        # pass real-world deviation
-                departure_dev_h=departure_dev_h,    # pass real-world deviation
+                arrival_dev_h=arrival_dev_h,
+                departure_dev_h=departure_dev_h,
+                aux_power_w=aux_power_w,
+                bat_heat_w=bat_heat_w,
             )
             all_season_res_kpi["winter_weekday"] = res_w_kpi
             all_reefer_costs["winter_weekday"]    = rc_w
@@ -1658,8 +1707,10 @@ else:
                 "summer_weekday", arr_h, dep_h,
                 float(soc_s), float(soc_dep),
                 tru_cycle, do_B, do_C, do_D, mpc_noise_std,
-                arrival_dev_h=arrival_dev_h,        # pass real-world deviation
-                departure_dev_h=departure_dev_h,    # pass real-world deviation
+                arrival_dev_h=arrival_dev_h,
+                departure_dev_h=departure_dev_h,
+                aux_power_w=aux_power_w,
+                bat_heat_w=bat_heat_w,
             )
             all_season_res_kpi["summer_weekday"] = res_s_kpi
             all_reefer_costs["summer_weekday"]    = rc_s
@@ -1694,7 +1745,9 @@ else:
                 (res_we, res_we_kpi, buy_d_we, plug_d_we, hours_d_we,
                  _, is_48h_we, tru_d_we, rc_we) = run_seasonal(
                     sk, arr_h, dep_h, float(soc_init), float(soc_dep),
-                    tru_cycle, do_B, do_C, do_D
+                    tru_cycle, do_B, do_C, do_D,
+                    aux_power_w=aux_power_w,
+                    bat_heat_w=bat_heat_w,
                 )
                 all_season_res_kpi[sk] = res_we_kpi
                 all_reefer_costs[sk]   = rc_we
