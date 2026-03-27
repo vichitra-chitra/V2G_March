@@ -6,10 +6,8 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from matplotlib.lines import Line2D
 from dataclasses import dataclass
 from pathlib import Path
-from datetime import timedelta
 
 SC_COL   = {"A": "#999999", "B": "#2196F3", "C": "#00ACC1", "D": "#FF7700", "price": "#2E7D32"}
 SC_FILL  = {"A": "#CCCCCC", "B": "#A5D6A7", "C": "#80DEEA", "D": "#FFCC80"}
@@ -29,7 +27,7 @@ GERMAN_TARIFF = {
     "OffshoreGridLevy_ct": 0.816,
     "CHPLevy_ct":          0.277,
     "ElectricityTax_ct":   2.05,
-    "NEV19Levy_ct":        1.558,
+    "NEV19Levy_ct":        1.559,
     "NetworkUsageFees_ct": 6.63,
     "VAT_pc":             19.0,
 }
@@ -56,8 +54,8 @@ class V2GParams:
     eta_charge           : float = 0.92
     eta_discharge        : float = 0.92
     deg_cost_eur_kwh     : float = 0.0
-    dt_h                 : float = 0.25
-    n_slots              : int   = 96
+    dt_h                 : float = 1
+    n_slots              : int   = 24
 
     @property
     def E_min(self):
@@ -93,15 +91,15 @@ def _reefer_hi_res(cycle_type, N, dt_sec=10):
     return np.tile(pw, reps)[:N]
 
 
-def get_tru_15min_trace(cycle_type, W, dt_h=0.25):
+def get_tru_1h_trace(cycle_type, W, dt_h=1.0):
     if cycle_type.strip().lower() in ("off", "noreeferstationary"):
         return np.zeros(W)
-    dt_sec_hi       = 10
-    slots_per_15min = int(dt_h * 3600 / dt_sec_hi)
-    N_hi            = W * slots_per_15min
-    P_hi            = _reefer_hi_res(cycle_type, N_hi, dt_sec_hi)
+    dt_sec_hi      = 10
+    slots_per_1h   = int(dt_h * 3600 / dt_sec_hi)   # 360 samples per hour
+    N_hi           = W * slots_per_1h
+    P_hi           = _reefer_hi_res(cycle_type, N_hi, dt_sec_hi)
     return np.array([
-        float(np.mean(P_hi[i * slots_per_15min:(i + 1) * slots_per_15min]))
+        float(np.mean(P_hi[i * slots_per_1h:(i + 1) * slots_per_1h]))
         for i in range(W)
     ])
 
@@ -178,7 +176,7 @@ def _load_csv_raw(csv_path):
     df = df.dropna(subset=["dt", "price_eur_mwh"])
     df["price"] = pd.to_numeric(df["price_eur_mwh"], errors="coerce") / 1000.0
     df = df.dropna(subset=["price"]).set_index("dt").sort_index()
-    df["slot"]       = df.index.hour * 4 + df.index.minute // 15
+    df["slot"]       = df.index.hour
     df["is_weekend"] = df.index.dayofweek >= 5
     df["month"]      = df.index.month
     df["date"]       = df.index.date
@@ -187,11 +185,7 @@ def _load_csv_raw(csv_path):
     return df
 
 
-def _interpolate_to_15min(profile: np.ndarray) -> np.ndarray:
-    n    = len(profile)
-    flat = sum(1 for i in range(0, n, 4) if np.ptp(profile[i:i+4]) < 1e-9)
-    if (n // 4) > 0 and flat / (n // 4) > 0.55:
-        return profile
+def _passthrough_profile(profile: np.ndarray) -> np.ndarray:
     return profile
 
 
@@ -202,9 +196,9 @@ def load_avg_profile(csv_path, months, is_weekend):
     if len(sub) == 0:
         raise ValueError(f"No data for months={months}, weekend={is_weekend}")
     profile = sub.groupby("slot")["price"].mean().values
-    if len(profile) != 96:
-        raise ValueError(f"Expected 96 slots, got {len(profile)}")
-    return _interpolate_to_15min(profile)
+    if len(profile) != 24:
+        raise ValueError(f"Expected 24 slots, got {len(profile)}")
+    return _passthrough_profile(profile)
 
 
 # =============================================================================
@@ -261,13 +255,118 @@ def soc_ramp(hours, soc_pct, init_pct):
         y[2*i+1] = soc_pct[i]
     return x, y
 
+# =============================================================================
+#  6b. MINUTE-RESOLUTION EXPANDER
+# =============================================================================
+
+def expand_to_minutes(v2g, Pc_w, Pd_w, E_init):
+    """
+    Expand hourly window arrays (length W) to minute resolution (length W×60).
+
+    Strategy:
+      - Pc_min, Pd_min : each hourly value repeated 60× (step-hold within hour)
+      - soc_pct        : re-integrated minute-by-minute from E_init using
+                         dt = 1/60 h, so SoC ramps smoothly within each hour
+                         rather than jumping. Clipped to [E_min, E_max].
+
+    Returns
+    -------
+    t_min   : np.ndarray shape (W*60,)  — time in hours from window start
+    Pc_min  : np.ndarray shape (W*60,)  — charge power (kW)
+    Pd_min  : np.ndarray shape (W*60,)  — discharge power (kW)
+    soc_pct : np.ndarray shape (W*60,)  — SoC in %
+    """
+    W    = len(Pc_w)
+    N    = W * 60
+    dt_m = 1.0 / 60.0                      # 1 minute expressed in hours
+
+    Pc_min = np.repeat(Pc_w.astype(float), 60)
+    Pd_min = np.repeat(Pd_w.astype(float), 60)
+
+    soc_kwh = np.empty(N)
+    s = float(E_init)
+    for i in range(N):
+        s = float(np.clip(
+            s + Pc_min[i] * v2g.eta_charge  * dt_m
+              - Pd_min[i] / v2g.eta_discharge * dt_m,
+            v2g.E_min, v2g.E_max,
+        ))
+        soc_kwh[i] = s
+
+    t_min   = np.arange(N, dtype=float) * dt_m   # 0, 1/60, 2/60, …
+    soc_pct = soc_kwh * 100.0 / v2g.usable_capacity_kWh
+    return t_min, Pc_min, Pd_min, soc_pct
+
+def realize_planned_window_under_actual_times(
+    v2g,
+    Pc_plan,
+    Pd_plan,
+    E_init,
+    planned_arrival_h,
+    planned_departure_h,
+    actual_arrival_h,
+    actual_departure_h,
+):
+
+    def _abs_slots(arrival_h, departure_h):
+        n = v2g.n_slots
+        dt = v2g.dt_h
+        a = round(arrival_h / dt) % n
+        d = round(departure_h / dt) % n
+
+        if a == d:
+            raise ValueError("Arrival and departure times cannot be equal.")
+
+        if d <= a:
+            # Overnight window, e.g. 16:00 -> 06:00
+            return list(range(a, n)) + list(range(n, n + d))
+        else:
+            # Same-day window (robust fallback)
+            return list(range(a, d))
+
+    plan_slots = _abs_slots(planned_arrival_h, planned_departure_h)
+    act_slots  = _abs_slots(actual_arrival_h, actual_departure_h)
+
+    horizon = max(max(plan_slots), max(act_slots)) + 1
+
+    Pc_abs = np.zeros(horizon)
+    Pd_abs = np.zeros(horizon)
+
+    n_map_c = min(len(Pc_plan), len(plan_slots))
+    n_map_d = min(len(Pd_plan), len(plan_slots))
+
+    for k in range(n_map_c):
+        Pc_abs[plan_slots[k]] = float(Pc_plan[k])
+
+    for k in range(n_map_d):
+        Pd_abs[plan_slots[k]] = float(Pd_plan[k])
+
+    # Only the part inside the ACTUAL plugged-in interval can actually be executed
+    Pc_act = Pc_abs[act_slots]
+    Pd_act = Pd_abs[act_slots]
+
+    # Re-integrate SoC over ACTUAL window
+    dt = v2g.dt_h
+    soc_act = np.zeros(len(act_slots))
+    s = float(E_init)
+
+    for t in range(len(act_slots)):
+        s = float(np.clip(
+            s
+            + Pc_act[t] * v2g.eta_charge * dt
+            - Pd_act[t] / v2g.eta_discharge * dt,
+            v2g.E_min,
+            v2g.E_max,
+        ))
+        soc_act[t] = s
+
+    return Pc_act, Pd_act, soc_act
 
 # =============================================================================
 #  7. MILP SOLVER
 # =============================================================================
 
-def solve_milp(v2g, buy_w, v2gp_w, E_init, E_fin,
-               allow_discharge=True, tru_w=None):
+def solve_milp(v2g, buy_w, v2gp_w, E_init, E_fin, allow_discharge=True, tru_w=None):
     from scipy.optimize import milp, LinearConstraint, Bounds
     from scipy.sparse import lil_matrix, csc_matrix
 
@@ -289,6 +388,10 @@ def solve_milp(v2g, buy_w, v2gp_w, E_init, E_fin,
     c[ic]  = buy_w * dt
     if allow_discharge:
         c[id_] = -v2gp_w * dt
+    # Small penalty per active charging slot — encourages contiguous blocks
+    # and eliminates physically meaningless alternating on/off patterns.
+    # 1e-4 is ~0.01 ct/kWh: negligible on cost results, decisive on tie-breaking.
+    c[izc] += 1e-4
 
     lb = np.zeros(nv)
     ub = np.full(nv, np.inf)
@@ -296,8 +399,10 @@ def solve_milp(v2g, buy_w, v2gp_w, E_init, E_fin,
     ub[id_] = v2g.discharge_power_kW if allow_discharge else 0.0
     lb[ie]  = v2g.E_min
     ub[ie]  = v2g.E_max
-    lb[izc] = 0.0;  ub[izc] = 1.0
-    lb[izd] = 0.0;  ub[izd] = 1.0
+    lb[izc] = 0.0
+    ub[izc] = 1.0
+    lb[izd] = 0.0
+    ub[izd] = 1.0
     integ = np.zeros(nv)
     integ[izc] = 1
     integ[izd] = 1
@@ -317,9 +422,12 @@ def solve_milp(v2g, buy_w, v2gp_w, E_init, E_fin,
         lo[t] = hi[t] = rhs
 
     for t in range(W):
-        A[W+t,   ic[t]]  =  1.0;  A[W+t,   izc[t]] = -v2g.charge_power_kW
-        A[2*W+t, id_[t]] =  1.0;  A[2*W+t, izd[t]] = -v2g.discharge_power_kW
-        A[3*W+t, izc[t]] =  1.0;  A[3*W+t, izd[t]] =  1.0
+        A[W+t,   ic[t]]  =  1.0
+        A[W+t,   izc[t]] = -v2g.charge_power_kW
+        A[2*W+t, id_[t]] =  1.0
+        A[2*W+t, izd[t]] = -v2g.discharge_power_kW
+        A[3*W+t, izc[t]] =  1.0
+        A[3*W+t, izd[t]] =  1.0
         hi[W+t] = hi[2*W+t] = 0.0
         hi[3*W+t] = 1.0
 
@@ -402,8 +510,7 @@ def run_D_mpc(v2g, buy_w, v2gp_w, E_init, tru_w=None,
         tw_t = tru_w[t:] if tru_w is not None else None
         # tru for tomorrow — zeros if not available
         if buy_tomorrow is not None:
-            tru_tomorrow = np.zeros(96) if tru_w is None else get_tru_15min_trace(
-                "Continuous", 96, v2g.dt_h)
+            tru_tomorrow = np.zeros(24) if tru_w is None else get_tru_1h_trace("Continuous", 24, v2g.dt_h)
             tw_t = np.concatenate([tw_t, tru_tomorrow]) if tw_t is not None else None
 
         Pcw, Pdw, _ = solve_milp(v2g, buy_fc, v2gp_fc,
@@ -616,7 +723,7 @@ def plot_kpi_multi(all_res, v2g, arrival_h, departure_h, run_mpc, out):
 
 def plot_price_profiles(csv_path, out):
     df   = _load_csv_raw(csv_path)
-    h_ax = np.arange(96) * 0.25
+    h_ax = np.arange(24)
     w_wd = load_avg_profile(csv_path, WINTER_M, False)
     s_wd = load_avg_profile(csv_path, SUMMER_M, False)
     w_we = load_avg_profile(csv_path, WINTER_M, True)
@@ -767,7 +874,8 @@ def main():
         buy   = load_avg_profile(csv_path, months, False)
         v2gp  = buy.copy()
         win, arr, dep, W = get_wd_window(v2g, arrival_h, departure_h)
-        buy_w = buy[win]; v2gp_w = v2gp[win]
+        buy_w = buy[win]
+        v2gp_w = v2gp[win]
         E_init = v2g.usable_capacity_kWh * soc_pct / 100.0
 
         Pc,Pd,soc = run_A_dumb(v2g, buy_w, v2gp_w, W, E_init)

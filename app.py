@@ -1,10 +1,27 @@
 import streamlit as st
+from v2g import (
+    V2GParams, WINTER_M, SUMMER_M, SC_COL, SC_FILL,
+    FIXED_PRICE_EUR_KWH,
+    _passthrough_profile, _load_csv_raw,
+    get_tru_1h_trace, tru_avg_kw,
+    compute_reefer_costs,
+    get_wd_window, build_wd_display,
+    run_A_dumb, run_B_smart, run_C_milp, run_D_mpc,
+    make_kpi,
+    soc_ramp,
+    realize_planned_window_under_actual_times,
+)
+import matplotlib.patches as mpatches
+from matplotlib.lines import Line2D
+from io import BytesIO
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib as mpl
+
 mpl.rcParams.update({
     "font.size":        9,
     "axes.titlesize":   10,
@@ -14,12 +31,9 @@ mpl.rcParams.update({
     "legend.fontsize":  8,
     "lines.linewidth":  2.0,
 })
-import matplotlib.patches as mpatches
-from matplotlib.lines import Line2D
-from io import BytesIO
-from pathlib import Path
 
-# ── German all-in tariff components (BNetzA 2024) ─────────────────────────
+
+# ── German all-in tariff components ───────────────────────
 TARIFF = {
     "network_fee_ct":     6.63,
     "concession_ct":      1.992,
@@ -47,17 +61,6 @@ def to_allin_ct(spot_eur_kwh: np.ndarray,
     vr  = vat          if vat          is not None else VAT_RATE
     return (spot_eur_kwh * 100.0 + fn) * (1.0 + vr)
 
-from v2g_single_day4 import (
-    V2GParams, WINTER_M, SUMMER_M, SC_COL, SC_FILL,
-    FIXED_PRICE_EUR_KWH,
-    _interpolate_to_15min, _load_csv_raw,
-    get_tru_15min_trace, tru_avg_kw,
-    compute_reefer_costs,
-    get_wd_window, build_wd_display,
-    run_A_dumb, run_B_smart, run_C_milp, run_D_mpc,
-    make_kpi, plot_price_profiles,
-    soc_ramp,
-)
 
 CSV_PATH = "2025_Electricity_Price.csv"
 
@@ -75,7 +78,8 @@ st.set_page_config(
 def parse_hhmm(s: str, default: float) -> float:
     try:
         parts = s.strip().split(":")
-        h = int(parts[0]); m = int(parts[1]) if len(parts) > 1 else 0
+        h = int(parts[0])
+        m = int(parts[1]) if len(parts) > 1 else 0
         assert 0 <= h <= 23 and 0 <= m <= 59
         return h + m / 60.0
     except Exception:
@@ -116,41 +120,60 @@ def _setup_xaxis(ax, is_48h, is_wknd_fullday=False):
     ax.grid(True, alpha=0.20, zorder=0)
 
 
-def _vlines(ax, arrival_h, departure_h, is_48h, is_wknd_fullday=False):
+def _vlines(ax, arrival_h, departure_h, is_48h, is_wknd_fullday=False,
+            arrival_act_h=None, departure_act_h=None):
     if is_48h:
         ax.axvline(24, color="#555", lw=1.0, ls="--", alpha=0.55, zorder=6)
         return
     if is_wknd_fullday:
         return
-    def dx(h): return h if h >= 12. else h + 24.
-    ax.axvline(dx(arrival_h),   color="#1B5E20", lw=1.0, ls=":", alpha=0.80, zorder=6)
-    ax.axvline(dx(departure_h), color="#B71C1C", lw=1.0, ls=":", alpha=0.80, zorder=6)
-    ax.axvline(dx(0.),          color="#555",    lw=1.0, ls="--", alpha=0.55, zorder=6)
 
+    def dx(h): return h if h >= 12. else h + 24.
+
+    # ── Planned times (dotted) — always shown ─────────────────────────────
+    ax.axvline(dx(arrival_h),   color="#1B5E20", lw=1.0, ls=":",  alpha=0.50, zorder=6)
+    ax.axvline(dx(departure_h), color="#B71C1C", lw=1.0, ls=":",  alpha=0.50, zorder=6)
+    ax.axvline(dx(0.),          color="#555",    lw=1.0, ls="--", alpha=0.50, zorder=6)
+
+    # ── Actual times (solid) — only when deviation is non-zero ────────────
+    if arrival_act_h is not None and abs(arrival_act_h - arrival_h) > 1e-9:
+        ax.axvline(dx(arrival_act_h),   color="#1B5E20", lw=2.0, ls="-", alpha=0.90, zorder=7,
+                   label=f"Actual arrival {int(arrival_act_h):02d}:00")
+    if departure_act_h is not None and abs(departure_act_h - departure_h) > 1e-9:
+        ax.axvline(dx(departure_act_h), color="#B71C1C", lw=2.0, ls="-", alpha=0.90, zorder=7,
+                   label=f"Actual departure {int(departure_act_h):02d}:00")
 
 # =============================================================================
 #  POWER CHART
 # =============================================================================
-
 def make_power_chart(v2g, hours_d, buy_d, plug_d,
                      result_A, result_X,
                      x_label, x_key,
                      arrival_h, departure_h,
                      is_48h, is_wknd_fullday=False,
                      tru_d=None,
-                     fixed_net_ct=None, vat_rate=None):
+                     fixed_net_ct=None, vat_rate=None,
+                     arrival_act_h=None, departure_act_h=None):
 
-    col_a  = SC_COL["A"];   fill_a  = SC_FILL["A"]
-    col_x  = SC_COL[x_key]; fill_x  = SC_FILL[x_key]
+    col_a  = SC_COL["A"]
+    fill_a  = SC_FILL["A"]
+    col_x  = SC_COL[x_key]
+    fill_x  = SC_FILL[x_key]
     lbl_x  = result_X["label"].split("(")[0].strip()
+    # MPC gets dashed line so it's visually distinct from MILP
+    ls_x   = "--" if x_key == "D" else "-"
+
+    # Infer slot width from hours_d spacing (works for both 15-min and 1h)
+    dt_plot = float(hours_d[1] - hours_d[0]) if len(hours_d) > 1 else 1.0
 
     fig, ax = plt.subplots(figsize=(9.0, 3.5))
     fig.patch.set_facecolor("#F8F9FA")
     ax.set_facecolor("#FFFFFF")
 
+    # FIX 1a: use dt_plot instead of hard-coded 0.25
     for t in range(len(hours_d)):
         if plug_d[t] > 0.5:
-            ax.axvspan(hours_d[t], hours_d[t] + 0.25,
+            ax.axvspan(hours_d[t], hours_d[t] + dt_plot,
                        color="gold", alpha=0.14, lw=0, zorder=1)
 
     ax.fill_between(hours_d, result_A["Pc_d"],
@@ -161,7 +184,7 @@ def make_power_chart(v2g, hours_d, buy_d, plug_d,
     ax.fill_between(hours_d, result_X["Pc_d"],
                     step="post", color=fill_x, alpha=0.48, zorder=4)
     h_x, = ax.step(hours_d, result_X["Pc_d"], where="post",
-                   color=col_x, lw=2.0, zorder=5, label=f"{lbl_x} charge")
+                   color=col_x, lw=2.0, ls=ls_x, zorder=5, label=f"{lbl_x} charge")
 
     handles = [h_a, h_x]
 
@@ -169,7 +192,7 @@ def make_power_chart(v2g, hours_d, buy_d, plug_d,
         ax.fill_between(hours_d, -result_X["Pd_d"],
                         step="post", color=fill_x, alpha=0.28, zorder=4)
         h_d, = ax.step(hours_d, -result_X["Pd_d"], where="post",
-                       color=col_x, lw=2.0, ls="--", alpha=0.90, zorder=5,
+                       color=col_x, lw=2.0, ls=":", alpha=0.90, zorder=5,
                        label=f"{lbl_x} V2G (−)")
         handles.append(h_d)
 
@@ -180,13 +203,19 @@ def make_power_chart(v2g, hours_d, buy_d, plug_d,
         handles.append(h_t)
 
     ax.axhline(0, color="black", lw=0.6)
-    _vlines(ax, arrival_h, departure_h, is_48h, is_wknd_fullday)
+    _vlines(ax, arrival_h, departure_h, is_48h, is_wknd_fullday,
+            arrival_act_h=arrival_act_h, departure_act_h=departure_act_h)
 
     buy_d_ct = to_allin_ct(buy_d, fixed_net_ct, vat_rate)
     ax2 = ax.twinx()
-    h_p, = ax2.step(hours_d, buy_d_ct, where="post",
+
+    # FIX 1b: extend by one slot so the LAST hour's price is visible
+    hours_ext    = np.append(hours_d, hours_d[-1] + dt_plot)
+    buy_d_ct_ext = np.append(buy_d_ct, buy_d_ct[-1])
+
+    h_p, = ax2.step(hours_ext, buy_d_ct_ext, where="post",
                     color="#2E7D32", lw=1.4, alpha=0.85, label="Price (all-in)")
-    ax2.fill_between(hours_d, buy_d_ct,
+    ax2.fill_between(hours_ext, buy_d_ct_ext,
                      step="post", color="#2E7D32", alpha=0.07)
     ax2.set_ylabel("ct/kWh (all-in)", fontsize=8, color="#2E7D32")
     ax2.tick_params(axis="y", labelcolor="#2E7D32", labelsize=8)
@@ -215,31 +244,38 @@ def make_soc_chart(v2g, hours_d, plug_d,
                    result_A, result_X,
                    x_label, x_key,
                    arrival_h, departure_h,
-                   is_48h, is_wknd_fullday=False):
+                   is_48h, is_wknd_fullday=False,
+                   arrival_act_h=None, departure_act_h=None):
 
     col_a = SC_COL["A"]
     col_x = SC_COL[x_key]
     lbl_x = result_X["label"].split("(")[0].strip()
+    ls_x  = "--" if x_key == "D" else "-"
+
+    # Infer slot width
+    dt_plot = float(hours_d[1] - hours_d[0]) if len(hours_d) > 1 else 1.0
 
     fig, ax = plt.subplots(figsize=(9.0, 3.5))
     fig.patch.set_facecolor("#F8F9FA")
     ax.set_facecolor("#FFFFFF")
 
+    # FIX 1a: use dt_plot instead of hard-coded 0.25
     for t in range(len(hours_d)):
         if plug_d[t] > 0.5:
-            ax.axvspan(hours_d[t], hours_d[t] + 0.25,
+            ax.axvspan(hours_d[t], hours_d[t] + dt_plot,
                        color="gold", alpha=0.14, lw=0, zorder=1)
 
     xA, yA = soc_ramp(hours_d, result_A["soc_d"], result_A["E_init_pct"])
     xX, yX = soc_ramp(hours_d, result_X["soc_d"], result_X["E_init_pct"])
 
     h_a, = ax.plot(xA, yA, color=col_a, lw=2.0, label="A - Dumb SoC")
-    h_x, = ax.plot(xX, yX, color=col_x, lw=2.3, label=f"{lbl_x} SoC")
+    h_x, = ax.plot(xX, yX, color=col_x, lw=2.3, ls=ls_x, label=f"{lbl_x} SoC")
 
     ax.axhline(v2g.soc_min_pct,       color="#C62828", ls=":", lw=1.2, zorder=3)
     ax.axhline(v2g.soc_departure_pct, color="#0D47A1", ls=":", lw=1.2, zorder=3)
 
-    _vlines(ax, arrival_h, departure_h, is_48h, is_wknd_fullday)
+    _vlines(ax, arrival_h, departure_h, is_48h, is_wknd_fullday,
+            arrival_act_h=arrival_act_h, departure_act_h=departure_act_h)
 
     handles = [
         h_a, h_x,
@@ -264,7 +300,6 @@ def make_soc_chart(v2g, hours_d, plug_d,
     plt.tight_layout(pad=0.3)
     return fig_to_buf(fig)
 
-
 # =============================================================================
 #  RENDER ONE SEASON BLOCK
 # =============================================================================
@@ -274,7 +309,8 @@ def render_season_block(v2g, season_title, color_hex,
                          arrival_h, departure_h,
                          is_48h, is_wknd_fullday,
                          do_B, do_C, do_D, tru_d=None,
-                         fixed_net_ct=None, vat_rate=None):
+                         fixed_net_ct=None, vat_rate=None,
+                         arrival_act_h=None, departure_act_h=None):
 
     result_A = results[0]
     comparisons = []
@@ -299,27 +335,25 @@ def render_season_block(v2g, season_title, color_hex,
     col_pow, col_soc = st.columns(2)
 
     with col_pow:
-        st.caption("⚡ **Charge / Discharge Power**  "
-                   "(left axis = kW  |  right axis = ct/kWh all-in incl. taxes & grid fees)")
         for result_X, x_label, x_key in comparisons:
             buf = make_power_chart(
                 v2g, hours_d, buy_d, plug_d,
                 result_A, result_X, x_label, x_key,
                 arrival_h, departure_h, is_48h, is_wknd_fullday, tru_d,
-                fixed_net_ct=fixed_net_ct, vat_rate=vat_rate
+                fixed_net_ct=fixed_net_ct, vat_rate=vat_rate,
+                arrival_act_h=arrival_act_h, departure_act_h=departure_act_h,
             )
             st.image(buf, use_container_width=True)
 
     with col_soc:
-        st.caption("🔋 **Battery State of Charge (%)**")
         for result_X, x_label, x_key in comparisons:
             buf = make_soc_chart(
                 v2g, hours_d, plug_d,
                 result_A, result_X, x_label, x_key,
-                arrival_h, departure_h, is_48h, is_wknd_fullday
+                arrival_h, departure_h, is_48h, is_wknd_fullday,
+                arrival_act_h=arrival_act_h, departure_act_h=departure_act_h,
             )
             st.image(buf, use_container_width=True)
-
 
 # =============================================================================
 #  CACHED DATA LOADERS
@@ -333,9 +367,9 @@ def load_seasonal_profile(months: tuple, is_weekend: bool) -> np.ndarray:
     if len(sub) == 0:
         raise ValueError(f"No data for months={months}, weekend={is_weekend}")
     profile = sub.groupby("slot")["price"].mean().values
-    if len(profile) != 96:
-        raise ValueError(f"Expected 96 slots, got {len(profile)}")
-    return _interpolate_to_15min(profile)
+    if len(profile) != 24:
+        raise ValueError(f"Expected 24 slots, got {len(profile)}")
+    return _passthrough_profile(profile)
 
 
 @st.cache_data(show_spinner=False)
@@ -346,11 +380,9 @@ def load_date_profile(date_str: str) -> np.ndarray:
     if len(day_df) == 0:
         raise ValueError(f"No price data found for {date_str}.")
     prices = day_df["price"].values
-    if len(prices) == 24:
-        return _interpolate_to_15min(prices)
-    if len(prices) != 96:
-        raise ValueError(f"Expected 96 price slots for {date_str}, got {len(prices)}.")
-    return _interpolate_to_15min(prices)
+    if len(prices) != 24:
+        raise ValueError(f"Expected 24 price slots for {date_str}, got {len(prices)}.")
+    return _passthrough_profile(prices)
 
 
 @st.cache_data(show_spinner=False)
@@ -380,16 +412,18 @@ def load_two_day_profile(date_str: str) -> np.ndarray:
 # =============================================================================
 #  SCENARIO RUNNERS
 # =============================================================================
-
 @st.cache_data(show_spinner=False)
 def run_seasonal(season_key, arrival_h, departure_h,
                  soc_pct, soc_departure_pct, tru_cycle,
-                 do_B, do_C, do_D, mpc_noise_std=0.0):
+                 do_B, do_C, do_D, mpc_noise_std=0.0,
+                 arrival_dev_h=0.0, departure_dev_h=0.0,
+                 aux_power_w=400, bat_heat_w=100):
+    
     months_map = {
         "winter_weekday": (WINTER_M, False, False),
         "summer_weekday": (SUMMER_M, False, False),
-        "winter_weekend": (WINTER_M, True,  True),
-        "summer_weekend": (SUMMER_M, True,  True),
+        "winter_weekend": (WINTER_M, True, True),
+        "summer_weekend": (SUMMER_M, True, True),
     }
     months, is_wknd, is_48h = months_map[season_key]
     buy  = load_seasonal_profile(tuple(months), is_wknd)
@@ -397,131 +431,344 @@ def run_seasonal(season_key, arrival_h, departure_h,
     v2g  = V2GParams(soc_departure_pct=soc_departure_pct)
     E_init = v2g.usable_capacity_kWh * soc_pct / 100.0
 
+    # Parasitic constant loads while plugged in
+    is_winter_season = any(m in WINTER_M for m in months)
+    _aux_kw  = aux_power_w / 1000.0
+    _heat_kw = (bat_heat_w / 1000.0) if is_winter_season else 0.0
+    _parasitic_kw = _aux_kw + _heat_kw
+
+    # ---------------------------------------------------------
+    # WEEKEND 48H CASE (unchanged)
+    # ---------------------------------------------------------
     if is_48h:
-        buy48   = np.concatenate([buy, buy])
-        v2gp48  = buy48.copy()
-        W       = 192
-        tru_w   = get_tru_15min_trace(tru_cycle, W, v2g.dt_h)
+        buy48  = np.concatenate([buy, buy])
+        v2gp48 = buy48.copy()
+        W      = 48
+        tru_w  = get_tru_1h_trace(tru_cycle, W, v2g.dt_h) + _parasitic_kw
+
         hours_d = np.arange(W) * v2g.dt_h
         plug_d  = np.ones(W)
         buy_d   = buy48
 
-        Pc,Pd,soc = run_A_dumb(v2g,buy48,v2gp48,W,E_init,tru_w)
-        results = [make_kpi("A - Dumb",v2g,Pc,Pd,soc,buy48,v2gp48,E_init,
-                            is_weekend_48=True,tru_w=tru_w)]
-        if do_B:
-            Pc,Pd,soc = run_B_smart(v2g,buy48,v2gp48,E_init,tru_w)
-            results.append(make_kpi("B - Smart (no V2G)",v2g,Pc,Pd,soc,
-                                    buy48,v2gp48,E_init,is_weekend_48=True,tru_w=tru_w))
-        if do_C:
-            Pc,Pd,soc = run_C_milp(v2g,buy48,v2gp48,E_init,tru_w)
-            results.append(make_kpi("C - MILP Day-Ahead",v2g,Pc,Pd,soc,
-                                    buy48,v2gp48,E_init,is_weekend_48=True,tru_w=tru_w))
-        if do_D:
-            Pc,Pd,soc = run_D_mpc(v2g,buy48,v2gp48,E_init,tru_w,noise_std=mpc_noise_std)
-            results.append(make_kpi("D - MPC (receding)",v2g,Pc,Pd,soc,
-                                    buy48,v2gp48,E_init,is_weekend_48=True,tru_w=tru_w))
+        results = []
 
-        results_kpi = [{**r,
-            "net_cost":r["net_cost"]/2,"charge_cost":r["charge_cost"]/2,
-            "v2g_rev":r["v2g_rev"]/2,"tru_cost":r["tru_cost"]/2,
-            "total_cost":r["total_cost"]/2,"v2g_kwh":r["v2g_kwh"]/2,
-            "charge_kwh":r["charge_kwh"]/2,
+        Pc, Pd, soc = run_A_dumb(v2g, buy48, v2gp48, W, E_init, tru_w)
+        results.append(make_kpi("A - Dumb", v2g, Pc, Pd, soc,
+                                buy48, v2gp48, E_init,
+                                is_weekend_48=True, tru_w=tru_w))
+
+        if do_B:
+            Pc, Pd, soc = run_B_smart(v2g, buy48, v2gp48, E_init, tru_w)
+            results.append(make_kpi("B - Smart (no V2G)", v2g, Pc, Pd, soc,
+                                    buy48, v2gp48, E_init,
+                                    is_weekend_48=True, tru_w=tru_w))
+
+        if do_C:
+            Pc, Pd, soc = run_C_milp(v2g, buy48, v2gp48, E_init, tru_w)
+            results.append(make_kpi("C - MILP Day-Ahead", v2g, Pc, Pd, soc,
+                                    buy48, v2gp48, E_init,
+                                    is_weekend_48=True, tru_w=tru_w))
+
+        if do_D:
+            Pc, Pd, soc = run_D_mpc(v2g, buy48, v2gp48, E_init, tru_w,
+                                    noise_std=mpc_noise_std)
+            results.append(make_kpi("D - MPC (receding)", v2g, Pc, Pd, soc,
+                                    buy48, v2gp48, E_init,
+                                    is_weekend_48=True, tru_w=tru_w))
+
+        results_kpi = [{
+            **r,
+            "net_cost":    r["net_cost"]/2,
+            "charge_cost": r["charge_cost"]/2,
+            "v2g_rev":     r["v2g_rev"]/2,
+            "tru_cost":    r["tru_cost"]/2,
+            "total_cost":  r["total_cost"]/2,
+            "v2g_kwh":     r["v2g_kwh"]/2,
+            "charge_kwh":  r["charge_kwh"]/2
         } for r in results]
-        rc = compute_reefer_costs(tru_w[:96], buy[:96], v2g.dt_h)
+
+        rc = compute_reefer_costs(tru_w[:24], buy[:24], v2g.dt_h)
         return results, results_kpi, buy_d, plug_d, hours_d, is_wknd, is_48h, tru_w, rc
 
-    else:
-        win, arr, dep, W = get_wd_window(v2g, arrival_h, departure_h)
-        buy_w  = buy[win]; v2gp_w = v2gp[win]
-        tru_w  = get_tru_15min_trace(tru_cycle, W, v2g.dt_h)
-        buy_d, plug_d, hours_d = build_wd_display(v2g, buy, arrival_h, departure_h)
-        tru_d = np.zeros(v2g.n_slots); tru_d[arr:dep] = tru_w[:dep - arr]
+# ---------------------------------------------------------
 
-        Pc,Pd,soc = run_A_dumb(v2g,buy_w,v2gp_w,W,E_init,tru_w)
-        results = [make_kpi("A - Dumb",v2g,Pc,Pd,soc,buy_w,v2gp_w,E_init,arr,dep,tru_w=tru_w)]
-        if do_B:
-            Pc,Pd,soc = run_B_smart(v2g,buy_w,v2gp_w,E_init,tru_w)
-            results.append(make_kpi("B - Smart (no V2G)",v2g,Pc,Pd,soc,
-                                    buy_w,v2gp_w,E_init,arr,dep,tru_w=tru_w))
-        if do_C:
-            Pc,Pd,soc = run_C_milp(v2g,buy_w,v2gp_w,E_init,tru_w)
-            results.append(make_kpi("C - MILP Day-Ahead",v2g,Pc,Pd,soc,
-                                    buy_w,v2gp_w,E_init,arr,dep,tru_w=tru_w))
-        if do_D:
-            Pc,Pd,soc = run_D_mpc(v2g,buy_w,v2gp_w,E_init,tru_w,noise_std=mpc_noise_std)
-            results.append(make_kpi("D - MPC (receding)",v2g,Pc,Pd,soc,
-                                    buy_w,v2gp_w,E_init,arr,dep,tru_w=tru_w))
+    abnormal = (abs(arrival_dev_h) > 1e-12) or (abs(departure_dev_h) > 1e-12)
 
-        rc = compute_reefer_costs(tru_w, buy_w, v2g.dt_h)
-        return results, results, buy_d, plug_d, hours_d, is_wknd, is_48h, tru_d, rc
+    # Actual arrival/departure after applying real-world deviation
+    arrival_act_h   = (arrival_h   + arrival_dev_h)   % 24.0
+    departure_act_h = (departure_h + departure_dev_h) % 24.0
 
+    if not (12.0 <= arrival_act_h < 24.0):
+        raise ValueError("Actual weekday arrival must be 12:00–23:59.")
+    if not (0.0 <= departure_act_h < 12.0):
+        raise ValueError("Actual weekday departure must be 00:00–11:59.")
+    if abs(arrival_act_h - departure_act_h) < 1e-12:
+        raise ValueError("Actual arrival and departure cannot be equal.")
+
+    # ── PLANNED window — what B and C optimise against (day-ahead commitment)
+    win_plan, _, _, W_plan = get_wd_window(v2g, arrival_h, departure_h)
+    buy_w_plan  = buy[win_plan]
+    v2gp_w_plan = v2gp[win_plan]
+    tru_w_plan  = get_tru_1h_trace(tru_cycle, W_plan, v2g.dt_h) + _parasitic_kw
+
+    # ── ACTUAL window — the real plug-in period; used by A, D, and for KPI eval
+    win_act, arr_act, dep_act, W_act = get_wd_window(v2g, arrival_act_h, departure_act_h)
+    buy_w_act  = buy[win_act]
+    v2gp_w_act = v2gp[win_act]
+    tru_w_act  = get_tru_1h_trace(tru_cycle, W_act, v2g.dt_h) + _parasitic_kw
+
+    # ── Display: gold band = ACTUAL plug-in window
+    buy_d, plug_d, hours_d = build_wd_display(v2g, buy, arrival_act_h, departure_act_h)
+
+    # TRU display: reefer only draws grid power while physically plugged in
+    tru_d = np.zeros(v2g.n_slots)
+    tru_d[arr_act:dep_act] = tru_w_act[:dep_act - arr_act]
+
+    results = []
+
+    # ── A — DUMB ──────────────────────────────────────────────────────────────
+    # No price awareness, no pre-committed schedule.
+    # Always runs on ACTUAL window — deviation affects it immediately and fully.
+    Pc, Pd, soc = run_A_dumb(v2g, buy_w_act, v2gp_w_act, W_act, E_init, tru_w_act)
+    results.append(make_kpi("A - Dumb", v2g, Pc, Pd, soc,
+                            buy_w_act, v2gp_w_act, E_init,
+                            arr_act, dep_act, tru_w=tru_w_act))
+
+    # ── B — SMART (no V2G) ────────────────────────────────────────────────────
+    # Optimised day-ahead on PLANNED window (cheapest hours, charge-only).
+    # When abnormal: plan is fixed; realized on ACTUAL window.
+    # Slots that fall outside the actual plug-in period are skipped.
+    if do_B:
+        Pc, Pd, soc = run_B_smart(v2g, buy_w_plan, v2gp_w_plan, E_init, tru_w_plan)
+        if abnormal:
+            Pc, Pd, soc = realize_planned_window_under_actual_times(
+                v2g, Pc, Pd, E_init,
+                arrival_h,     departure_h,
+                arrival_act_h, departure_act_h,
+            )
+        results.append(make_kpi("B - Smart (no V2G)", v2g, Pc, Pd, soc,
+                                buy_w_act, v2gp_w_act, E_init,
+                                arr_act, dep_act, tru_w=tru_w_act))
+
+    # ── C — MILP Day-Ahead ────────────────────────────────────────────────────
+    # Full MILP with V2G, optimised day-ahead on PLANNED window.
+    # Same plan-then-realize logic as B. If the trailer arrives late and misses
+    # the cheapest charging slots (e.g. 02:00–04:00), those slots are simply
+    # lost — the plan cannot be retroactively changed. This exposes the
+    # key weakness of open-loop day-ahead MILP under schedule uncertainty.
+    if do_C:
+        Pc, Pd, soc = run_C_milp(v2g, buy_w_plan, v2gp_w_plan, E_init, tru_w_plan)
+        if abnormal:
+            Pc, Pd, soc = realize_planned_window_under_actual_times(
+                v2g, Pc, Pd, E_init,
+                arrival_h,     departure_h,
+                arrival_act_h, departure_act_h,
+            )
+        results.append(make_kpi("C - MILP Day-Ahead", v2g, Pc, Pd, soc,
+                                buy_w_act, v2gp_w_act, E_init,
+                                arr_act, dep_act, tru_w=tru_w_act))
+
+    # ── D — MPC Receding Horizon ──────────────────────────────────────────────
+    # Re-solves MILP at every hour using only the remaining actual horizon.
+    # No pre-committed plan → adapts automatically to late or early arrival.
+    # Always runs on ACTUAL window; no realize step is needed.
+    if do_D:
+        Pc, Pd, soc = run_D_mpc(v2g, buy_w_act, v2gp_w_act, E_init, tru_w_act,
+                                noise_std=mpc_noise_std)
+        results.append(make_kpi("D - MPC (receding)", v2g, Pc, Pd, soc,
+                                buy_w_act, v2gp_w_act, E_init,
+                                arr_act, dep_act, tru_w=tru_w_act))
+
+    rc = compute_reefer_costs(tru_w_act, buy_w_act, v2g.dt_h)
+
+    return results, results, buy_d, plug_d, hours_d, is_wknd, is_48h, tru_d, rc
 
 @st.cache_data(show_spinner=False)
 def run_specific_date(date_str, arrival_h, departure_h,
                       soc_pct, soc_departure_pct, tru_cycle,
-                      do_B, do_C, do_D, mpc_noise_std=0.0):
-    ts      = pd.Timestamp(date_str)
-    is_wknd = ts.dayofweek >= 5
-    v2g     = V2GParams(soc_departure_pct=soc_departure_pct)
-    E_init  = v2g.usable_capacity_kWh * soc_pct / 100.0
+                      do_B, do_C, do_D, mpc_noise_std=0.0,
+                      arrival_dev_h=0.0, departure_dev_h=0.0,
+                      aux_power_w=400, bat_heat_w=100):
 
+    ts = pd.Timestamp(date_str)
+    is_wknd  = ts.dayofweek >= 5
+    is_winter_date = ts.month in WINTER_M
+    v2g = V2GParams(soc_departure_pct=soc_departure_pct)
+    E_init = v2g.usable_capacity_kWh * soc_pct / 100.0
+
+    # Parasitic loads
+    _aux_kw      = aux_power_w / 1000.0
+    _heat_kw     = (bat_heat_w / 1000.0) if is_winter_date else 0.0
+    _parasitic_kw = _aux_kw + _heat_kw
+
+    # -------------------------------------------------------
+    # Weekend = simple 24h plug-in, abnormality NOT applied
+    # -------------------------------------------------------
     if is_wknd:
-        buy             = load_date_profile(date_str)
-        v2gp            = buy.copy()
-        W               = 96
-        buy_w           = buy
-        v2gp_w          = v2gp
-        tru_w           = get_tru_15min_trace(tru_cycle, W, v2g.dt_h)
-        buy_d           = buy
-        plug_d          = np.ones(96)
-        hours_d         = np.arange(96) * v2g.dt_h
-        tru_d           = tru_w
-        arr, dep        = 0, 96
-        is_48h          = False
+        buy = load_date_profile(date_str)
+        v2gp = buy.copy()
+        W = 24
+
+        buy_w = buy
+        v2gp_w = v2gp
+        tru_w = get_tru_1h_trace(tru_cycle, W, v2g.dt_h) + _parasitic_kw
+
+        buy_d = buy
+        plug_d = np.ones(24)
+        hours_d = np.arange(24) * v2g.dt_h
+        tru_d = tru_w
+
+        arr, dep = 0, 24
+        is_48h = False
         is_wknd_fullday = True
-    else:
-        buy_192  = load_two_day_profile(date_str)
-        v2gp_192 = buy_192.copy()
-        ROLL     = round(12.0 / v2g.dt_h)
-        arr_slot = round(arrival_h   / v2g.dt_h) % 96
-        dep_slot = round(departure_h / v2g.dt_h) % 96
-        buy_w    = buy_192[arr_slot : 96 + dep_slot]
-        v2gp_w   = buy_w.copy()
-        W        = len(buy_w)
-        buy_d    = buy_192[ROLL : ROLL + 96]
-        hours_d  = np.arange(96) * v2g.dt_h + 12.0
-        dep_on_chart = (departure_h + 24.0) if departure_h < 12.0 else departure_h
-        plug_d   = ((hours_d >= arrival_h) & (hours_d < dep_on_chart)).astype(float)
-        arr_disp = arr_slot - ROLL
-        dep_disp = ROLL     + dep_slot
-        arr, dep = arr_disp, dep_disp
-        tru_w    = get_tru_15min_trace(tru_cycle, W, v2g.dt_h)
-        tru_d    = np.zeros(96)
-        d_s = max(0, arr_disp); d_e = min(96, dep_disp)
-        w_s = d_s - arr_disp;   w_e = w_s + (d_e - d_s)
-        if w_e > w_s:
-            tru_d[d_s:d_e] = tru_w[w_s:w_e]
-        is_48h          = False
-        is_wknd_fullday = False
 
-    Pc, Pd, soc = run_A_dumb(v2g, buy_w, v2gp_w, W, E_init, tru_w)
-    results = [make_kpi("A - Dumb", v2g, Pc, Pd, soc,
-                        buy_w, v2gp_w, E_init, arr, dep, tru_w=tru_w)]
+        results = []
+
+        Pc, Pd, soc = run_A_dumb(v2g, buy_w, v2gp_w, W, E_init, tru_w)
+        results.append(make_kpi("A - Dumb", v2g, Pc, Pd, soc,
+                                buy_w, v2gp_w, E_init, arr, dep, tru_w=tru_w))
+
+        if do_B:
+            Pc, Pd, soc = run_B_smart(v2g, buy_w, v2gp_w, E_init, tru_w)
+            results.append(make_kpi("B - Smart (no V2G)", v2g, Pc, Pd, soc,
+                                    buy_w, v2gp_w, E_init, arr, dep, tru_w=tru_w))
+
+        if do_C:
+            Pc, Pd, soc = run_C_milp(v2g, buy_w, v2gp_w, E_init, tru_w)
+            results.append(make_kpi("C - MILP Day-Ahead", v2g, Pc, Pd, soc,
+                                    buy_w, v2gp_w, E_init, arr, dep, tru_w=tru_w))
+
+        if do_D:
+            Pc, Pd, soc = run_D_mpc(v2g, buy_w, v2gp_w, E_init, tru_w,
+                                    noise_std=mpc_noise_std)
+            results.append(make_kpi("D - MPC (receding)", v2g, Pc, Pd, soc,
+                                    buy_w, v2gp_w, E_init, arr, dep, tru_w=tru_w))
+
+        rc = compute_reefer_costs(tru_w, buy_w, v2g.dt_h)
+
+        return (results, buy_d, plug_d, hours_d,
+                is_wknd, is_48h, is_wknd_fullday, tru_d, rc)
+
+    # -------------------------------------------------------
+    # Weekday abnormality handling (arrival/departure deviation)
+    # -------------------------------------------------------
+    arrival_act_h = (arrival_h + arrival_dev_h) % 24.0
+    departure_act_h = (departure_h + departure_dev_h) % 24.0
+
+    abnormal = (abs(arrival_dev_h) > 1e-12) or (abs(departure_dev_h) > 1e-12)
+
+    # Validate actual weekday times
+    if not (12.0 <= arrival_act_h < 24.0):
+        raise ValueError("Actual weekday arrival must remain between 12:00 and 23:59.")
+    if not (0.0 <= departure_act_h < 12.0):
+        raise ValueError("Actual weekday departure must remain between 00:00 and 11:59.")
+    if abs(arrival_act_h - departure_act_h) < 1e-12:
+        raise ValueError("Actual arrival and departure times cannot be equal.")
+
+    # Load 48h demand
+    buy_48 = load_two_day_profile(date_str)
+    v2gp_48 = buy_48.copy()
+
+    # Slot builder helper (planned vs actual)
+    def _slots_48(arr_h, dep_h):
+        a = round(arr_h / v2g.dt_h) % 24
+        d = round(dep_h / v2g.dt_h) % 24
+        if a == d:
+            raise ValueError("Arrival and departure cannot be equal.")
+        if d <= a:
+            return list(range(a, 24)) + list(range(24, 24 + d))
+        return list(range(a, d))
+
+    # Planned window (day-ahead)
+    slots_plan = _slots_48(arrival_h, departure_h)
+    buy_w_plan = buy_48[slots_plan]
+    v2gp_w_plan = v2gp_48[slots_plan]
+    tru_w_plan = get_tru_1h_trace(tru_cycle, len(slots_plan), v2g.dt_h) + _parasitic_kw
+
+    # Actual window (real execution + MPC)
+    slots_act = _slots_48(arrival_act_h, departure_act_h)
+    buy_w_act = buy_48[slots_act]
+    v2gp_w_act = v2gp_48[slots_act]
+    tru_w_act = get_tru_1h_trace(tru_cycle, len(slots_act), v2g.dt_h) + _parasitic_kw
+
+    # 24h display window: 12:00 -> next 12:00
+    ROLL = round(12.0 / v2g.dt_h)
+    buy_d = buy_48[ROLL:ROLL + 24]
+    hours_d = np.arange(24) * v2g.dt_h + 12.0
+
+    dep_on_chart = (departure_act_h + 24.0) if departure_act_h < 12.0 else departure_act_h
+    plug_d = ((hours_d >= arrival_act_h) & (hours_d < dep_on_chart)).astype(float)
+
+    # Display indices for KPI
+    arr_slot_act = round(arrival_act_h / v2g.dt_h) % 24
+    arr_disp = arr_slot_act - ROLL
+    dep_disp = arr_disp + len(slots_act)
+
+    arr, dep = arr_disp, dep_disp
+
+    # Build display TRU
+    tru_d = np.zeros(24)
+    d_s = max(0, arr_disp)
+    d_e = min(24, dep_disp)
+    w_s = d_s - arr_disp
+    w_e = w_s + (d_e - d_s)
+    if w_e > w_s:
+        tru_d[d_s:d_e] = tru_w_act[w_s:w_e]
+
+    is_48h = False
+    is_wknd_fullday = False
+
+    # -------------------------------------------------------
+    # Run scenarios
+    # -------------------------------------------------------
+    results = []
+
+# ── A — DUMB
+    # No schedule, no price awareness. Charges greedily from actual arrival.
+    # Runs directly on ACTUAL window — no plan to realize.
+    Pc, Pd, soc = run_A_dumb(v2g, buy_w_act, v2gp_w_act, len(slots_act), E_init, tru_w_act)
+    results.append(make_kpi("A - Dumb", v2g, Pc, Pd, soc,
+                            buy_w_act, v2gp_w_act, E_init,
+                            arr, dep, tru_w=tru_w_act))
+
+    # B - SMART
     if do_B:
-        Pc, Pd, soc = run_B_smart(v2g, buy_w, v2gp_w, E_init, tru_w)
+        Pc, Pd, soc = run_B_smart(v2g, buy_w_plan, v2gp_w_plan, E_init, tru_w_plan)
+        if abnormal:
+            Pc, Pd, soc = realize_planned_window_under_actual_times(
+                v2g, Pc, Pd, E_init,
+                arrival_h, departure_h, arrival_act_h, departure_act_h
+            )
         results.append(make_kpi("B - Smart (no V2G)", v2g, Pc, Pd, soc,
-                                buy_w, v2gp_w, E_init, arr, dep, tru_w=tru_w))
-    if do_C:
-        Pc, Pd, soc = run_C_milp(v2g, buy_w, v2gp_w, E_init, tru_w)
-        results.append(make_kpi("C - MILP Day-Ahead", v2g, Pc, Pd, soc,
-                                buy_w, v2gp_w, E_init, arr, dep, tru_w=tru_w))
-    if do_D:
-        Pc, Pd, soc = run_D_mpc(v2g, buy_w, v2gp_w, E_init, tru_w, noise_std=mpc_noise_std)
-        results.append(make_kpi("D - MPC (receding)", v2g, Pc, Pd, soc,
-                                buy_w, v2gp_w, E_init, arr, dep, tru_w=tru_w))
+                                buy_w_act, v2gp_w_act, E_init,
+                                arr, dep, tru_w=tru_w_act))
 
-    rc = compute_reefer_costs(tru_w, buy_w, v2g.dt_h)
+    # C - MILP
+    if do_C:
+        Pc, Pd, soc = run_C_milp(v2g, buy_w_plan, v2gp_w_plan, E_init, tru_w_plan)
+        if abnormal:
+            Pc, Pd, soc = realize_planned_window_under_actual_times(
+                v2g, Pc, Pd, E_init,
+                arrival_h, departure_h, arrival_act_h, departure_act_h
+            )
+        results.append(make_kpi("C - MILP Day-Ahead", v2g, Pc, Pd, soc,
+                                buy_w_act, v2gp_w_act, E_init,
+                                arr, dep, tru_w=tru_w_act))
+
+    # D - MPC (adapts to actual)
+    if do_D:
+        Pc, Pd, soc = run_D_mpc(v2g, buy_w_act, v2gp_w_act, E_init, tru_w_act,
+                                noise_std=mpc_noise_std)
+        results.append(make_kpi("D - MPC (receding)", v2g, Pc, Pd, soc,
+                                buy_w_act, v2gp_w_act, E_init,
+                                arr, dep, tru_w=tru_w_act))
+
+    # TRU cost on actual window
+    rc = compute_reefer_costs(tru_w_act, buy_w_act, v2g.dt_h)
+
+    # -------------------------------------------------------
+    # Return everything
+    # -------------------------------------------------------
     return (results, buy_d, plug_d, hours_d,
             is_wknd, is_48h, is_wknd_fullday, tru_d, rc)
 
@@ -556,9 +803,12 @@ def run_annual_all_days(
     all_dates = sorted(df_all["date"].unique())
 
     sc_keys = ["A"]
-    if do_B: sc_keys.append("B")
-    if do_C: sc_keys.append("C")
-    if do_D: sc_keys.append("D")
+    if do_B:
+        sc_keys.append("B")
+    if do_C:
+        sc_keys.append("C")
+    if do_D:
+        sc_keys.append("D")
 
     double_tax_eur = v2g_double_ct / 100.0
     exempt_eur     = v2g_exempt_ct / 100.0
@@ -626,26 +876,6 @@ def run_annual_all_days(
         }
     return out
 
-# =============================================================================
-#  AUTHENTICATION
-# =============================================================================
-
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-
-if not st.session_state.authenticated:
-    st.title("S.KOe COOL -- Access Restricted")
-    with st.form("login_form"):
-        user = st.text_input("Username")
-        pwd  = st.text_input("Password", type="password")
-        if st.form_submit_button("Login", type="primary"):
-            if user == "admin" and pwd == "dontshare":
-                st.session_state.authenticated = True
-                st.rerun()
-            else:
-                st.error("Invalid credentials.")
-    st.stop()
-
 
 # =============================================================================
 #  SESSION STATE DEFAULTS
@@ -684,6 +914,10 @@ DEFAULTS = {
     "t_fut_elec_tax":   2.05,
     "t_fut_nev19":      1.559,
     "t_fut_vat":        19.0,
+    "arrival_dev_h": 0.0,
+    "departure_dev_h": 0.0,
+    "aux_power_w": 400,
+    "bat_heat_w":  100,
 }
 
 if "cfg" not in st.session_state:
@@ -718,9 +952,29 @@ def render_input_panel():
             cfg["departure_str"] = st.text_input(
                 "Departure time (HH:MM)", cfg["departure_str"],
                 help="Next-morning departure time")
+            
+            st.markdown("##### Abnormality / schedule deviation")
+            cfg["arrival_dev_h"] = st.slider(
+            "Actual arrival deviation (h)",
+            min_value=-4.0, max_value=4.0,
+            value=float(cfg.get("arrival_dev_h", 0.0)),
+            step=1.0,
+            help="Positive = later arrival, negative = earlier arrival. Applied to weekday abnormality analysis."
+            )
+            cfg["departure_dev_h"] = st.slider(
+            "Actual departure deviation (h)",
+            min_value=-4.0, max_value=4.0,
+            value=float(cfg.get("departure_dev_h", 0.0)),
+            step=1.0,
+            help="Positive = later departure, negative = earlier departure. Applied to weekday abnormality analysis."
+            )
+            st.caption(
+            "MILP / Smart are optimized on the planned schedule and then realized on the actual schedule. "
+            "MPC adapts to the actual schedule."
+            )
 
-            st.markdown("##### Analysis Mode")
-            mode = st.radio(
+        st.markdown("##### Analysis Mode")
+        mode = st.radio(
                 "Price data source",
                 ["Seasonal Average", "Specific Date"],
                 index=0 if cfg.get("mode", "Seasonal Average") == "Seasonal Average" else 1,
@@ -729,9 +983,9 @@ def render_input_panel():
                     "**Specific Date:** Actual prices for that exact date."
                 )
             )
-            cfg["mode"] = mode
+        cfg["mode"] = mode
 
-            if mode == "Specific Date":
+        if mode == "Specific Date":
                 date_val = st.date_input(
                     "Select date (2025)",
                     value=pd.Timestamp(cfg.get("specific_date", "2025-01-15")),
@@ -748,8 +1002,8 @@ def render_input_panel():
                     f"{'Winter' if mth_sel in WINTER_M else 'Summer'}"
                 )
 
-            st.markdown("##### Fixed-Tariff Benchmark")
-            cfg["fixed_price"] = st.number_input(
+        st.markdown("##### Fixed-Tariff Benchmark")
+        cfg["fixed_price"] = st.number_input(
                 "Fixed price (EUR/kWh)",
                 value=float(cfg["fixed_price"]),
                 min_value=0.05, max_value=1.0, step=0.01,
@@ -771,22 +1025,50 @@ def render_input_panel():
                 "B -- Smart charging (no V2G)", bool(cfg["do_B"]), key="form_do_B")
             cfg["do_C"] = st.checkbox(
                 "C -- MILP Day-Ahead + V2G",   bool(cfg["do_C"]), key="form_do_C")
+            
             cfg["do_D"] = st.checkbox(
                 "D -- MPC receding horizon", bool(cfg["do_D"]), key="form_do_D")
             cfg["mpc_noise_std"] = st.slider(
                 "MPC forecast noise σ (EUR/kWh)",
-                min_value=0.000, max_value=0.050,
+                min_value=0.000, max_value=0.100,          # extended from 0.050
                 value=float(cfg.get("mpc_noise_std", 0.0)),
                 step=0.001, format="%.3f",
                 help=(
-                    "0.000 = perfect foresight (MPC = MILP).\n\n"
-                    "0.012 = realistic intraday uncertainty (Liu 2023).\n\n"
-                    "Higher = MPC makes worse decisions due to forecast error."
+                    "0.000 = perfect foresight → MPC ≡ MILP (identical graphs by design).\n\n"
+                    "0.015–0.030 = realistic EPEX intraday uncertainty (Liu 2023).\n\n"
+                    "0.050–0.100 = high uncertainty; MPC decisions visibly diverge from MILP.\n\n"
+                    "MPC line is shown dashed (---) to help distinguish it from MILP."
                 ),
                 key="form_mpc_noise")
+            # Noise status hint
+            _noise = float(cfg.get("mpc_noise_std", 0.0))
+            if cfg["do_D"] and cfg["do_C"]:
+                if _noise == 0.0:
+                    st.info(
+                        "ℹ️ Noise = 0 → MPC and MILP graphs will be **identical** "
+                        "(perfect foresight). Set σ ≥ 0.030 to see divergence.",
+                        icon=None)
+                elif _noise < 0.020:
+                    st.caption(f"⚠️ σ = {_noise:.3f} EUR/kWh — may be too small to flip "
+                               "hourly decisions on a smooth seasonal profile. Try ≥ 0.030.")
+                else:
+                    st.success(f"🔊 MPC noise active: σ = {_noise:.3f} EUR/kWh — "
+                               "MPC line (dashed) should diverge from MILP.")
 
         with c3:
             st.subheader("Reefer (TRU) at Depot")
+            cfg["aux_power_w"] = st.number_input(
+                "Auxiliary power loss (W)",
+                min_value=0, max_value=2000,
+                value=int(cfg.get("aux_power_w", 400)), step=10,
+                help="Constant grid draw while trailer is plugged in "
+                     "(charger standby, lighting, control systems, etc.)")
+            cfg["bat_heat_w"] = st.number_input(
+                "Battery heating (W) — Winter only",
+                min_value=0, max_value=1000,
+                value=int(cfg.get("bat_heat_w", 100)), step=10,
+                help="Constant power to keep battery warm in winter months (Oct–Mar). "
+                     "Added only when is_winter=True.")
             cycle_choice = st.radio(
                 "TRU cycle while plugged in",
                 ["Continuous", "Start-Stop", "OFF"],
@@ -915,6 +1197,89 @@ def render_input_panel():
                 f"(+VAT: **{_fut_total * (1 + _vat_fut):.3f} ct**) added to V2G rev | "
                 f"Pending EU state aid approval (BNetzA 2025)"
             )
+
+
+            # ── ADD THIS block inside the st.form, just before the Submit button ─────
+        # ── System Parameters (read-only reference) ──────────────────────
+        with st.expander("📋 System Parameters & Pre-defined Values", expanded=False):
+            st.markdown("These values are fixed in the model. They are shown here "
+                        "for transparency — no input needed.")
+            col_sp1, col_sp2, col_sp3 = st.columns(3)
+
+            with col_sp1:
+                st.markdown("**🔋 Battery (S.KOe COOL)**")
+                st.caption("Total capacity: **70 kWh**")
+                st.caption("Usable capacity: **60 kWh**")
+                st.caption("Charge power: **22 kW**")
+                st.caption("Discharge power: **22 kW**")
+                st.caption("Charge efficiency η: **0.92**")
+                st.caption("Discharge efficiency η: **0.92**")
+                st.caption("Cold-chain SoC floor: **20 %**")
+                st.caption("Degradation cost: **€0.00/kWh** (not yet active)")
+
+            with col_sp2:
+                st.markdown("**❄️ TRU Reefer Cycle Power**")
+                st.caption("Continuous — High: **7.6 kW** for 1,717 s")
+                st.caption("Continuous — Low:  **0.7 kW** for 292 s")
+                st.caption("Continuous avg: **~6.6 kW**")
+                st.caption("Start-Stop — High: **9.7 kW** for 975 s")
+                st.caption("Start-Stop — Mid:  **0.65 kW** for 295 s")
+                st.caption("Start-Stop — Off:  **0.0 kW** for 1,207 s")
+                st.caption("Start-Stop avg: **~3.9 kW**")
+                st.caption("Hi-res simulation: **10-second** intervals → averaged to 1h")
+
+            with col_sp3:
+                st.markdown("**⚡ Fixed Diesel Benchmark**")
+                st.caption("Diesel price: **€1.80/L**")
+                st.caption("Diesel energy: **9.8 kWh/L**")
+                st.caption("Genset efficiency: **30%**")
+                st.markdown("**📅 Seasonality**")
+                st.caption("Winter: **Oct–Mar** (months 1,2,3,10,11,12)")
+                st.caption("Summer: **Apr–Sep** (months 4,5,6,7,8,9)")
+                st.markdown("**🔧 Optimisation**")
+                st.caption("MILP solver: **scipy.optimize.milp** (HiGHS)")
+                st.caption("Time limit per solve: **60 s**")
+                st.caption("Price resolution: **hourly** (SMARD DE/LU 2025)")
+                st.caption("MPC seed: **42** (deterministic noise)")
+
+        # ── Methodology (mirrored from bottom of results page) ────────────
+        with st.expander("📐 Methodology & Assumptions", expanded=False):
+            _fn_disp  = (cfg["t_network_fee"] + cfg["t_concession"] + cfg["t_offshore"]
+                         + cfg["t_chp"] + cfg["t_elec_tax"] + cfg["t_nev19"])
+            _vat_disp = cfg["t_vat"] / 100.0
+            _fut_disp = (cfg.get("t_fut_network", 6.63) + cfg.get("t_fut_concession", 1.992)
+                         + cfg.get("t_fut_offshore", 0.941) + cfg.get("t_fut_chp", 0.446)
+                         + cfg.get("t_fut_elec_tax", 2.05) + cfg.get("t_fut_nev19", 1.559))
+            _dep_disp = int(cfg.get("soc_departure", 100))
+            _fp_disp  = float(cfg.get("fixed_price", 0.35))
+            st.markdown(f"""
+**Price data:** SMARD DE/LU hourly day-ahead spot prices (2025).
+
+**All-in depot price:** `(spot + {_fn_disp:.3f} ct/kWh taxes & levies) × {1+_vat_disp:.2f} VAT`
+
+**Scenario A — Dumb:** Greedy charge from arrival until target SoC reached. No price awareness.
+
+**Scenario B — Smart:** MILP, charge-only (`allow_discharge=False`). Schedules charging at cheapest hours while meeting departure SoC.
+
+**Scenario C — MILP Day-Ahead:** Full MILP with V2G. Optimises both charge and discharge over the full overnight window using perfect price foresight.
+
+**Scenario D — MPC Receding Horizon:** Re-solves MILP at every hour using remaining horizon (+ optional forecast noise). MPC ≡ MILP when noise = 0.
+
+**Scenario F — Fixed Tariff Benchmark:** Applies a flat rate of €{_fp_disp:.2f}/kWh to Scenario A's charge volume. No V2G.
+
+**Current regulation V2G cost:** Re-applied Netzentgelt + Stromsteuer on each exported kWh (double taxation).
+
+**Future regulation (MiSpeL):** Exported kWh receives fee exemption of {_fut_disp:.3f} ct/kWh (×VAT). **Pending EU state aid approval** — BNetzA 2025.
+
+**Cold-chain floor:** SoC ≥ 20 % hard MILP constraint (cold-chain integrity — highest priority).
+
+**Departure SoC target:** ≥ {_dep_disp} % at end of overnight window.
+
+**Battery:** 70 kWh total / 60 kWh usable. Charge/discharge: 22 kW AC bidirectional.
+
+**MILP slot-use penalty:** 1×10⁻⁴ EUR per active charging slot (consolidates charging into contiguous blocks; negligible effect on costs).
+            """)
+        
         # ── Submit ─────────────────────────────────────────────────────────────
         st.markdown("")
         submitted = st.form_submit_button(
@@ -958,6 +1323,10 @@ soc_s         = int(cfg["soc_summer"])
 soc_dep       = int(cfg["soc_departure"])
 tru_cycle     = cfg["tru_cycle"]
 mpc_noise_std = float(cfg.get("mpc_noise_std", 0.0))
+arrival_dev_h = float(cfg.get("arrival_dev_h", 0.0))
+departure_dev_h = float(cfg.get("departure_dev_h", 0.0))
+aux_power_w     = int(cfg.get("aux_power_w", 400))
+bat_heat_w      = int(cfg.get("bat_heat_w",  100))
 w_months      = 6
 s_months      = 6
 do_B          = bool(cfg["do_B"])
@@ -983,6 +1352,29 @@ with st.sidebar:
     st.caption("Changes apply immediately")
     cfg["arrival_str"]   = st.text_input("Arrival (HH:MM)",   cfg["arrival_str"])
     cfg["departure_str"] = st.text_input("Departure (HH:MM)", cfg["departure_str"])
+    cfg["arrival_dev_h"] = st.slider(
+        "Arrival deviation (h)", -4.0, 4.0,
+        float(cfg.get("arrival_dev_h", 0.0)), 1.0
+    )
+    cfg["departure_dev_h"] = st.slider(
+        "Departure deviation (h)", -4.0, 4.0,
+        float(cfg.get("departure_dev_h", 0.0)), 1.0
+    )
+    cfg["aux_power_w"] = st.number_input(
+        "Aux power loss (W)", min_value=0, max_value=2000,
+        value=int(cfg.get("aux_power_w", 400)), step=10, key="sb_aux")
+    cfg["bat_heat_w"] = st.number_input(
+        "Bat heating (W, winter)", min_value=0, max_value=1000,
+        value=int(cfg.get("bat_heat_w", 100)), step=10, key="sb_heat")
+
+    # ── Auto-clear cache when deviation or parasitic loads change ──────────
+    _watch = (cfg["arrival_dev_h"], cfg["departure_dev_h"],
+              cfg["aux_power_w"], cfg["bat_heat_w"])
+    if st.session_state.get("_watch_prev") != _watch:
+        st.session_state["_watch_prev"] = _watch
+        st.cache_data.clear()
+        st.rerun()
+
     cfg["soc_winter"]    = st.slider("Winter arrival SoC (%)",   20, 100, soc_w)
     cfg["soc_summer"]    = st.slider("Summer arrival SoC (%)",   20, 100, soc_s)
     cfg["soc_departure"] = st.slider("Departure target SoC (%)", 50, 100, soc_dep)
@@ -1004,6 +1396,10 @@ with st.sidebar:
     st.markdown("---")
     if st.button("Back to Input", use_container_width=True):
         st.session_state.show_output = False
+        st.rerun()
+    if st.button("🗑️ Clear Cache & Recompute", use_container_width=True,
+                 help="Forces fresh computation — use after changing deviation sliders"):
+        st.cache_data.clear()
         st.rerun()
     st.session_state.cfg = cfg
     arr_h         = parse_hhmm(cfg["arrival_str"],   16.0)
@@ -1032,7 +1428,8 @@ with st.spinner("Loading price data..."):
             + (f"  |  Date: **{specific_date}**" if mode == "Specific Date" else "")
         )
     except Exception as e:
-        st.error(f"Could not load CSV: {e}"); st.stop()
+        st.error(f"Could not load CSV: {e}")
+        st.stop()
 
 v2g     = V2GParams(soc_departure_pct=float(soc_dep))
 tru_avg = tru_avg_kw(tru_cycle)
@@ -1047,7 +1444,15 @@ m5.metric("Mode", "Seasonal avg" if mode == "Seasonal Average"
                   else f"Date: {specific_date}")
 st.markdown("---")
 
-
+if abs(arrival_dev_h) > 1e-12 or abs(departure_dev_h) > 1e-12:
+    st.info(
+        "Abnormality active for weekday runs: "
+        f"planned arrival/departure = {fmt_hhmm(arr_h)} / {fmt_hhmm(dep_h)}, "
+        f"actual arrival/departure = {fmt_hhmm((arr_h + arrival_dev_h) % 24)} / "
+        f"{fmt_hhmm((dep_h + departure_dev_h) % 24)}. "
+        "Smart/MILP are planned on the nominal window and realized on the actual window; "
+        "MPC adapts to the actual window."
+    )
 
 # =============================================================================
 #  ANNUAL GRAPHS
@@ -1150,7 +1555,6 @@ def show_kpi_table(results, fixed_price, tru_cycle, rc, label="", buy_d=None):
     def _build_rows(reg):
         ref_A         = results[0]
         F_charge_cost = ref_A["charge_kwh"] * fixed_price
-        F_net_cost    = F_charge_cost
 
         rows = [{
             "Scenario"                  : f"F  Fixed@{fixed_price:.2f}€/kWh",
@@ -1180,7 +1584,7 @@ def show_kpi_table(results, fixed_price, tru_cycle, rc, label="", buy_d=None):
             })
         return rows
 
-    hdr = f"**EV Charging KPI{' — ' + label if label else ''}**"
+    hdr = f"**Charging KPI{' — ' + label if label else ''}**"
     st.markdown(hdr)
 
     tab_cur, tab_fut = st.tabs([
@@ -1189,26 +1593,15 @@ def show_kpi_table(results, fixed_price, tru_cycle, rc, label="", buy_d=None):
     ])
 
     with tab_cur:
-        st.caption(
-            f"Charge: all-in ≈{avg_allin_eur*100:.1f} ct/kWh  |  "
-            f"V2G: spot minus re-applied Netzentgelt+Stromsteuer "
-            f"({_v2g_double_ct:.2f} ct × 1+VAT = {_v2g_double_ct*(1+_vat_rate):.2f} ct penalty)"
-        )
         st.dataframe(pd.DataFrame(_build_rows("current")),
                      use_container_width=True, hide_index=True)
 
     with tab_fut:
-        st.caption(
-            f"Charge: same all-in  |  "
-            f"V2G: spot + exempt fees "
-            f"({_v2g_exempt_ct:.2f} ct × 1+VAT = {_v2g_exempt_ct*(1+_vat_rate):.2f} ct bonus)  |  "
-            f"MiSpeL Pauschaloption — pending EU state aid approval (BNetzA 2025)"
-        )
         st.dataframe(pd.DataFrame(_build_rows("future")),
                      use_container_width=True, hide_index=True)
 
     if tru_cycle != "OFF" and rc["E_kWh"] > 0.01:
-        st.markdown("**Reefer (TRU) Energy Cost**")
+        st.markdown("**Reefer + Aux + Heating Energy Cost**")
         st.dataframe(pd.DataFrame([
             ["TRU energy (kWh/d)",                        f"{rc['E_kWh']:.2f}"],
             ["Grid spot cost (EUR/d)",                    f"EUR {rc['cost_dynamic']:.3f}"],
@@ -1249,10 +1642,13 @@ if mode == "Specific Date":
              is_wknd_r, is_48h, is_wknd_fullday, tru_d, rc) = run_specific_date(
                 specific_date, arr_h, dep_h,
                 float(soc_init), float(soc_dep),
-                tru_cycle, do_B, do_C, do_D
+                tru_cycle, do_B, do_C, do_D,
+                aux_power_w=aux_power_w,
+                bat_heat_w=bat_heat_w,
             )
         except Exception as e:
-            st.error(f"Error: {e}"); st.stop()
+            st.error(f"Error: {e}")
+            st.stop()
 
     render_season_block(
         v2g, day_label, color_hex,
@@ -1272,7 +1668,11 @@ else:
              is_wknd_w, is_48h_w, tru_d_w, rc_w) = run_seasonal(
                 "winter_weekday", arr_h, dep_h,
                 float(soc_w), float(soc_dep),
-                tru_cycle, do_B, do_C, do_D, mpc_noise_std
+                tru_cycle, do_B, do_C, do_D, mpc_noise_std,
+                arrival_dev_h=arrival_dev_h,
+                departure_dev_h=departure_dev_h,
+                aux_power_w=aux_power_w,
+                bat_heat_w=bat_heat_w,
             )
             all_season_res_kpi["winter_weekday"] = res_w_kpi
             all_reefer_costs["winter_weekday"]    = rc_w
@@ -1280,6 +1680,9 @@ else:
             st.error(f"Winter weekday error: {e}")
 
     if res_w is not None:
+        # Compute actual times for chart annotation (None = no deviation)
+        _arr_act_w = (arr_h + arrival_dev_h) % 24 if abs(arrival_dev_h) > 1e-9 else None
+        _dep_act_w = (dep_h + departure_dev_h) % 24 if abs(departure_dev_h) > 1e-9 else None
         render_season_block(
             v2g,
             "Winter Weekday  (Oct – Mar average)",
@@ -1287,7 +1690,8 @@ else:
             hours_d_w, buy_d_w, plug_d_w, res_w,
             arr_h, dep_h, False, False,
             do_B, do_C, do_D, tru_d_w,
-            fixed_net_ct=_fixed_net_ct, vat_rate=_vat_rate
+            fixed_net_ct=_fixed_net_ct, vat_rate=_vat_rate,
+            arrival_act_h=_arr_act_w, departure_act_h=_dep_act_w,
         )
 
     st.markdown(
@@ -1302,7 +1706,11 @@ else:
              is_wknd_s, is_48h_s, tru_d_s, rc_s) = run_seasonal(
                 "summer_weekday", arr_h, dep_h,
                 float(soc_s), float(soc_dep),
-                tru_cycle, do_B, do_C, do_D, mpc_noise_std
+                tru_cycle, do_B, do_C, do_D, mpc_noise_std,
+                arrival_dev_h=arrival_dev_h,
+                departure_dev_h=departure_dev_h,
+                aux_power_w=aux_power_w,
+                bat_heat_w=bat_heat_w,
             )
             all_season_res_kpi["summer_weekday"] = res_s_kpi
             all_reefer_costs["summer_weekday"]    = rc_s
@@ -1310,6 +1718,8 @@ else:
             st.error(f"Summer weekday error: {e}")
 
     if res_s is not None:
+        _arr_act_s = (arr_h + arrival_dev_h) % 24 if abs(arrival_dev_h) > 1e-9 else None
+        _dep_act_s = (dep_h + departure_dev_h) % 24 if abs(departure_dev_h) > 1e-9 else None
         render_season_block(
             v2g,
             "Summer Weekday  (Apr – Sep average)",
@@ -1317,7 +1727,8 @@ else:
             hours_d_s, buy_d_s, plug_d_s, res_s,
             arr_h, dep_h, False, False,
             do_B, do_C, do_D, tru_d_s,
-            fixed_net_ct=_fixed_net_ct, vat_rate=_vat_rate
+            fixed_net_ct=_fixed_net_ct, vat_rate=_vat_rate,
+            arrival_act_h=_arr_act_s, departure_act_h=_dep_act_s,
         )
 
     st.markdown("---")
@@ -1334,12 +1745,15 @@ else:
                 (res_we, res_we_kpi, buy_d_we, plug_d_we, hours_d_we,
                  _, is_48h_we, tru_d_we, rc_we) = run_seasonal(
                     sk, arr_h, dep_h, float(soc_init), float(soc_dep),
-                    tru_cycle, do_B, do_C, do_D
+                    tru_cycle, do_B, do_C, do_D,
+                    aux_power_w=aux_power_w,
+                    bat_heat_w=bat_heat_w,
                 )
                 all_season_res_kpi[sk] = res_we_kpi
                 all_reefer_costs[sk]   = rc_we
             except Exception as e:
-                st.error(f"{lbl} error: {e}"); continue
+                st.error(f"{lbl} error: {e}")
+                continue
 
         render_season_block(
             v2g, lbl, col_hex,
@@ -1369,35 +1783,13 @@ else:
 
     st.subheader("KPI Tables")
     tab_specs = []
-    if res_w is not None: tab_specs.append(("Winter Weekday", res_w, rc_w, buy_d_w))
-    if res_s is not None: tab_specs.append(("Summer Weekday", res_s, rc_s, buy_d_s))
+    if res_w is not None:
+        tab_specs.append(("Winter Weekday", res_w, rc_w, buy_d_w))
+    if res_s is not None:
+        tab_specs.append(("Summer Weekday", res_s, rc_s, buy_d_s))
 
     if tab_specs:
         tab_objs = st.tabs([t[0] for t in tab_specs])
         for tab_obj, (lbl, res, rc, buy_d_tab) in zip(tab_objs, tab_specs):
             with tab_obj:
                 show_kpi_table(res, fixed_price, tru_cycle, rc, lbl, buy_d=buy_d_tab)
-
-
-# =============================================================================
-#  METHODOLOGY
-# =============================================================================
-
-with st.expander("Methodology & Assumptions", expanded=False):
-    st.markdown(f"""
-**Price data:** SMARD DE/LU 15-min day-ahead spot prices.
-
-**Charts:** All-in price = (spot + {_fixed_net_ct:.3f} ct/kWh fixed) × {1+_vat_rate:.2f} VAT.
-
-**Current regulation:** V2G export kWh penalised by re-applied Netzentgelt + Stromsteuer ({_v2g_double_ct:.2f} ct × 1+VAT).
-
-**Future regulation (MiSpeL):** V2G export kWh receives exemption of {_v2g_exempt_ct:.2f} ct/kWh (× 1+VAT). Pending EU state aid approval.
-
-**Cold-chain floor:** SoC >= 20% hard MILP constraint.
-
-**Departure target:** SoC >= {soc_dep}%.
-
-**Battery:** 70 kWh total / 60 kWh usable | eta_c = 0.92 | eta_d = 0.92
-
-**Fixed-tariff benchmark:** EUR {fixed_price:.2f}/kWh (comparison only).
-    """)
