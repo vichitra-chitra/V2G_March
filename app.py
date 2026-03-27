@@ -1,7 +1,6 @@
 import streamlit as st
 from v2g import (
     V2GParams, WINTER_M, SUMMER_M, SC_COL, SC_FILL,
-    expand_to_minutes,
     FIXED_PRICE_EUR_KWH,
     _passthrough_profile, _load_csv_raw,
     get_tru_1h_trace, tru_avg_kw,
@@ -22,7 +21,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib as mpl
-import plotly.graph_objects as go
 
 mpl.rcParams.update({
     "font.size":        9,
@@ -302,152 +300,6 @@ def make_soc_chart(v2g, hours_d, plug_d,
     plt.tight_layout(pad=0.3)
     return fig_to_buf(fig)
 
-
-# =============================================================================
-#  MINUTE-RESOLUTION PLOTLY CHARTS
-# =============================================================================
-
-def _fmt_clock(h_float: float) -> str:
-    """Convert fractional hour (e.g. 25.5) to HH:MM string (e.g. 01:30)."""
-    h24 = h_float % 24
-    hh  = int(h24)
-    mm  = int(round((h24 - hh) * 60))
-    if mm == 60:
-        hh += 1
-        mm = 0
-    return f"{hh % 24:02d}:{mm:02d}"
-
-
-def make_minute_charts(v2g, results, arrival_h, is_48h, is_wknd_fullday):
-    """
-    Build two Plotly figures (power, SoC) at minute resolution for every
-    scenario in `results`.
-
-    Parameters
-    ----------
-    results        : list of KPI dicts — must contain keys Pc_w, Pd_w, E_init_pct, label
-    arrival_h      : float — depot arrival hour (used as x-axis offset for weekdays)
-    is_48h         : bool  — 48h weekend block (x starts at 0)
-    is_wknd_fullday: bool  — single-day weekend (x starts at 0)
-    """
-
-    # Scenario styling ──────────────────────────────────────────────────────
-    STYLE = {
-        "A": dict(color="#999999", dash="solid",  width=1.4),
-        "B": dict(color="#2196F3", dash="solid",  width=1.4),
-        "C": dict(color="#00ACC1", dash="solid",  width=1.6),
-        "D": dict(color="#FF7700", dash="dash",   width=1.6),
-    }
-
-    def _sc_key(label):
-        for k, v in {"Dumb": "A", "Smart": "B", "MILP": "C", "MPC": "D"}.items():
-            if k in label:
-                return v
-        return "A"
-
-    # X-axis offset: weekdays start at arrival_h, weekends at 0
-    t0 = 0.0 if (is_48h or is_wknd_fullday) else arrival_h
-
-    # ── Build figures ────────────────────────────────────────────────────────
-    fig_pow = go.Figure()
-    fig_soc = go.Figure()
-
-    # SoC reference lines (added before traces so they sit behind)
-    fig_soc.add_hline(
-        y=v2g.soc_min_pct, line_dash="dot", line_color="#C62828",
-        annotation_text=f"Floor {v2g.soc_min_pct:.0f}%",
-        annotation_position="bottom right", annotation_font_size=10,
-    )
-    fig_soc.add_hline(
-        y=v2g.soc_departure_pct, line_dash="dot", line_color="#0D47A1",
-        annotation_text=f"Target {v2g.soc_departure_pct:.0f}%",
-        annotation_position="top right", annotation_font_size=10,
-    )
-    # Zero line on power chart
-    fig_pow.add_hline(y=0, line_color="#AAAAAA", line_width=0.8)
-
-    for r in results:
-        k      = _sc_key(r["label"])
-        style  = STYLE.get(k, dict(color="#888888", dash="solid", width=1.4))
-        E_init = r["E_init_pct"] * v2g.usable_capacity_kWh / 100.0
-        lbl    = r["label"].split("(")[0].strip()
-
-        # Expand to minutes ───────────────────────────────────────────────
-        t_min, Pc_min, Pd_min, soc_pct = expand_to_minutes(
-            v2g, r["Pc_w"], r["Pd_w"], E_init,
-        )
-        t_clock = t_min + t0                        # absolute clock hours
-        hover   = [_fmt_clock(h) for h in t_clock]  # HH:MM for every minute
-
-        # Net power: positive = charging, negative = V2G export
-        P_net = Pc_min - Pd_min
-
-        fig_pow.add_trace(go.Scatter(
-            x=t_clock, y=P_net,
-            mode="lines", name=lbl,
-            line=dict(color=style["color"], dash=style["dash"], width=style["width"]),
-            hovertemplate=(
-                "<b>" + lbl + "</b><br>"
-                "Time : %{text}<br>"
-                "Power: %{y:.2f} kW<extra></extra>"
-            ),
-            text=hover,
-        ))
-
-        fig_soc.add_trace(go.Scatter(
-            x=t_clock, y=soc_pct,
-            mode="lines", name=lbl,
-            line=dict(color=style["color"], dash=style["dash"], width=style["width"]),
-            hovertemplate=(
-                "<b>" + lbl + "</b><br>"
-                "Time: %{text}<br>"
-                "SoC : %{y:.1f}%<extra></extra>"
-            ),
-            text=hover,
-        ))
-
-    # ── X-axis ticks every 2 hours ───────────────────────────────────────────
-    W_hours   = len(results[0]["Pc_w"])
-    x_end     = t0 + W_hours
-    tick_vals = np.arange(np.floor(t0), np.ceil(x_end) + 1, 2.0).tolist()
-    tick_text = [_fmt_clock(h) for h in tick_vals]
-
-    _xaxis = dict(
-        tickvals=tick_vals, ticktext=tick_text,
-        title="Time (HH:MM)",
-        showgrid=True, gridcolor="#EEEEEE", gridwidth=1,
-        zeroline=False,
-    )
-    _layout_common = dict(
-        paper_bgcolor="#F8F9FA", plot_bgcolor="#FFFFFF",
-        height=310,
-        margin=dict(l=55, r=20, t=42, b=65),
-        legend=dict(orientation="h", yanchor="bottom", y=-0.42,
-                    font=dict(size=11)),
-        font=dict(size=11),
-        hovermode="x unified",
-    )
-
-    fig_pow.update_layout(
-        title=dict(text="⚡ Minute-Resolution Power  [+ charge / − V2G]",
-                   font=dict(size=13, color="#263238")),
-        xaxis=_xaxis,
-        yaxis=dict(title="Power (kW)", zeroline=False,
-                   showgrid=True, gridcolor="#EEEEEE"),
-        **_layout_common,
-    )
-
-    fig_soc.update_layout(
-        title=dict(text="🔋 Minute-Resolution State of Charge (%)",
-                   font=dict(size=13, color="#263238")),
-        xaxis=_xaxis,
-        yaxis=dict(title="SoC (%)", range=[0, 112],
-                   showgrid=True, gridcolor="#EEEEEE"),
-        **_layout_common,
-    )
-
-    return fig_pow, fig_soc
-
 # =============================================================================
 #  RENDER ONE SEASON BLOCK
 # =============================================================================
@@ -502,32 +354,6 @@ def render_season_block(v2g, season_title, color_hex,
                 arrival_act_h=arrival_act_h, departure_act_h=departure_act_h,
             )
             st.image(buf, use_container_width=True)
-
-    # ── Minute-resolution Plotly charts ─────────────────────────────────────
-    with st.expander("🔬 Minute-Resolution Detail (interactive Plotly)", expanded=False):
-        try:
-            # Collect results in display order: A first, then active comparisons
-            _min_results = [result_A] + [r for r, _, _ in comparisons]
-            fig_pow_min, fig_soc_min = make_minute_charts(
-                v2g, _min_results, arrival_h, is_48h, is_wknd_fullday,
-            )
-            m_left, m_right = st.columns(2)
-            with m_left:
-                st.plotly_chart(fig_pow_min, use_container_width=True,
-                                config={"displayModeBar": True,
-                                        "modeBarButtonsToRemove": ["lasso2d","select2d"]})
-            with m_right:
-                st.plotly_chart(fig_soc_min, use_container_width=True,
-                                config={"displayModeBar": True,
-                                        "modeBarButtonsToRemove": ["lasso2d","select2d"]})
-            st.caption(
-                "ℹ️ Power and SoC re-computed at **1-minute resolution**. "
-                "Power = step-hold of hourly schedule. SoC = minute-by-minute integration "
-                "using η_charge = 0.92 / η_discharge = 0.92."
-            )
-        except Exception as exc:
-            st.warning(f"Minute-resolution chart error: {exc}")
-
 
 # =============================================================================
 #  CACHED DATA LOADERS
@@ -658,26 +484,6 @@ def run_seasonal(season_key, arrival_h, departure_h,
         return results, results_kpi, buy_d, plug_d, hours_d, is_wknd, is_48h, tru_w, rc
 
 # ---------------------------------------------------------
-    # WEEKDAY: planned window (day-ahead) vs actual window (real execution)
-    #
-    # Scenario A  — Dumb   : runs on ACTUAL window. No schedule exists;
-    #               trailer charges greedily the moment it physically arrives.
-    #
-    # Scenario B  — Smart  : optimised day-ahead on PLANNED window (cheapest
-    #               hours, charge-only). Realized on ACTUAL window:
-    #               slots missed because trailer was not yet plugged in are
-    #               simply skipped. No re-optimisation after deviation.
-    #
-    # Scenario C  — MILP   : same plan-then-realize logic as B. MILP commits
-    #               to a schedule before the trailer moves. If it arrives late
-    #               and misses cheap overnight slots, those slots are lost
-    #               (SoC target may not be met — this is intentional and is
-    #               a key finding to highlight in the thesis).
-    #
-    # Scenario D  — MPC    : re-solves MILP every hour on the remaining ACTUAL
-    #               horizon. No pre-committed plan, so it adapts automatically
-    #               to early or late arrival.
-    # ---------------------------------------------------------
 
     abnormal = (abs(arrival_dev_h) > 1e-12) or (abs(departure_dev_h) > 1e-12)
 
