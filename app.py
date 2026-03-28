@@ -1,4 +1,6 @@
 import streamlit as st
+import altair as alt
+
 from v2g import (
     V2GParams, WINTER_M, SUMMER_M, SC_COL, SC_FILL,
     FIXED_PRICE_EUR_KWH,
@@ -10,6 +12,7 @@ from v2g import (
     make_kpi,
     soc_ramp,
     realize_planned_window_under_actual_times,
+    expand_to_minutes,
 )
 
 import matplotlib.patches as mpatches
@@ -145,8 +148,71 @@ def _vlines(ax, arrival_h, departure_h, is_48h, is_wknd_fullday=False,
                    label=f"Actual departure {int(departure_act_h):02d}:00")
 
 # =============================================================================
-#  POWER CHART
+#  ALTAIR HELPERS
 # =============================================================================
+
+def _alt_x(hours_d, is_48h, is_wknd_fullday):
+    """Shared X encoding + domain bounds for all charts."""
+    dt   = float(hours_d[1] - hours_d[0]) if len(hours_d) > 1 else 1.0
+    xmin = float(hours_d[0])
+    xmax = float(hours_d[-1]) + dt
+    if is_48h:
+        ticks = list(range(0, 49, 4))
+        expr  = ("(datum.value < 24 ? 'Sat ' : 'Sun ') +"
+                 "((datum.value%24)<10?'0':'')+floor(datum.value%24)+':00'")
+    elif is_wknd_fullday:
+        ticks = list(range(0, 25, 2))
+        expr  = "(datum.value<10?'0':'')+datum.value+':00'"
+    else:
+        ticks = list(range(12, 37, 2))
+        expr  = "((datum.value%24)<10?'0':'')+floor(datum.value%24)+':00'"
+    enc = alt.X('hour:Q',
+                scale=alt.Scale(domain=[xmin, xmax]),
+                axis=alt.Axis(values=ticks, labelExpr=expr, labelAngle=-35, title=''))
+    return enc, xmin, xmax, dt
+
+
+def _plug_rects(hours_d, plug_d, dt):
+    """Returns list of {x, x2} dicts for plug-in shading."""
+    rects, in_p, s = [], False, None
+    for t, h in enumerate(hours_d):
+        if plug_d[t] > 0.5 and not in_p:
+            s, in_p = float(h), True
+        elif plug_d[t] < 0.5 and in_p:
+            rects.append({'x': s, 'x2': float(h)})
+            in_p = False
+    if in_p and s is not None:
+        rects.append({'x': s, 'x2': float(hours_d[-1]) + dt})
+    return rects
+
+
+def _vrow_data(arrival_h, departure_h, is_48h, is_wknd_fullday,
+               arrival_act_h=None, departure_act_h=None):
+    """Returns list of {x, c, lbl} for vertical rule marks."""
+    if is_wknd_fullday:
+        return []
+    def dx(h): return h if h >= 12. else h + 24.
+    rows = [{'x': dx(0.), 'c': '#888888', 'lbl': 'Midnight'}]
+    if is_48h:
+        rows.append({'x': 24., 'c': '#555555', 'lbl': 'Day boundary'})
+    else:
+        rows += [
+            {'x': dx(arrival_h),   'c': '#1B5E20', 'lbl': f'Plan arr {int(arrival_h):02d}:00'},
+            {'x': dx(departure_h), 'c': '#B71C1C', 'lbl': f'Plan dep {int(departure_h):02d}:00'},
+        ]
+        if arrival_act_h is not None and abs(arrival_act_h - arrival_h) > 1e-9:
+            rows.append({'x': dx(arrival_act_h), 'c': '#00C853',
+                         'lbl': f'Actual arr {int(arrival_act_h):02d}:00'})
+        if departure_act_h is not None and abs(departure_act_h - departure_h) > 1e-9:
+            rows.append({'x': dx(departure_act_h), 'c': '#FF5252',
+                         'lbl': f'Actual dep {int(departure_act_h):02d}:00'})
+    return rows
+
+
+# =============================================================================
+#  POWER CHART  (Altair — interactive, dual y-axis)
+# =============================================================================
+
 def make_power_chart(v2g, hours_d, buy_d, plug_d,
                      result_A, result_X,
                      x_label, x_key,
@@ -156,89 +222,136 @@ def make_power_chart(v2g, hours_d, buy_d, plug_d,
                      fixed_net_ct=None, vat_rate=None,
                      arrival_act_h=None, departure_act_h=None):
 
-    col_a  = SC_COL["A"]
-    fill_a  = SC_FILL["A"]
-    col_x  = SC_COL[x_key]
-    fill_x  = SC_FILL[x_key]
     lbl_x  = result_X["label"].split("(")[0].strip()
-    # MPC gets dashed line so it's visually distinct from MILP
-    ls_x   = "--" if x_key == "D" else "-"
+    buy_ct = to_allin_ct(buy_d, fixed_net_ct, vat_rate)
+    x_enc, xmin, xmax, dt = _alt_x(hours_d, is_48h, is_wknd_fullday)
 
-    # Infer slot width from hours_d spacing (works for both 15-min and 1h)
-    dt_plot = float(hours_d[1] - hours_d[0]) if len(hours_d) > 1 else 1.0
+    # ── Series spec: (name, values_array, hex_color, [dash, gap]) ──────────
+    series_spec = [
+        ('A - Dumb',      result_A['Pc_d'],  SC_COL['A'],   [1, 0]),
+        (f'{lbl_x}',      result_X['Pc_d'],  SC_COL[x_key], [1, 0]),
+    ]
+    if result_X['v2g_kwh'] > 0.05:
+        series_spec.append((f'{lbl_x} V2G', -result_X['Pd_d'], SC_COL[x_key], [8, 3]))
+    if tru_d is not None and np.any(np.array(tru_d) > 0.01):
+        tru_arr = np.zeros(len(hours_d))
+        tru_arr[:len(tru_d)] = -np.array(tru_d)[:len(hours_d)]
+        series_spec.append(('TRU', tru_arr, '#C62828', [4, 2]))
 
-    fig, ax = plt.subplots(figsize=(9.0, 3.5))
-    fig.patch.set_facecolor("#F8F9FA")
-    ax.set_facecolor("#FFFFFF")
+    rows = []
+    for sname, vals, col, _dash in series_spec:
+        for t in range(len(hours_d)):
+            rows.append({'hour': float(hours_d[t]),
+                         'kW':   float(vals[t]) if t < len(vals) else 0.0,
+                         'series': sname, 'color': col})
+    df_p = pd.DataFrame(rows)
 
-    # FIX 1a: use dt_plot instead of hard-coded 0.25
-    for t in range(len(hours_d)):
-        if plug_d[t] > 0.5:
-            ax.axvspan(hours_d[t], hours_d[t] + dt_plot,
-                       color="gold", alpha=0.14, lw=0, zorder=1)
+    s_domain = [s[0] for s in series_spec]
+    c_range  = [s[2] for s in series_spec]
+    d_range  = [s[3] for s in series_spec]
 
-    ax.fill_between(hours_d, result_A["Pc_d"],
-                    step="post", color=fill_a, alpha=0.55, zorder=2)
-    h_a, = ax.step(hours_d, result_A["Pc_d"], where="post",
-                   color=col_a, lw=1.8, zorder=3, label="A - Dumb charge")
+    # Price: extend one slot for step-after visual
+    hours_ext = list(hours_d) + [float(hours_d[-1]) + dt]
+    price_ext = list(buy_ct)  + [float(buy_ct[-1])]
+    df_price  = pd.DataFrame({'hour': hours_ext, 'ct_kwh': price_ext})
 
-    ax.fill_between(hours_d, result_X["Pc_d"],
-                    step="post", color=fill_x, alpha=0.48, zorder=4)
-    h_x, = ax.step(hours_d, result_X["Pc_d"], where="post",
-                   color=col_x, lw=2.0, ls=ls_x, zorder=5, label=f"{lbl_x} charge")
+    layers = []
 
-    handles = [h_a, h_x]
+    # 1. Gold plug-in shading
+    plug_r = _plug_rects(hours_d, plug_d, dt)
+    if plug_r:
+        layers.append(
+            alt.Chart(pd.DataFrame(plug_r))
+            .mark_rect(color='gold', opacity=0.18)
+            .encode(x=alt.X('x:Q', scale=alt.Scale(domain=[xmin, xmax])), x2='x2:Q')
+        )
 
-    if result_X["v2g_kwh"] > 0.05:
-        ax.fill_between(hours_d, -result_X["Pd_d"],
-                        step="post", color=fill_x, alpha=0.28, zorder=4)
-        h_d, = ax.step(hours_d, -result_X["Pd_d"], where="post",
-                       color=col_x, lw=2.0, ls=":", alpha=0.90, zorder=5,
-                       label=f"{lbl_x} V2G (−)")
-        handles.append(h_d)
+    # 2. Vertical rules (arrival / departure / midnight)
+    vrows = _vrow_data(arrival_h, departure_h, is_48h, is_wknd_fullday,
+                       arrival_act_h, departure_act_h)
+    if vrows:
+        layers.append(
+            alt.Chart(pd.DataFrame(vrows))
+            .mark_rule(strokeDash=[4, 2], opacity=0.65)
+            .encode(x='x:Q',
+                    color=alt.Color('c:N', scale=None, legend=None),
+                    tooltip='lbl:N')
+        )
 
-    if tru_d is not None and np.any(tru_d > 0.01):
-        h_t, = ax.step(hours_d, -tru_d, where="post",
-                       color="#C62828", lw=1.2, ls=":", alpha=0.75, zorder=5,
-                       label="TRU (−)")
-        handles.append(h_t)
+    # 3. Power step lines — solid series
+    df_solid = df_p[df_p['series'].isin(
+        [s[0] for s in series_spec if s[3] == [1, 0]])]
+    if not df_solid.empty:
+        dom_s = df_solid['series'].unique().tolist()
+        rng_s = [df_solid[df_solid['series'] == s]['color'].iloc[0] for s in dom_s]
+        layers.append(
+            alt.Chart(df_solid).mark_line(interpolate='step-after').encode(
+                x=x_enc,
+                y=alt.Y('kW:Q', axis=alt.Axis(title='Power (kW)')),
+                color=alt.Color('series:N',
+                    scale=alt.Scale(domain=dom_s, range=rng_s),
+                    legend=alt.Legend(orient='bottom', title=None,
+                                      columns=len(dom_s), symbolStrokeWidth=2)),
+                tooltip=['series:N',
+                         alt.Tooltip('kW:Q', format='.2f'),
+                         alt.Tooltip('hour:Q', format='.1f', title='Hour')]
+            )
+        )
 
-    ax.axhline(0, color="black", lw=0.6)
-    _vlines(ax, arrival_h, departure_h, is_48h, is_wknd_fullday,
-            arrival_act_h=arrival_act_h, departure_act_h=departure_act_h)
+    # 4. Dashed series (V2G, TRU)
+    df_dash = df_p[~df_p['series'].isin(
+        [s[0] for s in series_spec if s[3] == [1, 0]])]
+    if not df_dash.empty:
+        dom_d = df_dash['series'].unique().tolist()
+        rng_d = [df_dash[df_dash['series'] == s]['color'].iloc[0] for s in dom_d]
+        for i, sname in enumerate(dom_d):
+            dash_pat = next(s[3] for s in series_spec if s[0] == sname)
+            col_val  = next(s[2] for s in series_spec if s[0] == sname)
+            layers.append(
+                alt.Chart(df_dash[df_dash['series'] == sname])
+                .mark_line(interpolate='step-after', strokeDash=dash_pat)
+                .encode(
+                    x=x_enc,
+                    y=alt.Y('kW:Q'),
+                    color=alt.Color('series:N',
+                        scale=alt.Scale(domain=[sname], range=[col_val]),
+                        legend=alt.Legend(orient='bottom', title=None,
+                                          columns=1, symbolStrokeWidth=2,
+                                          symbolDash=dash_pat)),
+                    tooltip=['series:N', alt.Tooltip('kW:Q', format='.2f')]
+                )
+            )
 
-    buy_d_ct = to_allin_ct(buy_d, fixed_net_ct, vat_rate)
-    ax2 = ax.twinx()
+    # 5. Price line on right axis
+    price_layer = (
+        alt.Chart(df_price)
+        .mark_line(interpolate='step-after', color='#2E7D32',
+                   opacity=0.80, strokeDash=[3, 1])
+        .encode(
+            x=x_enc,
+            y=alt.Y('ct_kwh:Q',
+                    axis=alt.Axis(title='ct/kWh (all-in)',
+                                  titleColor='#2E7D32', orient='right'),
+                    scale=alt.Scale(domain=[
+                        max(0., float(buy_ct.min()) - 2.),
+                        float(buy_ct.max()) + 2.])),
+            tooltip=[alt.Tooltip('ct_kwh:Q', format='.1f', title='Price ct/kWh')]
+        )
+    )
 
-    # FIX 1b: extend by one slot so the LAST hour's price is visible
-    hours_ext    = np.append(hours_d, hours_d[-1] + dt_plot)
-    buy_d_ct_ext = np.append(buy_d_ct, buy_d_ct[-1])
-
-    h_p, = ax2.step(hours_ext, buy_d_ct_ext, where="post",
-                    color="#2E7D32", lw=1.4, alpha=0.85, label="Price (all-in)")
-    ax2.fill_between(hours_ext, buy_d_ct_ext,
-                     step="post", color="#2E7D32", alpha=0.07)
-    ax2.set_ylabel("ct/kWh (all-in)", fontsize=8, color="#2E7D32")
-    ax2.tick_params(axis="y", labelcolor="#2E7D32", labelsize=8)
-    ax2.set_ylim(bottom=min(0, buy_d_ct.min() - 1))
-    handles.append(h_p)
-
-    ax.set_ylabel("Power (kW)", fontsize=9)
-    ax.set_title(f"Power — Dumb vs {x_label}",
-                 fontsize=10, fontweight="bold", loc="left", pad=4)
-    _setup_xaxis(ax, is_48h, is_wknd_fullday)
-
-    ax.legend(handles=handles, fontsize=8, ncol=len(handles),
-              loc="upper center", bbox_to_anchor=(0.5, -0.28),
-              framealpha=0.92, edgecolor="#CCC", handlelength=1.2,
-              borderpad=0.4, columnspacing=1.0)
-
-    plt.tight_layout(pad=0.3)
-    return fig_to_buf(fig)
+    left  = alt.layer(*layers)
+    chart = (
+        alt.layer(left, price_layer)
+        .resolve_scale(y='independent')
+        .properties(title=f'Power — Dumb vs {x_label}', height=300,
+                    background='#FAFAFA')
+        .interactive()
+    )
+    return chart
 
 
 # =============================================================================
-#  SOC CHART
+#  SOC CHART  (Altair — 1-minute resolution)
 # =============================================================================
 
 def make_soc_chart(v2g, hours_d, plug_d,
@@ -248,58 +361,99 @@ def make_soc_chart(v2g, hours_d, plug_d,
                    is_48h, is_wknd_fullday=False,
                    arrival_act_h=None, departure_act_h=None):
 
-    col_a = SC_COL["A"]
-    col_x = SC_COL[x_key]
     lbl_x = result_X["label"].split("(")[0].strip()
-    ls_x  = "--" if x_key == "D" else "-"
+    x_enc, xmin, xmax, dt = _alt_x(hours_d, is_48h, is_wknd_fullday)
 
-    # Infer slot width
-    dt_plot = float(hours_d[1] - hours_d[0]) if len(hours_d) > 1 else 1.0
+    # Display-hour offset for window-relative t_min
+    if is_48h or is_wknd_fullday:
+        arr_h0 = 0.0
+    else:
+        idx = np.where(np.array(plug_d) > 0.5)[0]
+        arr_h0 = float(hours_d[idx[0]]) if len(idx) > 0 else float(arrival_h)
 
-    fig, ax = plt.subplots(figsize=(9.0, 3.5))
-    fig.patch.set_facecolor("#F8F9FA")
-    ax.set_facecolor("#FFFFFF")
+    def _minsoc(result):
+        E0  = result['E_init_pct'] * v2g.usable_capacity_kWh / 100.0
+        Pc, Pd = result['Pc_w'], result['Pd_w']
+        if len(Pc) == 0:
+            return np.array([arr_h0]), np.array([result['E_init_pct']])
+        t_m, _, _, soc_p = expand_to_minutes(v2g, np.asarray(Pc), np.asarray(Pd), E0)
+        return arr_h0 + t_m, soc_p
 
-    # FIX 1a: use dt_plot instead of hard-coded 0.25
-    for t in range(len(hours_d)):
-        if plug_d[t] > 0.5:
-            ax.axvspan(hours_d[t], hours_d[t] + dt_plot,
-                       color="gold", alpha=0.14, lw=0, zorder=1)
+    t_A, s_A = _minsoc(result_A)
+    t_X, s_X = _minsoc(result_X)
 
-    xA, yA = soc_ramp(hours_d, result_A["soc_d"], result_A["E_init_pct"])
-    xX, yX = soc_ramp(hours_d, result_X["soc_d"], result_X["E_init_pct"])
+    # Downsample to every 2 min (keeps ~400 pts per series for 14h overnight)
+    STEP = 2
+    rows = []
+    for i in range(0, len(t_A), STEP):
+        rows.append({'hour': float(t_A[i]), 'SoC': float(s_A[i]), 'series': 'A - Dumb'})
+    for i in range(0, len(t_X), STEP):
+        rows.append({'hour': float(t_X[i]), 'SoC': float(s_X[i]), 'series': lbl_x})
+    df_soc = pd.DataFrame(rows)
 
-    h_a, = ax.plot(xA, yA, color=col_a, lw=2.0, label="A - Dumb SoC")
-    h_x, = ax.plot(xX, yX, color=col_x, lw=2.3, ls=ls_x, label=f"{lbl_x} SoC")
+    layers = []
 
-    ax.axhline(v2g.soc_min_pct,       color="#C62828", ls=":", lw=1.2, zorder=3)
-    ax.axhline(v2g.soc_departure_pct, color="#0D47A1", ls=":", lw=1.2, zorder=3)
+    # 1. Gold plug-in shading
+    plug_r = _plug_rects(hours_d, plug_d, dt)
+    if plug_r:
+        layers.append(
+            alt.Chart(pd.DataFrame(plug_r))
+            .mark_rect(color='gold', opacity=0.18)
+            .encode(x=alt.X('x:Q', scale=alt.Scale(domain=[xmin, xmax])), x2='x2:Q')
+        )
 
-    _vlines(ax, arrival_h, departure_h, is_48h, is_wknd_fullday,
-            arrival_act_h=arrival_act_h, departure_act_h=departure_act_h)
+    # 2. Vertical rules
+    vrows = _vrow_data(arrival_h, departure_h, is_48h, is_wknd_fullday,
+                       arrival_act_h, departure_act_h)
+    if vrows:
+        layers.append(
+            alt.Chart(pd.DataFrame(vrows))
+            .mark_rule(strokeDash=[4, 2], opacity=0.65)
+            .encode(x='x:Q',
+                    color=alt.Color('c:N', scale=None, legend=None),
+                    tooltip='lbl:N')
+        )
 
-    handles = [
-        h_a, h_x,
-        Line2D([0],[0], color="#C62828", ls=":", lw=1.2,
-               label=f"Floor {v2g.soc_min_pct:.0f}%"),
-        Line2D([0],[0], color="#0D47A1", ls=":", lw=1.2,
-               label=f"Target {v2g.soc_departure_pct:.0f}%"),
-        mpatches.Patch(color="gold", alpha=0.40, label="Plugged-in"),
-    ]
+    # 3. SoC lines
+    layers.append(
+        alt.Chart(df_soc).mark_line().encode(
+            x=x_enc,
+            y=alt.Y('SoC:Q',
+                    scale=alt.Scale(domain=[0, 115]),
+                    axis=alt.Axis(title='SoC (%)')),
+            color=alt.Color('series:N',
+                scale=alt.Scale(domain=['A - Dumb', lbl_x],
+                                range=[SC_COL['A'], SC_COL[x_key]]),
+                legend=alt.Legend(orient='bottom', title=None,
+                                  columns=3, symbolStrokeWidth=2)),
+            tooltip=['series:N',
+                     alt.Tooltip('SoC:Q', format='.1f'),
+                     alt.Tooltip('hour:Q', format='.2f', title='Hour')]
+        )
+    )
 
-    ax.set_ylabel("SoC (%)", fontsize=9)
-    ax.set_ylim(0, 115)
-    ax.set_title(f"SoC — Dumb vs {x_label}",
-                 fontsize=10, fontweight="bold", loc="left", pad=4)
-    _setup_xaxis(ax, is_48h, is_wknd_fullday)
+    # 4. Floor and departure-target reference lines
+    ref_df = pd.DataFrame([
+        {'y': v2g.soc_min_pct,       'c': '#C62828',
+         'lbl': f'SoC floor {v2g.soc_min_pct:.0f}%'},
+        {'y': v2g.soc_departure_pct, 'c': '#0D47A1',
+         'lbl': f'Departure target {v2g.soc_departure_pct:.0f}%'},
+    ])
+    layers.append(
+        alt.Chart(ref_df)
+        .mark_rule(strokeDash=[4, 2], opacity=0.80)
+        .encode(y='y:Q',
+                color=alt.Color('c:N', scale=None, legend=None),
+                tooltip='lbl:N')
+    )
 
-    ax.legend(handles=handles, fontsize=8, ncol=5,
-              loc="upper center", bbox_to_anchor=(0.5, -0.28),
-              framealpha=0.92, edgecolor="#CCC", handlelength=1.2,
-              borderpad=0.4, columnspacing=1.0)
-
-    plt.tight_layout(pad=0.3)
-    return fig_to_buf(fig)
+    chart = (
+        alt.layer(*layers)
+        .properties(title=f'SoC (1-min resolution) — Dumb vs {x_label}',
+                    height=300, background='#FAFAFA')
+        .interactive()
+    )
+    return chart
 
 # =============================================================================
 #  RENDER ONE SEASON BLOCK
@@ -337,24 +491,23 @@ def render_season_block(v2g, season_title, color_hex,
 
     with col_pow:
         for result_X, x_label, x_key in comparisons:
-            buf = make_power_chart(
+            chart = make_power_chart(
                 v2g, hours_d, buy_d, plug_d,
                 result_A, result_X, x_label, x_key,
                 arrival_h, departure_h, is_48h, is_wknd_fullday, tru_d,
                 fixed_net_ct=fixed_net_ct, vat_rate=vat_rate,
                 arrival_act_h=arrival_act_h, departure_act_h=departure_act_h,
             )
-            st.image(buf, use_container_width=True)
+        st.altair_chart(chart, use_container_width=True)
 
     with col_soc:
-        for result_X, x_label, x_key in comparisons:
-            buf = make_soc_chart(
+        chart = make_soc_chart(
                 v2g, hours_d, plug_d,
                 result_A, result_X, x_label, x_key,
                 arrival_h, departure_h, is_48h, is_wknd_fullday,
                 arrival_act_h=arrival_act_h, departure_act_h=departure_act_h,
             )
-            st.image(buf, use_container_width=True)
+        st.altair_chart(chart, use_container_width=True)
 
 # =============================================================================
 #  CACHED DATA LOADERS
