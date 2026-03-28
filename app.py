@@ -210,7 +210,7 @@ def _vrow_data(arrival_h, departure_h, is_48h, is_wknd_fullday,
 
 
 # =============================================================================
-#  POWER CHART  (Altair — interactive, dual y-axis)
+#  POWER CHART  (Altair — interactive, minute-level resolution)
 # =============================================================================
 
 def make_power_chart(v2g, hours_d, buy_d, plug_d,
@@ -226,172 +226,84 @@ def make_power_chart(v2g, hours_d, buy_d, plug_d,
     buy_ct = to_allin_ct(buy_d, fixed_net_ct, vat_rate)
     x_enc, xmin, xmax, dt = _alt_x(hours_d, is_48h, is_wknd_fullday)
 
-    # ── Series spec: (name, values_array, hex_color, [dash, gap]) ──────────
-    series_spec = [
-        ('A - Dumb',      result_A['Pc_d'],  SC_COL['A'],   [1, 0]),
-        (f'{lbl_x}',      result_X['Pc_d'],  SC_COL[x_key], [1, 0]),
-    ]
-    if result_X['v2g_kwh'] > 0.05:
-        series_spec.append((f'{lbl_x} V2G', -result_X['Pd_d'], SC_COL[x_key], [8, 3]))
-    if tru_d is not None and np.any(np.array(tru_d) > 0.01):
-        tru_arr = np.zeros(len(hours_d))
-        tru_arr[:len(tru_d)] = -np.array(tru_d)[:len(hours_d)]
-        series_spec.append(('TRU', tru_arr, '#C62828', [4, 2]))
+    # Helper to expand hourly display arrays to compressed minute pulses
+    def expand_arr(P_c, P_d, tru_arr):
+        N = len(hours_d) * 60
+        h_min = np.zeros(N)
+        pc_min = np.zeros(N)
+        pd_min = np.zeros(N)
+        tru_min = np.zeros(N)
+        dt_h = float(hours_d[1] - hours_d[0]) if len(hours_d) > 1 else 1.0
+        dt_m = dt_h / 60.0
+        
+        for i in range(len(hours_d)):
+            h_start = float(hours_d[i])
+            pc_val = float(P_c[i]) if i < len(P_c) else 0.0
+            pd_val = float(P_d[i]) if i < len(P_d) else 0.0
+            tru_val = float(tru_arr[i]) if (tru_arr is not None and i < len(tru_arr)) else 0.0
+            
+            p_max_c = max(0.0, v2g.charge_power_kW - tru_val)
+            p_max_d = v2g.discharge_power_kW
+            
+            E_c_rem = pc_val * dt_h
+            E_d_rem = pd_val * dt_h
+            
+            for m in range(60):
+                idx = i * 60 + m
+                h_min[idx] = h_start + m * dt_m
+                tru_min[idx] = tru_val
+                
+                if E_c_rem > 1e-6:
+                    charge_e = min(E_c_rem, p_max_c * dt_m)
+                    pc_min[idx] = charge_e / dt_m
+                    E_c_rem -= charge_e
+                elif E_d_rem > 1e-6:
+                    discharge_e = min(E_d_rem, p_max_d * dt_m)
+                    pd_min[idx] = discharge_e / dt_m
+                    E_d_rem -= discharge_e
+                    
+        return h_min, pc_min, pd_min, tru_min
 
-    rows = []
-    for sname, vals, col, _dash in series_spec:
-        for t in range(len(hours_d)):
-            rows.append({'hour': float(hours_d[t]),
-                         'kW':   float(vals[t]) if t < len(vals) else 0.0,
-                         'series': sname, 'color': col})
+    h_min, pcA_m, pdA_m, _ = expand_arr(result_A['Pc_d'], result_A['Pd_d'], tru_d)
+    _, pcX_m, pdX_m, tru_m = expand_arr(result_X['Pc_d'], result_X['Pd_d'], tru_d)
+
+    # Series styling map
+    series_props = {
+        'A - Dumb':       {'color': SC_COL['A'],   'dash': [1, 0]},
+        f'{lbl_x}':       {'color': SC_COL[x_key], 'dash': [1, 0]},
+        f'{lbl_x} V2G':   {'color': SC_COL[x_key], 'dash': [8, 3]},
+        'TRU':            {'color': '#C62828',     'dash': [4, 2]}
+    }
+
+    # Build DataFrame with minute-level points
+    STEP = 1
+    rows =[]
+    
+    # 1. Dumb charge
+    for i in range(0, len(h_min), STEP):
+        rows.append({'hour': float(h_min[i]), 'kW': float(pcA_m[i]), 'series': 'A - Dumb'})
+        
+    # 2. X Smart/MILP/MPC charge
+    for i in range(0, len(h_min), STEP):
+        rows.append({'hour': float(h_min[i]), 'kW': float(pcX_m[i]), 'series': f'{lbl_x}'})
+        
+    # 3. X Smart/MILP/MPC discharge (V2G)
+    if result_X['v2g_kwh'] > 0.05:
+        for i in range(0, len(h_min), STEP):
+            rows.append({'hour': float(h_min[i]), 'kW': float(-pdX_m[i]), 'series': f'{lbl_x} V2G'})
+            
+    # 4. TRU
+    if tru_d is not None and np.any(np.array(tru_d) > 0.01):
+        for i in range(0, len(h_min), STEP):
+            rows.append({'hour': float(h_min[i]), 'kW': float(-tru_m[i]), 'series': 'TRU'})
+
     df_p = pd.DataFrame(rows)
 
-    s_domain = [s[0] for s in series_spec]
-    c_range  = [s[2] for s in series_spec]
-    d_range  = [s[3] for s in series_spec]
-
-    # Price: extend one slot for step-after visual
     hours_ext = list(hours_d) + [float(hours_d[-1]) + dt]
     price_ext = list(buy_ct)  + [float(buy_ct[-1])]
     df_price  = pd.DataFrame({'hour': hours_ext, 'ct_kwh': price_ext})
 
-    layers = []
-
-    # 1. Gold plug-in shading
-    plug_r = _plug_rects(hours_d, plug_d, dt)
-    if plug_r:
-        layers.append(
-            alt.Chart(pd.DataFrame(plug_r))
-            .mark_rect(color='gold', opacity=0.18)
-            .encode(x=alt.X('x:Q', scale=alt.Scale(domain=[xmin, xmax])), x2='x2:Q')
-        )
-
-    # 2. Vertical rules (arrival / departure / midnight)
-    vrows = _vrow_data(arrival_h, departure_h, is_48h, is_wknd_fullday,
-                       arrival_act_h, departure_act_h)
-    if vrows:
-        layers.append(
-            alt.Chart(pd.DataFrame(vrows))
-            .mark_rule(strokeDash=[4, 2], opacity=0.65)
-            .encode(x='x:Q',
-                    color=alt.Color('c:N', scale=None, legend=None),
-                    tooltip='lbl:N')
-        )
-
-    # 3. Power step lines — solid series
-    df_solid = df_p[df_p['series'].isin(
-        [s[0] for s in series_spec if s[3] == [1, 0]])]
-    if not df_solid.empty:
-        dom_s = df_solid['series'].unique().tolist()
-        rng_s = [df_solid[df_solid['series'] == s]['color'].iloc[0] for s in dom_s]
-        layers.append(
-            alt.Chart(df_solid).mark_line(interpolate='step-after').encode(
-                x=x_enc,
-                y=alt.Y('kW:Q', axis=alt.Axis(title='Power (kW)')),
-                color=alt.Color('series:N',
-                    scale=alt.Scale(domain=dom_s, range=rng_s),
-                    legend=alt.Legend(orient='bottom', title=None,
-                                      columns=len(dom_s), symbolStrokeWidth=2)),
-                tooltip=['series:N',
-                         alt.Tooltip('kW:Q', format='.2f'),
-                         alt.Tooltip('hour:Q', format='.1f', title='Hour')]
-            )
-        )
-
-    # 4. Dashed series (V2G, TRU)
-    df_dash = df_p[~df_p['series'].isin(
-        [s[0] for s in series_spec if s[3] == [1, 0]])]
-    if not df_dash.empty:
-        dom_d = df_dash['series'].unique().tolist()
-        rng_d = [df_dash[df_dash['series'] == s]['color'].iloc[0] for s in dom_d]
-        for i, sname in enumerate(dom_d):
-            dash_pat = next(s[3] for s in series_spec if s[0] == sname)
-            col_val  = next(s[2] for s in series_spec if s[0] == sname)
-            layers.append(
-                alt.Chart(df_dash[df_dash['series'] == sname])
-                .mark_line(interpolate='step-after', strokeDash=dash_pat)
-                .encode(
-                    x=x_enc,
-                    y=alt.Y('kW:Q'),
-                    color=alt.Color('series:N',
-                        scale=alt.Scale(domain=[sname], range=[col_val]),
-                        legend=alt.Legend(orient='bottom', title=None,
-                                          columns=1, symbolStrokeWidth=2,
-                                          symbolDash=dash_pat)),
-                    tooltip=['series:N', alt.Tooltip('kW:Q', format='.2f')]
-                )
-            )
-
-    # 5. Price line on right axis
-    price_layer = (
-        alt.Chart(df_price)
-        .mark_line(interpolate='step-after', color='#2E7D32',
-                   opacity=0.80, strokeDash=[3, 1])
-        .encode(
-            x=x_enc,
-            y=alt.Y('ct_kwh:Q',
-                    axis=alt.Axis(title='ct/kWh (all-in)',
-                                  titleColor='#2E7D32', orient='right'),
-                    scale=alt.Scale(domain=[
-                        max(0., float(buy_ct.min()) - 2.),
-                        float(buy_ct.max()) + 2.])),
-            tooltip=[alt.Tooltip('ct_kwh:Q', format='.1f', title='Price ct/kWh')]
-        )
-    )
-
-    left  = alt.layer(*layers)
-    chart = (
-        alt.layer(left, price_layer)
-        .resolve_scale(y='independent')
-        .properties(title=f'Power — Dumb vs {x_label}', height=300,
-                    background='#FAFAFA')
-        .interactive()
-    )
-    return chart
-
-
-# =============================================================================
-#  SOC CHART  (Altair — 1-minute resolution)
-# =============================================================================
-
-def make_soc_chart(v2g, hours_d, plug_d,
-                   result_A, result_X,
-                   x_label, x_key,
-                   arrival_h, departure_h,
-                   is_48h, is_wknd_fullday=False,
-                   arrival_act_h=None, departure_act_h=None):
-
-    lbl_x = result_X["label"].split("(")[0].strip()
-    x_enc, xmin, xmax, dt = _alt_x(hours_d, is_48h, is_wknd_fullday)
-
-    # Display-hour offset for window-relative t_min
-    if is_48h or is_wknd_fullday:
-        arr_h0 = 0.0
-    else:
-        idx = np.where(np.array(plug_d) > 0.5)[0]
-        arr_h0 = float(hours_d[idx[0]]) if len(idx) > 0 else float(arrival_h)
-
-    def _minsoc(result):
-        E0  = result['E_init_pct'] * v2g.usable_capacity_kWh / 100.0
-        Pc, Pd = result['Pc_w'], result['Pd_w']
-        if len(Pc) == 0:
-            return np.array([arr_h0]), np.array([result['E_init_pct']])
-        t_m, _, _, soc_p = expand_to_minutes(v2g, np.asarray(Pc), np.asarray(Pd), E0)
-        return arr_h0 + t_m, soc_p
-
-    t_A, s_A = _minsoc(result_A)
-    t_X, s_X = _minsoc(result_X)
-
-    # Downsample to every 2 min (keeps ~400 pts per series for 14h overnight)
-    STEP = 2
-    rows = []
-    for i in range(0, len(t_A), STEP):
-        rows.append({'hour': float(t_A[i]), 'SoC': float(s_A[i]), 'series': 'A - Dumb'})
-    for i in range(0, len(t_X), STEP):
-        rows.append({'hour': float(t_X[i]), 'SoC': float(s_X[i]), 'series': lbl_x})
-    df_soc = pd.DataFrame(rows)
-
-    layers = []
+    layers =[]
 
     # 1. Gold plug-in shading
     plug_r = _plug_rects(hours_d, plug_d, dt)
@@ -409,48 +321,154 @@ def make_soc_chart(v2g, hours_d, plug_d,
         layers.append(
             alt.Chart(pd.DataFrame(vrows))
             .mark_rule(strokeDash=[4, 2], opacity=0.65)
-            .encode(x='x:Q',
-                    color=alt.Color('c:N', scale=None, legend=None),
-                    tooltip='lbl:N')
+            .encode(x='x:Q', color=alt.Color('c:N', scale=None, legend=None), tooltip='lbl:N')
+        )
+
+    # 3. Solid lines
+    solid_series =['A - Dumb', f'{lbl_x}']
+    df_solid = df_p[df_p['series'].isin(solid_series)]
+    if not df_solid.empty:
+        dom_s = df_solid['series'].unique().tolist()
+        rng_s = [series_props[s]['color'] for s in dom_s]
+        layers.append(
+            alt.Chart(df_solid).mark_line(interpolate='step-after').encode(
+                x=x_enc,
+                y=alt.Y('kW:Q', axis=alt.Axis(title='Power (kW)')),
+                color=alt.Color('series:N',
+                    scale=alt.Scale(domain=dom_s, range=rng_s),
+                    legend=alt.Legend(orient='bottom', title=None, columns=len(dom_s), symbolStrokeWidth=2)),
+                tooltip=['series:N', alt.Tooltip('kW:Q', format='.2f'), alt.Tooltip('hour:Q', format='.2f', title='Hour')]
+            )
+        )
+
+    # 4. Dashed lines
+    dash_series = [s for s in df_p['series'].unique() if s not in solid_series]
+    if dash_series:
+        for sname in dash_series:
+            col_val  = series_props[sname]['color']
+            dash_pat = series_props[sname]['dash']
+            layers.append(
+                alt.Chart(df_p[df_p['series'] == sname])
+                .mark_line(interpolate='step-after', strokeDash=dash_pat)
+                .encode(
+                    x=x_enc,
+                    y=alt.Y('kW:Q'),
+                    color=alt.Color('series:N',
+                        scale=alt.Scale(domain=[sname], range=[col_val]),
+                        legend=alt.Legend(orient='bottom', title=None, columns=1, symbolStrokeWidth=2, symbolDash=dash_pat)),
+                    tooltip=['series:N', alt.Tooltip('kW:Q', format='.2f'), alt.Tooltip('hour:Q', format='.2f', title='Hour')]
+                )
+            )
+
+    # 5. Price line
+    price_layer = (
+        alt.Chart(df_price)
+        .mark_line(interpolate='step-after', color='#2E7D32', opacity=0.80, strokeDash=[3, 1])
+        .encode(
+            x=x_enc,
+            y=alt.Y('ct_kwh:Q', axis=alt.Axis(title='ct/kWh (all-in)', titleColor='#2E7D32', orient='right'),
+                    scale=alt.Scale(domain=[max(0., float(buy_ct.min()) - 2.), float(buy_ct.max()) + 2.])),
+            tooltip=[alt.Tooltip('ct_kwh:Q', format='.1f', title='Price ct/kWh')]
+        )
+    )
+
+    left  = alt.layer(*layers)
+    chart = (
+        alt.layer(left, price_layer)
+        .resolve_scale(y='independent')
+        .properties(title=f'Power — Dumb vs {x_label}', height=300, background='#FAFAFA')
+        .interactive()
+    )
+    return chart
+
+
+# =============================================================================
+#  SOC CHART  (Altair — minute resolution)
+# =============================================================================
+
+def make_soc_chart(v2g, hours_d, plug_d,
+                   result_A, result_X,
+                   x_label, x_key,
+                   arrival_h, departure_h,
+                   is_48h, is_wknd_fullday=False,
+                   arrival_act_h=None, departure_act_h=None):
+
+    lbl_x = result_X["label"].split("(")[0].strip()
+    x_enc, xmin, xmax, dt = _alt_x(hours_d, is_48h, is_wknd_fullday)
+
+    if is_48h or is_wknd_fullday:
+        arr_h0 = 0.0
+    else:
+        idx = np.where(np.array(plug_d) > 0.5)[0]
+        arr_h0 = float(hours_d[idx[0]]) if len(idx) > 0 else float(arrival_h)
+
+    def _minsoc(result):
+        E0  = result['E_init_pct'] * v2g.usable_capacity_kWh / 100.0
+        Pc, Pd = result['Pc_w'], result['Pd_w']
+        tru = result.get('tru_w', None)  # Fetch the TRU trace needed for max-power estimation
+        if len(Pc) == 0:
+            return np.array([arr_h0]), np.array([result['E_init_pct']])
+        t_m, _, _, soc_p = expand_to_minutes(v2g, np.asarray(Pc), np.asarray(Pd), E0, tru)
+        return arr_h0 + t_m, soc_p
+
+    t_A, s_A = _minsoc(result_A)
+    t_X, s_X = _minsoc(result_X)
+
+    STEP = 2
+    rows =[]
+    for i in range(0, len(t_A), STEP):
+        rows.append({'hour': float(t_A[i]), 'SoC': float(s_A[i]), 'series': 'A - Dumb'})
+    for i in range(0, len(t_X), STEP):
+        rows.append({'hour': float(t_X[i]), 'SoC': float(s_X[i]), 'series': lbl_x})
+    df_soc = pd.DataFrame(rows)
+
+    layers =[]
+
+    # 1. Gold plug-in shading
+    plug_r = _plug_rects(hours_d, plug_d, dt)
+    if plug_r:
+        layers.append(
+            alt.Chart(pd.DataFrame(plug_r))
+            .mark_rect(color='gold', opacity=0.18)
+            .encode(x=alt.X('x:Q', scale=alt.Scale(domain=[xmin, xmax])), x2='x2:Q')
+        )
+
+    # 2. Vertical rules
+    vrows = _vrow_data(arrival_h, departure_h, is_48h, is_wknd_fullday,
+                       arrival_act_h, departure_act_h)
+    if vrows:
+        layers.append(
+            alt.Chart(pd.DataFrame(vrows))
+            .mark_rule(strokeDash=[4, 2], opacity=0.65)
+            .encode(x='x:Q', color=alt.Color('c:N', scale=None, legend=None), tooltip='lbl:N')
         )
 
     # 3. SoC lines
     layers.append(
         alt.Chart(df_soc).mark_line().encode(
             x=x_enc,
-            y=alt.Y('SoC:Q',
-                    scale=alt.Scale(domain=[0, 115]),
-                    axis=alt.Axis(title='SoC (%)')),
+            y=alt.Y('SoC:Q', scale=alt.Scale(domain=[0, 115]), axis=alt.Axis(title='SoC (%)')),
             color=alt.Color('series:N',
-                scale=alt.Scale(domain=['A - Dumb', lbl_x],
-                                range=[SC_COL['A'], SC_COL[x_key]]),
-                legend=alt.Legend(orient='bottom', title=None,
-                                  columns=3, symbolStrokeWidth=2)),
-            tooltip=['series:N',
-                     alt.Tooltip('SoC:Q', format='.1f'),
-                     alt.Tooltip('hour:Q', format='.2f', title='Hour')]
+                scale=alt.Scale(domain=['A - Dumb', lbl_x], range=[SC_COL['A'], SC_COL[x_key]]),
+                legend=alt.Legend(orient='bottom', title=None, columns=3, symbolStrokeWidth=2)),
+            tooltip=['series:N', alt.Tooltip('SoC:Q', format='.1f'), alt.Tooltip('hour:Q', format='.2f', title='Hour')]
         )
     )
 
-    # 4. Floor and departure-target reference lines
+    # 4. Reference lines
     ref_df = pd.DataFrame([
-        {'y': v2g.soc_min_pct,       'c': '#C62828',
-         'lbl': f'SoC floor {v2g.soc_min_pct:.0f}%'},
-        {'y': v2g.soc_departure_pct, 'c': '#0D47A1',
-         'lbl': f'Departure target {v2g.soc_departure_pct:.0f}%'},
+        {'y': v2g.soc_min_pct,       'c': '#C62828', 'lbl': f'SoC floor {v2g.soc_min_pct:.0f}%'},
+        {'y': v2g.soc_departure_pct, 'c': '#0D47A1', 'lbl': f'Departure target {v2g.soc_departure_pct:.0f}%'},
     ])
     layers.append(
         alt.Chart(ref_df)
         .mark_rule(strokeDash=[4, 2], opacity=0.80)
-        .encode(y='y:Q',
-                color=alt.Color('c:N', scale=None, legend=None),
-                tooltip='lbl:N')
+        .encode(y='y:Q', color=alt.Color('c:N', scale=None, legend=None), tooltip='lbl:N')
     )
 
     chart = (
         alt.layer(*layers)
-        .properties(title=f'SoC (1-min resolution) — Dumb vs {x_label}',
-                    height=300, background='#FAFAFA')
+        .properties(title=f'SoC (1-min resolution) — Dumb vs {x_label}', height=300, background='#FAFAFA')
         .interactive()
     )
     return chart

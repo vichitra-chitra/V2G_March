@@ -259,41 +259,58 @@ def soc_ramp(hours, soc_pct, init_pct):
 #  6b. MINUTE-RESOLUTION EXPANDER
 # =============================================================================
 
-def expand_to_minutes(v2g, Pc_w, Pd_w, E_init):
+def expand_to_minutes(v2g, Pc_w, Pd_w, E_init, tru_w=None):
     """
     Expand hourly window arrays (length W) to minute resolution (length W×60).
-
-    Strategy:
-      - Pc_min, Pd_min : each hourly value repeated 60× (step-hold within hour)
-      - soc_pct        : re-integrated minute-by-minute from E_init using
-                         dt = 1/60 h, so SoC ramps smoothly within each hour
-                         rather than jumping. Clipped to [E_min, E_max].
-
-    Returns
-    -------
-    t_min   : np.ndarray shape (W*60,)  — time in hours from window start
-    Pc_min  : np.ndarray shape (W*60,)  — charge power (kW)
-    Pd_min  : np.ndarray shape (W*60,)  — discharge power (kW)
-    soc_pct : np.ndarray shape (W*60,)  — SoC in %
+    Compresses energy to max possible power at the start of each hour.
     """
     W    = len(Pc_w)
     N    = W * 60
-    dt_m = 1.0 / 60.0                      # 1 minute expressed in hours
+    dt_m = 1.0 / 60.0                      
 
-    Pc_min = np.repeat(Pc_w.astype(float), 60)
-    Pd_min = np.repeat(Pd_w.astype(float), 60)
-
+    Pc_min = np.zeros(N)
+    Pd_min = np.zeros(N)
     soc_kwh = np.empty(N)
     s = float(E_init)
-    for i in range(N):
-        s = float(np.clip(
-            s + Pc_min[i] * v2g.eta_charge  * dt_m
-              - Pd_min[i] / v2g.eta_discharge * dt_m,
-            v2g.E_min, v2g.E_max,
-        ))
-        soc_kwh[i] = s
+    
+    for i in range(W):
+        # Maximum available charging power (constrained by TRU if present)
+        p_max_c = v2g.charge_power_kW
+        if tru_w is not None and i < len(tru_w):
+            p_max_c = max(0.0, v2g.charge_power_kW - tru_w[i])
+        p_max_d = v2g.discharge_power_kW
 
-    t_min   = np.arange(N, dtype=float) * dt_m   # 0, 1/60, 2/60, …
+        # Total Energy to transfer in this hour (kWh)
+        E_c_rem = Pc_w[i] * v2g.dt_h
+        E_d_rem = Pd_w[i] * v2g.dt_h
+
+        for m in range(60):
+            idx = i * 60 + m
+            
+            # 1-minute energy capacity at max power
+            e_cap_c = p_max_c * dt_m
+            e_cap_d = p_max_d * dt_m
+            
+            # Charge at max power until energy for this hour is depleted
+            if E_c_rem > 1e-6:
+                charge_e = min(E_c_rem, e_cap_c)
+                Pc_min[idx] = charge_e / dt_m
+                E_c_rem -= charge_e
+            # Discharge at max power until energy for this hour is depleted
+            elif E_d_rem > 1e-6:
+                discharge_e = min(E_d_rem, e_cap_d)
+                Pd_min[idx] = discharge_e / dt_m
+                E_d_rem -= discharge_e
+
+            # Update SoC min by min
+            s = float(np.clip(
+                s + Pc_min[idx] * v2g.eta_charge * dt_m
+                  - Pd_min[idx] / v2g.eta_discharge * dt_m,
+                v2g.E_min, v2g.E_max,
+            ))
+            soc_kwh[idx] = s
+
+    t_min   = np.arange(N, dtype=float) * dt_m   
     soc_pct = soc_kwh * 100.0 / v2g.usable_capacity_kWh
     return t_min, Pc_min, Pd_min, soc_pct
 
@@ -560,6 +577,7 @@ def make_kpi(label, v2g, Pc_w, Pd_w, soc_w, buy_w, v2gp_w, E_init_kwh,
         "Pc_w"        : Pc_w,
         "Pd_w"        : Pd_w,
         "soc_w_kwh"   : soc_w,
+        "tru_w"       : tru_w,
         "net_cost"    : chg - rev,
         "charge_cost" : chg,
         "v2g_rev"     : rev,
