@@ -487,10 +487,9 @@ def render_season_block(v2g, season_title, color_hex,
         unsafe_allow_html=True
     )
 
-    col_pow, col_soc = st.columns(2)
-
-    with col_pow:
-        for result_X, x_label, x_key in comparisons:
+    for result_X, x_label, x_key in comparisons:
+        col_pow, col_soc = st.columns(2)
+        with col_pow:
             chart = make_power_chart(
                 v2g, hours_d, buy_d, plug_d,
                 result_A, result_X, x_label, x_key,
@@ -498,16 +497,15 @@ def render_season_block(v2g, season_title, color_hex,
                 fixed_net_ct=fixed_net_ct, vat_rate=vat_rate,
                 arrival_act_h=arrival_act_h, departure_act_h=departure_act_h,
             )
-        st.altair_chart(chart, use_container_width=True)
-
-    with col_soc:
-        chart = make_soc_chart(
+            st.altair_chart(chart, use_container_width=True)
+        with col_soc:
+            chart = make_soc_chart(
                 v2g, hours_d, plug_d,
                 result_A, result_X, x_label, x_key,
                 arrival_h, departure_h, is_48h, is_wknd_fullday,
                 arrival_act_h=arrival_act_h, departure_act_h=departure_act_h,
             )
-        st.altair_chart(chart, use_container_width=True)
+            st.altair_chart(chart, use_container_width=True)
 
 # =============================================================================
 #  CACHED DATA LOADERS
