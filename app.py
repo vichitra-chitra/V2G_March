@@ -1627,7 +1627,7 @@ if abs(arrival_dev_h) > 1e-12 or abs(departure_dev_h) > 1e-12:
 # =============================================================================
 #  ANNUAL GRAPHS
 # =============================================================================
-
+'''
 def make_annual_graphs(annual_data):
     """3 side-by-side bar charts: Charge Cost | V2G Revenue | Net Cost."""
     sc_list  = annual_data["scenarios"]   # ["F","A", ...]
@@ -1702,7 +1702,7 @@ def make_annual_graphs(annual_data):
 
             plt.tight_layout(pad=0.8)
             st.image(fig_to_buf(fig), use_container_width=True)
-
+'''
 
 # =============================================================================
 #  KPI TABLE HELPER
@@ -1946,7 +1946,7 @@ else:
                     _v2g_double_ct, _v2g_exempt_ct, _vat_fut_rate,
                     fixed_price,
                 )
-                make_annual_graphs(annual_data)
+#                make_annual_graphs(annual_data)
             except Exception as e:
                 st.warning(f"Annual computation error: {e}")
         st.markdown("---")

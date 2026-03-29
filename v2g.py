@@ -592,11 +592,19 @@ def run_D_mpc(v2g, buy_w, v2gp_w, E_init, tru_w=None,
 # =============================================================================
 
 def make_kpi(label, v2g, Pc_w, Pd_w, soc_w, buy_w, v2gp_w, E_init_kwh,
-             arr_disp=None, dep_disp=None, is_weekend_48=False, tru_w=None):
-    dt       = v2g.dt_h
-    chg      = float(np.sum(Pc_w * buy_w)  * dt)
-    rev      = float(np.sum(Pd_w * v2gp_w) * dt)
-    tru_cost = float(np.sum(tru_w * buy_w) * dt) if tru_w is not None else 0.0
+             arr_disp=None, dep_disp=None, is_weekend_48=False, tru_w=None,
+             dumb_cost=None):
+    dt = v2g.dt_h
+    
+    # 1. Explicitly calculate kWh per slot first
+    charge_kwh_per_slot    = Pc_w * dt
+    discharge_kwh_per_slot = Pd_w * dt
+    tru_kwh_per_slot       = (tru_w * dt) if tru_w is not None else np.zeros_like(Pc_w)
+
+    # 2. Multiply kWh by the exact price of that specific slot (Point 1)
+    chg      = float(np.sum(charge_kwh_per_slot * buy_w))
+    rev      = float(np.sum(discharge_kwh_per_slot * v2gp_w))
+    tru_cost = float(np.sum(tru_kwh_per_slot * buy_w))
 
     if is_weekend_48:
         pct   = 100.0 / v2g.usable_capacity_kWh
@@ -606,6 +614,14 @@ def make_kpi(label, v2g, Pc_w, Pd_w, soc_w, buy_w, v2gp_w, E_init_kwh,
     else:
         Pc_d, Pd_d, soc_d = to_display_wd(v2g, Pc_w, Pd_w, soc_w,
                                            arr_disp, dep_disp, E_init_kwh)
+
+    # 3. Calculate True V2G Profit/Revenue vs Dumb Charging (Point 2)
+    # The mathematical savings of V2G = Dumb Cost - (Smart Charge Cost - Smart Discharge Rev)
+    if dumb_cost is not None:
+        v2g_profit_vs_dumb = dumb_cost - (chg - rev)
+    else:
+        v2g_profit_vs_dumb = 0.0
+
     return {
         "label"       : label,
         "Pc_d"        : Pc_d,
@@ -617,11 +633,12 @@ def make_kpi(label, v2g, Pc_w, Pd_w, soc_w, buy_w, v2gp_w, E_init_kwh,
         "tru_w"       : tru_w,
         "net_cost"    : chg - rev,
         "charge_cost" : chg,
-        "v2g_rev"     : rev,
+        "v2g_rev"     : rev,                 # Gross revenue strictly from discharging
+        "v2g_profit"  : v2g_profit_vs_dumb,  # Net benefit compared to Dumb charging
         "tru_cost"    : tru_cost,
         "total_cost"  : chg - rev + tru_cost,
-        "v2g_kwh"     : float(np.sum(Pd_w) * dt),
-        "charge_kwh"  : float(np.sum(Pc_w) * dt),
+        "v2g_kwh"     : float(np.sum(discharge_kwh_per_slot)),
+        "charge_kwh"  : float(np.sum(charge_kwh_per_slot)),
         "E_init_pct"  : E_init_kwh * 100.0 / v2g.usable_capacity_kWh,
     }
 
@@ -944,20 +961,33 @@ def main():
         print(f"    Running simulation for {len(daily_profiles)} individual days... (this may take a few seconds)")
         
         # 2. Loop through each day and run the algorithms
-        for buy in daily_profiles:
-            v2gp = buy.copy()
-            buy_w = buy[win]
-            v2gp_w = v2gp[win]
+    for buy in daily_profiles:
+        win, arr, dep, W = get_wd_window(v2g, arrival_h, departure_h)
+        
+        # 1. Get raw day-ahead spot price for the window
+        spot_price_w = buy[win] 
 
-            # Run Dumb for this specific day
-            Pc_A, Pd_A, soc_A = run_A_dumb(v2g, buy_w, v2gp_w, W, E_init)
-            A = make_kpi("A - Dumb", v2g, Pc_A, Pd_A, soc_A, buy_w, v2gp_w, E_init, arr, dep)
-            kpis_A_list.append(A)
-            
-            # Run MILP for this specific day
-            Pc_C, Pd_C, soc_C = run_C_milp(v2g, buy_w, v2gp_w, E_init)
-            C = make_kpi("C - MILP", v2g, Pc_C, Pd_C, soc_C, buy_w, v2gp_w, E_init, arr, dep)
-            kpis_C_list.append(C)
+        # 2. BUYING PRICE: Spot Price + all taxes and levies (using your existing function)
+        buy_w = compose_all_in_price(spot_price_w, tariff=GERMAN_TARIFF)
+
+        # 3. DISCHARGING PRICE (V2G): Spot price + future export levies
+        # If future scenarios neglect/remove levies, it's just the spot price:
+        v2gp_w = spot_price_w  
+        # Note: If your GUI allows user input for export levies, add them here:
+        # v2gp_w = spot_price_w + (user_export_fee_ct / 100.0)
+
+        # --- RUN DUMB ALGORITHM ---
+        Pc_A, Pd_A, soc_A = run_A_dumb(v2g, buy_w, v2gp_w, W, E_init)
+        # Note dumb_cost=None here because this IS the dumb benchmark
+        A = make_kpi("A - Dumb", v2g, Pc_A, Pd_A, soc_A, buy_w, v2gp_w, E_init, arr, dep)
+        dumb_net_cost = A["net_cost"]
+        kpis_A_list.append(A)
+        
+        # --- RUN SMART / MILP ALGORITHM ---
+        Pc_C, Pd_C, soc_C = run_C_milp(v2g, buy_w, v2gp_w, E_init)
+        # Pass the dumb_net_cost into the function to calculate the actual comparative V2G profit
+        C = make_kpi("C - MILP", v2g, Pc_C, Pd_C, soc_C, buy_w, v2gp_w, E_init, arr, dep, dumb_cost=dumb_net_cost)
+        kpis_C_list.append(C)
             
         # 3. Average the results across all days to get the final Daily KPIs
         A_avg = average_kpis(kpis_A_list)
