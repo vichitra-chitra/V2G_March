@@ -200,6 +200,43 @@ def load_avg_profile(csv_path, months, is_weekend):
         raise ValueError(f"Expected 24 slots, got {len(profile)}")
     return _passthrough_profile(profile)
 
+def get_daily_profiles(csv_path, months, is_weekend):
+    """Returns a list of 24-hour price arrays, one for each actual day matching the criteria."""
+    df = _load_csv_raw(csv_path)
+    mask = df["month"].isin(months) & (df["is_weekend"] == is_weekend)
+    sub = df[mask]
+    
+    days =[]
+    # Group by exact date to get daily profiles
+    for date, group in sub.groupby("date"):
+        if len(group) == 24: # Ensure the day has full 24 hours of data
+            profile = group.sort_values("slot")["price"].values
+            days.append(_passthrough_profile(profile))
+    return days
+
+def average_kpis(kpi_list):
+    """Averages a list of daily KPI dictionaries into a single representative KPI dictionary."""
+    if not kpi_list:
+        return None
+    n = len(kpi_list)
+    avg_kpi = {}
+    
+    # Iterate through all keys in the KPI dictionary
+    for key in kpi_list[0].keys():
+        val = kpi_list[0][key]
+        if key == "label":
+            avg_kpi[key] = val
+        elif val is None:
+            avg_kpi[key] = None
+        elif isinstance(val, (int, float, np.number)):
+            # Average the monetary/energy costs
+            avg_kpi[key] = float(sum(k[key] for k in kpi_list) / n)
+        elif isinstance(val, np.ndarray):
+            # Average the power/SoC arrays for smooth charting
+            avg_kpi[key] = np.mean([k[key] for k in kpi_list], axis=0)
+        else:
+            avg_kpi[key] = val
+    return avg_kpi
 
 # =============================================================================
 #  6. WINDOW + DISPLAY HELPERS
@@ -884,27 +921,53 @@ def main():
     print("\n  Loading prices ...")
     _load_csv_raw(csv_path)
 
-    for season, months, soc_pct in [
+    for season, months, soc_pct in[
         ("Winter Weekday", WINTER_M, soc_winter_pct),
         ("Summer Weekday", SUMMER_M, soc_summer_pct),
     ]:
         print(f"\n  -- {season} --")
-        buy   = load_avg_profile(csv_path, months, False)
-        v2gp  = buy.copy()
+        
+        # 1. Get ALL individual days instead of an average day
+        daily_profiles = get_daily_profiles(csv_path, months, is_weekend=False)
+        
+        if not daily_profiles:
+            print("    No data found for this period.")
+            continue
+            
         win, arr, dep, W = get_wd_window(v2g, arrival_h, departure_h)
-        buy_w = buy[win]
-        v2gp_w = v2gp[win]
         E_init = v2g.usable_capacity_kWh * soc_pct / 100.0
+        
+        # Initialize lists to hold the KPIs for every single day
+        kpis_A_list = []
+        kpis_C_list =[]
+        
+        print(f"    Running simulation for {len(daily_profiles)} individual days... (this may take a few seconds)")
+        
+        # 2. Loop through each day and run the algorithms
+        for buy in daily_profiles:
+            v2gp = buy.copy()
+            buy_w = buy[win]
+            v2gp_w = v2gp[win]
 
-        Pc,Pd,soc = run_A_dumb(v2g, buy_w, v2gp_w, W, E_init)
-        A = make_kpi("A - Dumb", v2g, Pc, Pd, soc, buy_w, v2gp_w, E_init, arr, dep)
-        Pc,Pd,soc = run_C_milp(v2g, buy_w, v2gp_w, E_init)
-        C = make_kpi("C - MILP", v2g, Pc, Pd, soc, buy_w, v2gp_w, E_init, arr, dep)
+            # Run Dumb for this specific day
+            Pc_A, Pd_A, soc_A = run_A_dumb(v2g, buy_w, v2gp_w, W, E_init)
+            A = make_kpi("A - Dumb", v2g, Pc_A, Pd_A, soc_A, buy_w, v2gp_w, E_init, arr, dep)
+            kpis_A_list.append(A)
+            
+            # Run MILP for this specific day
+            Pc_C, Pd_C, soc_C = run_C_milp(v2g, buy_w, v2gp_w, E_init)
+            C = make_kpi("C - MILP", v2g, Pc_C, Pd_C, soc_C, buy_w, v2gp_w, E_init, arr, dep)
+            kpis_C_list.append(C)
+            
+        # 3. Average the results across all days to get the final Daily KPIs
+        A_avg = average_kpis(kpis_A_list)
+        C_avg = average_kpis(kpis_C_list)
 
-        print(f"    Dumb  net cost: EUR {A['net_cost']:.4f}/day")
-        print(f"    MILP  net cost: EUR {C['net_cost']:.4f}/day")
-        print(f"    V2G revenue  : EUR {C['v2g_rev']:.4f}/day")
-        print(f"    Savings/year : EUR {(A['net_cost']-C['net_cost'])*365:+,.0f}")
+        # 4. Print true averaged costs
+        print(f"    Dumb  net cost: EUR {A_avg['net_cost']:.4f}/day")
+        print(f"    MILP  net cost: EUR {C_avg['net_cost']:.4f}/day")
+        print(f"    V2G revenue   : EUR {C_avg['v2g_rev']:.4f}/day")
+        print(f"    Savings/year  : EUR {(A_avg['net_cost'] - C_avg['net_cost']) * 365:+,.0f}")
 
 
 if __name__ == "__main__":
