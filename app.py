@@ -1627,8 +1627,8 @@ if abs(arrival_dev_h) > 1e-12 or abs(departure_dev_h) > 1e-12:
 # =============================================================================
 #  ANNUAL GRAPHS
 # =============================================================================
-'''
 def make_annual_graphs(annual_data):
+    return
     """3 side-by-side bar charts: Charge Cost | V2G Revenue | Net Cost."""
     sc_list  = annual_data["scenarios"]   # ["F","A", ...]
     n_days   = annual_data["n_days"]
@@ -1702,7 +1702,6 @@ def make_annual_graphs(annual_data):
 
             plt.tight_layout(pad=0.8)
             st.image(fig_to_buf(fig), use_container_width=True)
-'''
 
 # =============================================================================
 #  KPI TABLE HELPER
