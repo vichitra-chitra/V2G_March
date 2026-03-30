@@ -1218,6 +1218,12 @@ def render_input_panel():
             )
             cfg["mode"] = mode
 
+            cfg["fixed_price"] = st.number_input(
+                "Fixed price (EUR/kWh)",
+                value=float(cfg["fixed_price"]),
+                min_value=0.05, max_value=1.0, step=0.01,
+                help="Fixed-tariff benchmark baseline.")
+
             if mode == "Specific Date":
                 date_val = st.date_input(
                     "Select date (2025)",
@@ -1246,37 +1252,15 @@ def render_input_panel():
                 key="form_do_swe")
 
             st.markdown("---")
-            st.markdown("**S.KOe COOL specs**")
-            st.caption("70 kWh total / 60 kWh usable")
-            st.caption("22 kW AC bidirectional OBC")
-            st.caption("Cold-chain floor: SoC >= 20%")
-
-            st.markdown("---")
-            st.markdown("##### Benchmark & Future V2G")
-            _fa, _fb = st.columns(2)
-            with _fa:
-                cfg["fixed_price"] = st.number_input(
-                    "Fixed price\n(EUR/kWh)",
-                    value=float(cfg["fixed_price"]),
-                    min_value=0.05, max_value=1.0, step=0.01,
-                    help="Fixed-tariff benchmark baseline.")
-            with _fb:
-                st.write("")  # spacer
-            _fc, _fd = st.columns(2)
-            with _fc:
-                cfg["fut_network_fee_ct"] = st.number_input(
-                    "Network fee\nexempt (ct/kWh)",
-                    value=float(cfg.get("fut_network_fee_ct", 6.63)),
-                    min_value=0.0, max_value=15.0, step=0.01, format="%.3f")
-            with _fd:
-                cfg["fut_elec_tax_ct"] = st.number_input(
-                    "Elec. tax\nexempt (ct/kWh)",
-                    value=float(cfg.get("fut_elec_tax_ct", 2.05)),
-                    min_value=0.0, max_value=10.0, step=0.01, format="%.3f")
-            st.caption(
-                "⚠️ Concession (1.992), Offshore (0.941), "
-                "CHP/KWKG (0.446) and NEV-19 (1.559) ct/kWh are "
-                "**not** recoverable under MiSpeL and excluded from V2G revenue.")
+            st.markdown("##### Future V2G charges")
+            cfg["fut_network_fee_ct"] = st.number_input(
+                "Network fee exempt (ct/kWh)",
+                value=float(cfg.get("fut_network_fee_ct", 6.63)),
+                min_value=0.0, max_value=15.0, step=0.01, format="%.3f")
+            cfg["fut_elec_tax_ct"] = st.number_input(
+                "Elec. tax exempt (ct/kWh)",
+                value=float(cfg.get("fut_elec_tax_ct", 2.05)),
+                min_value=0.0, max_value=10.0, step=0.01, format="%.3f")
 
             # ── ADD THIS block inside the st.form, just before the Submit button ─────
         # ── System Parameters (read-only reference) ──────────────────────
