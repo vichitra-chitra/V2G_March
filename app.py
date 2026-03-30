@@ -1129,51 +1129,6 @@ def render_input_panel():
             "MPC adapts to the actual schedule."
             )
 
-        st.markdown("##### Analysis Mode")
-        mode = st.radio(
-                "Price data source",
-                ["Seasonal Average", "Specific Date"],
-                index=0 if cfg.get("mode", "Seasonal Average") == "Seasonal Average" else 1,
-                help=(
-                    "**Seasonal Average:** Average prices of full 2025.\n\n"
-                    "**Specific Date:** Actual prices for that exact date."
-                )
-            )
-        cfg["mode"] = mode
-
-        if mode == "Specific Date":
-                date_val = st.date_input(
-                    "Select date (2025)",
-                    value=pd.Timestamp(cfg.get("specific_date", "2025-01-15")),
-                    min_value=pd.Timestamp("2025-01-01"),
-                    max_value=pd.Timestamp("2025-12-31"),
-                )
-                cfg["specific_date"] = str(date_val)
-                ts_sel  = pd.Timestamp(date_val)
-                dow_sel = ts_sel.dayofweek
-                mth_sel = ts_sel.month
-                st.caption(
-                    f"**{date_val.strftime('%A, %d %B %Y')}**  |  "
-                    f"{'Weekend — full 24h' if dow_sel >= 5 else 'Weekday — overnight window'}  |  "
-                    f"{'Winter' if mth_sel in WINTER_M else 'Summer'}"
-                )
-
-        st.markdown("##### Fixed-Tariff Benchmark")
-        cfg["fixed_price"] = st.number_input(
-                "Fixed price (EUR/kWh)",
-                value=float(cfg["fixed_price"]),
-                min_value=0.05, max_value=1.0, step=0.01,
-                help="Comparison baseline only.")
-
-        st.markdown("##### 🔮 Future Scenario — V2G Exempt Fees (MiSpeL)")
-        cfg["fut_network_fee_ct"] = st.number_input("Network fee exempt (ct/kWh)", value=float(cfg.get("fut_network_fee_ct", 6.63)),
-                                                    min_value=0.0, max_value=15.0, step=0.01, format="%.3f")
-        cfg["fut_elec_tax_ct"] = st.number_input("Electricity tax exempt (ct/kWh)", value=float(cfg.get("fut_elec_tax_ct", 2.05)),
-                                                 min_value=0.0, max_value=10.0, step=0.01, format="%.3f")
-        st.caption("⚠️ Concession (1.992), Offshore (0.941), CHP/KWKG (0.446) and NEV-19 (1.559) ct/kWh "
-                   "are **not** recoverable under current MiSpeL proposal and are excluded from V2G revenue."
-)
-
         with c2:
             st.subheader("State of Charge")
             cfg["soc_winter"]    = st.slider(
@@ -1251,6 +1206,35 @@ def render_input_panel():
                     f"Charging headroom: **{max(0, 22 - avg_kw):.1f} -- 22 kW**"
                 )
 
+            st.markdown("##### Analysis Mode")
+            mode = st.radio(
+                "Price data source",
+                ["Seasonal Average", "Specific Date"],
+                index=0 if cfg.get("mode", "Seasonal Average") == "Seasonal Average" else 1,
+                help=(
+                    "**Seasonal Average:** Average prices of full 2025.\n\n"
+                    "**Specific Date:** Actual prices for that exact date."
+                )
+            )
+            cfg["mode"] = mode
+
+            if mode == "Specific Date":
+                date_val = st.date_input(
+                    "Select date (2025)",
+                    value=pd.Timestamp(cfg.get("specific_date", "2025-01-15")),
+                    min_value=pd.Timestamp("2025-01-01"),
+                    max_value=pd.Timestamp("2025-12-31"),
+                )
+                cfg["specific_date"] = str(date_val)
+                ts_sel  = pd.Timestamp(date_val)
+                dow_sel = ts_sel.dayofweek
+                mth_sel = ts_sel.month
+                st.caption(
+                    f"**{date_val.strftime('%A, %d %B %Y')}**  |  "
+                    f"{'Weekend — full 24h' if dow_sel >= 5 else 'Weekday — overnight window'}  |  "
+                    f"{'Winter' if mth_sel in WINTER_M else 'Summer'}"
+                )
+
         with c4:
             st.subheader("Extras")
             cfg["do_wwe"] = st.checkbox(
@@ -1266,6 +1250,33 @@ def render_input_panel():
             st.caption("70 kWh total / 60 kWh usable")
             st.caption("22 kW AC bidirectional OBC")
             st.caption("Cold-chain floor: SoC >= 20%")
+
+            st.markdown("---")
+            st.markdown("##### Benchmark & Future V2G")
+            _fa, _fb = st.columns(2)
+            with _fa:
+                cfg["fixed_price"] = st.number_input(
+                    "Fixed price\n(EUR/kWh)",
+                    value=float(cfg["fixed_price"]),
+                    min_value=0.05, max_value=1.0, step=0.01,
+                    help="Fixed-tariff benchmark baseline.")
+            with _fb:
+                st.write("")  # spacer
+            _fc, _fd = st.columns(2)
+            with _fc:
+                cfg["fut_network_fee_ct"] = st.number_input(
+                    "Network fee\nexempt (ct/kWh)",
+                    value=float(cfg.get("fut_network_fee_ct", 6.63)),
+                    min_value=0.0, max_value=15.0, step=0.01, format="%.3f")
+            with _fd:
+                cfg["fut_elec_tax_ct"] = st.number_input(
+                    "Elec. tax\nexempt (ct/kWh)",
+                    value=float(cfg.get("fut_elec_tax_ct", 2.05)),
+                    min_value=0.0, max_value=10.0, step=0.01, format="%.3f")
+            st.caption(
+                "⚠️ Concession (1.992), Offshore (0.941), "
+                "CHP/KWKG (0.446) and NEV-19 (1.559) ct/kWh are "
+                "**not** recoverable under MiSpeL and excluded from V2G revenue.")
 
             # ── ADD THIS block inside the st.form, just before the Submit button ─────
         # ── System Parameters (read-only reference) ──────────────────────
