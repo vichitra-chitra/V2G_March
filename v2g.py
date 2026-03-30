@@ -898,7 +898,6 @@ def plot_price_profiles(csv_path, out):
     if isinstance(out, str):
         print(f"  Saved -> {out}")
 
-
 # =============================================================================
 #  13. MAIN  (command-line use only)
 # =============================================================================
@@ -910,7 +909,7 @@ def main():
     print("="*65)
 
     csv_path = next(
-        (str(p) for p in [
+        (str(p) for p in[
             Path(__file__).parent / "2025_Electricity_Price.csv",
             Path("2025_Electricity_Price.csv"),
         ] if p.exists()), None)
@@ -960,36 +959,32 @@ def main():
         
         print(f"    Running simulation for {len(daily_profiles)} individual days... (this may take a few seconds)")
         
-        # 2. Loop through each day and run the algorithms
-    for buy in daily_profiles:
-        win, arr, dep, W = get_wd_window(v2g, arrival_h, departure_h)
-        
-        # 1. Get raw day-ahead spot price for the window
-        spot_price_w = buy[win] 
+        # 2. Loop through each day and run the algorithms (NOTICE THE INDENTATION HERE)
+        for buy in daily_profiles:
+            # We don't need to recalculate win, arr, dep, W here, it's the same for all days
+            
+            # 1. Get raw day-ahead spot price for the window
+            spot_price_w = buy[win] 
 
-        # 2. BUYING PRICE: Spot Price + all taxes and levies (using your existing function)
-        buy_w = compose_all_in_price(spot_price_w, tariff=GERMAN_TARIFF)
+            # 2. BUYING PRICE: Spot Price + all taxes and levies
+            buy_w = compose_all_in_price(spot_price_w, tariff=GERMAN_TARIFF)
 
-        # 3. DISCHARGING PRICE (V2G): Spot price + future export levies
-        # If future scenarios neglect/remove levies, it's just the spot price:
-        v2gp_w = spot_price_w  
-        # Note: If your GUI allows user input for export levies, add them here:
-        # v2gp_w = spot_price_w + (user_export_fee_ct / 100.0)
+            # 3. DISCHARGING PRICE (V2G): Spot price + future export levies
+            v2gp_w = spot_price_w  
 
-        # --- RUN DUMB ALGORITHM ---
-        Pc_A, Pd_A, soc_A = run_A_dumb(v2g, buy_w, v2gp_w, W, E_init)
-        # Note dumb_cost=None here because this IS the dumb benchmark
-        A = make_kpi("A - Dumb", v2g, Pc_A, Pd_A, soc_A, buy_w, v2gp_w, E_init, arr, dep)
-        dumb_net_cost = A["net_cost"]
-        kpis_A_list.append(A)
-        
-        # --- RUN SMART / MILP ALGORITHM ---
-        Pc_C, Pd_C, soc_C = run_C_milp(v2g, buy_w, v2gp_w, E_init)
-        # Pass the dumb_net_cost into the function to calculate the actual comparative V2G profit
-        C = make_kpi("C - MILP", v2g, Pc_C, Pd_C, soc_C, buy_w, v2gp_w, E_init, arr, dep, dumb_cost=dumb_net_cost)
-        kpis_C_list.append(C)
+            # --- RUN DUMB ALGORITHM ---
+            Pc_A, Pd_A, soc_A = run_A_dumb(v2g, buy_w, v2gp_w, W, E_init)
+            A = make_kpi("A - Dumb", v2g, Pc_A, Pd_A, soc_A, buy_w, v2gp_w, E_init, arr, dep)
+            dumb_net_cost = A["net_cost"]
+            kpis_A_list.append(A)
+            
+            # --- RUN SMART / MILP ALGORITHM ---
+            Pc_C, Pd_C, soc_C = run_C_milp(v2g, buy_w, v2gp_w, E_init)
+            C = make_kpi("C - MILP", v2g, Pc_C, Pd_C, soc_C, buy_w, v2gp_w, E_init, arr, dep, dumb_cost=dumb_net_cost)
+            kpis_C_list.append(C)
             
         # 3. Average the results across all days to get the final Daily KPIs
+        # (NOTICE THIS IS OUTSIDE THE DAILY LOOP, BUT INSIDE THE SEASON LOOP)
         A_avg = average_kpis(kpis_A_list)
         C_avg = average_kpis(kpis_C_list)
 
