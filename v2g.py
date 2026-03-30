@@ -970,7 +970,7 @@ def main():
             buy_w = compose_all_in_price(spot_price_w, tariff=GERMAN_TARIFF)
 
             # 3. DISCHARGING PRICE (V2G): Spot price + future export levies
-            v2gp_w = spot_price_w  
+            v2gp_w = buy_w  
 
             # --- RUN DUMB ALGORITHM ---
             Pc_A, Pd_A, soc_A = run_A_dumb(v2g, buy_w, v2gp_w, W, E_init)
