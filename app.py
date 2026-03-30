@@ -1935,24 +1935,13 @@ else:
         st.markdown("---")
         show_kpi_table(res_we, fixed_price, tru_cycle, rc_we, lbl, buy_d=buy_d_we)
         st.markdown("---")
-# ── Annual graphs ──────────────────────────────────────────────────────────
-        with st.spinner("Running annual day-by-day optimisation for all 365 days..."):
-            try:
-                annual_data = run_annual_all_days(
-                    arr_h, dep_h,
-                    soc_w, soc_s, soc_dep,
-                    tru_cycle, do_B, do_C, do_D, mpc_noise_std,
-                    _fixed_net_ct, _vat_rate,
-                    _v2g_double_ct, _v2g_exempt_ct, _vat_fut_rate,
-                    fixed_price,
-                )
-#                make_annual_graphs(annual_data)
-            except Exception as e:
-                st.warning(f"Annual computation error: {e}")
-        st.markdown("---")
+
+    # ── Annual computation removed because make_annual_graphs was removed ──
+    # If you ever want to restore the annual calculation, it must be indented 
+    # OUTSIDE the weekend `for` loop, aligned with `st.subheader("KPI Tables")` below.
 
     st.subheader("KPI Tables")
-    tab_specs = []
+    tab_specs =[]
     if res_w is not None:
         tab_specs.append(("Winter Weekday", res_w, rc_w, buy_d_w))
     if res_s is not None:
