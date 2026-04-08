@@ -321,23 +321,47 @@ def expand_to_minutes(v2g, Pc_w, Pd_w, E_init, tru_w=None):
         E_c_rem = Pc_w[i] * v2g.dt_h
         E_d_rem = Pd_w[i] * v2g.dt_h
 
+        # Back-load a partial slot when the next slot continues in the same direction,
+        # so the SoC trace connects smoothly at slot boundaries.
+        next_pc = float(Pc_w[i + 1]) if i + 1 < W else 0.0
+        next_pd = float(Pd_w[i + 1]) if i + 1 < W else 0.0
+
+        is_partial_c = E_c_rem > 1e-6 and p_max_c > 1e-9 and E_c_rem < p_max_c * v2g.dt_h - 1e-6
+        back_load_c  = is_partial_c and next_pc > 1e-6
+        start_m_c    = max(0, 60 - int(np.ceil(E_c_rem / (p_max_c * dt_m)))) if back_load_c else 0
+
+        is_partial_d = E_d_rem > 1e-6 and p_max_d > 1e-9 and E_d_rem < p_max_d * v2g.dt_h - 1e-6
+        back_load_d  = is_partial_d and next_pd > 1e-6
+        start_m_d    = max(0, 60 - int(np.ceil(E_d_rem / (p_max_d * dt_m)))) if back_load_d else 0
+
         for m in range(60):
             idx = i * 60 + m
-            
+
             # 1-minute energy capacity at max power
             e_cap_c = p_max_c * dt_m
             e_cap_d = p_max_d * dt_m
-            
-            # Charge at max power until energy for this hour is depleted
-            if E_c_rem > 1e-6:
-                charge_e = min(E_c_rem, e_cap_c)
-                Pc_min[idx] = charge_e / dt_m
-                E_c_rem -= charge_e
-            # Discharge at max power until energy for this hour is depleted
-            elif E_d_rem > 1e-6:
-                discharge_e = min(E_d_rem, e_cap_d)
-                Pd_min[idx] = discharge_e / dt_m
-                E_d_rem -= discharge_e
+
+            if back_load_c:
+                if m >= start_m_c and E_c_rem > 1e-6:
+                    charge_e = min(E_c_rem, e_cap_c)
+                    Pc_min[idx] = charge_e / dt_m
+                    E_c_rem -= charge_e
+            elif back_load_d:
+                if m >= start_m_d and E_d_rem > 1e-6:
+                    discharge_e = min(E_d_rem, e_cap_d)
+                    Pd_min[idx] = discharge_e / dt_m
+                    E_d_rem -= discharge_e
+            else:
+                # Front-load: charge at max power until energy for this hour is depleted
+                if E_c_rem > 1e-6:
+                    charge_e = min(E_c_rem, e_cap_c)
+                    Pc_min[idx] = charge_e / dt_m
+                    E_c_rem -= charge_e
+                # Discharge at max power until energy for this hour is depleted
+                elif E_d_rem > 1e-6:
+                    discharge_e = min(E_d_rem, e_cap_d)
+                    Pd_min[idx] = discharge_e / dt_m
+                    E_d_rem -= discharge_e
 
             # Update SoC min by min
             s = float(np.clip(
@@ -442,10 +466,11 @@ def solve_milp(v2g, buy_w, v2gp_w, E_init, E_fin, allow_discharge=True, tru_w=No
     c[ic]  = buy_w * dt
     if allow_discharge:
         c[id_] = -v2gp_w * dt
-    # Small penalty per active charging slot — encourages contiguous blocks
-    # and eliminates physically meaningless alternating on/off patterns.
-    # 1e-4 is ~0.01 ct/kWh: negligible on cost results, decisive on tie-breaking.
-    c[izc] += 1e-4
+    # Tie-breaking penalty per active charging slot.
+    # 1e-7 base: only activates when price difference is < ~0.0001 EUR/MWh for any
+    # realistic charge amount — cannot override real price signals, only breaks exact ties.
+    # Time-ramp 1e-9*t: among tied slots, prefers earlier ones (front-loads charging).
+    c[izc] += 1e-7 + np.arange(W) * 1e-9
 
     lb = np.zeros(nv)
     ub = np.full(nv, np.inf)
@@ -477,7 +502,7 @@ def solve_milp(v2g, buy_w, v2gp_w, E_init, E_fin, allow_discharge=True, tru_w=No
 
     for t in range(W):
         A[W+t,   ic[t]]  =  1.0
-        A[W+t,   izc[t]] = -v2g.charge_power_kW
+        A[W+t,   izc[t]] = -p_c_eff[t]  # tight big-M = actual available power
         A[2*W+t, id_[t]] =  1.0
         A[2*W+t, izd[t]] = -v2g.discharge_power_kW
         A[3*W+t, izc[t]] =  1.0
