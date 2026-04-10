@@ -78,12 +78,17 @@ def fmt_hhmm(h: float) -> str:
 #  ALTAIR HELPERS
 # =============================================================================
 
-def _alt_x(hours_d, is_48h, is_wknd_fullday):
-    """Shared X encoding + domain bounds for all charts."""
+def _alt_x(hours_d, is_48h, is_wknd_fullday, is_long_weekend=False):
     dt   = float(hours_d[1] - hours_d[0]) if len(hours_d) > 1 else 1.0
     xmin = float(hours_d[0])
     xmax = float(hours_d[-1]) + dt
-    if is_48h:
+    if is_long_weekend:
+        t0    = int(xmin) - (int(xmin) % 6)
+        ticks = list(range(t0, int(xmax) + 7, 6))
+        expr  = ("(datum.value < 24 ? 'Fri ' : datum.value < 48 ? 'Sat ' : "
+                 "datum.value < 72 ? 'Sun ' : 'Mon ') + "
+                 "((datum.value%24)<10?'0':'') + floor(datum.value%24) + ':00'")
+    elif is_48h:
         ticks = list(range(0, 49, 4))
         expr  = ("(datum.value < 24 ? 'Sat ' : 'Sun ') +"
                  "((datum.value%24)<10?'0':'')+floor(datum.value%24)+':00'")
@@ -112,12 +117,16 @@ def _plug_rects(hours_d, plug_d, dt):
         rects.append({'x': s, 'x2': float(hours_d[-1]) + dt})
     return rects
 
-
 def _vrow_data(arrival_h, departure_h, is_48h, is_wknd_fullday,
-               arrival_act_h=None, departure_act_h=None):
-    """Returns list of {x, c, lbl} for vertical rule marks."""
+               arrival_act_h=None, departure_act_h=None, is_long_weekend=False):
     if is_wknd_fullday:
         return []
+    if is_long_weekend:
+        return [
+            {'x': 24., 'c': '#555555', 'lbl': 'Sat 00:00'},
+            {'x': 48., 'c': '#555555', 'lbl': 'Sun 00:00'},
+            {'x': 72., 'c': '#555555', 'lbl': 'Mon 00:00'},
+        ]
     def dx(h): return h if h >= 12. else h + 24.
     rows = [{'x': dx(0.), 'c': '#888888', 'lbl': 'Midnight'}]
     if is_48h:
@@ -147,11 +156,12 @@ def make_power_chart(v2g, hours_d, buy_d, plug_d,
                      is_48h, is_wknd_fullday=False,
                      tru_d=None,
                      fixed_net_ct=None, vat_rate=None,
-                     arrival_act_h=None, departure_act_h=None):
+                     arrival_act_h=None, departure_act_h=None,
+                     is_long_weekend=False):
 
     lbl_x  = result_X["label"].split("(")[0].strip()
     buy_ct = to_allin_ct(buy_d, fixed_net_ct, vat_rate)
-    x_enc, xmin, xmax, dt = _alt_x(hours_d, is_48h, is_wknd_fullday)
+    x_enc, xmin, xmax, dt = _alt_x(hours_d, is_48h, is_wknd_fullday, is_long_weekend)
 
     # Helper to expand hourly display arrays to compressed minute pulses.
     # Consecutive charging (or discharging) slots are treated as one run and
@@ -271,7 +281,7 @@ def make_power_chart(v2g, hours_d, buy_d, plug_d,
 
     # 2. Vertical rules
     vrows = _vrow_data(arrival_h, departure_h, is_48h, is_wknd_fullday,
-                       arrival_act_h, departure_act_h)
+                       arrival_act_h, departure_act_h, is_long_weekend)
     if vrows:
         layers.append(
             alt.Chart(pd.DataFrame(vrows))
@@ -346,15 +356,18 @@ def make_soc_chart(v2g, hours_d, plug_d,
                    x_label, x_key,
                    arrival_h, departure_h,
                    is_48h, is_wknd_fullday=False,
-                   arrival_act_h=None, departure_act_h=None):
+                   arrival_act_h=None, departure_act_h=None,
+                   is_long_weekend=False):
 
     lbl_x = result_X["label"].split("(")[0].strip()
-    x_enc, xmin, xmax, dt = _alt_x(hours_d, is_48h, is_wknd_fullday)
+    x_enc, xmin, xmax, dt = _alt_x(hours_d, is_48h, is_wknd_fullday, is_long_weekend)
 
-    if is_48h or is_wknd_fullday:
+    if is_long_weekend:
+        arr_h0 = float(hours_d[0])          # Fri arrival hour (e.g. 16.0)
+    elif is_48h or is_wknd_fullday:
         arr_h0 = 0.0
     else:
-        idx = np.where(np.array(plug_d) > 0.5)[0]
+        idx    = np.where(np.array(plug_d) > 0.5)[0]
         arr_h0 = float(hours_d[idx[0]]) if len(idx) > 0 else float(arrival_h)
 
     def _minsoc(result):
@@ -393,7 +406,7 @@ def make_soc_chart(v2g, hours_d, plug_d,
 
     # 2. Vertical rules
     vrows = _vrow_data(arrival_h, departure_h, is_48h, is_wknd_fullday,
-                       arrival_act_h, departure_act_h)
+                       arrival_act_h, departure_act_h, is_long_weekend)
     if vrows:
         layers.append(
             alt.Chart(pd.DataFrame(vrows))
@@ -441,7 +454,8 @@ def render_season_block(v2g, season_title, color_hex,
                          is_48h, is_wknd_fullday,
                          do_B, do_C, do_D, tru_d=None,
                          fixed_net_ct=None, vat_rate=None,
-                         arrival_act_h=None, departure_act_h=None):
+                         arrival_act_h=None, departure_act_h=None,
+                         is_long_weekend=False):
 
     result_A = results[0]
     comparisons = []
@@ -472,6 +486,7 @@ def render_season_block(v2g, season_title, color_hex,
                 arrival_h, departure_h, is_48h, is_wknd_fullday, tru_d,
                 fixed_net_ct=fixed_net_ct, vat_rate=vat_rate,
                 arrival_act_h=arrival_act_h, departure_act_h=departure_act_h,
+                is_long_weekend=is_long_weekend,
             )
             st.altair_chart(chart, use_container_width=True)
         with col_soc:
@@ -480,6 +495,7 @@ def render_season_block(v2g, season_title, color_hex,
                 result_A, result_X, x_label, x_key,
                 arrival_h, departure_h, is_48h, is_wknd_fullday,
                 arrival_act_h=arrival_act_h, departure_act_h=departure_act_h,
+                is_long_weekend=is_long_weekend,
             )
             st.altair_chart(chart, use_container_width=True)
 
@@ -536,6 +552,18 @@ def load_two_day_profile(date_str: str) -> np.ndarray:
             )
     return np.concatenate([day1, day2])
 
+@st.cache_data(show_spinner=False)
+def load_seasonal_longweekend_profile(months: tuple, arrival_h: float, departure_h: float):
+    """Builds Fri arrival_h → Mon departure_h price array from seasonal averages.
+    hours_d uses absolute-hours-from-Friday-midnight convention."""
+    buy_wd = load_seasonal_profile(months, is_weekend=False)
+    buy_we = load_seasonal_profile(months, is_weekend=True)
+    a = round(arrival_h)
+    d = round(departure_h)
+    buy_long = np.concatenate([buy_wd[a:], buy_we, buy_we, buy_wd[:d]])
+    hours_d  = np.arange(a, a + len(buy_long), dtype=float)
+    return buy_long, hours_d
+
 def _apply_mpc_distortions(buy_arr, reduce_night, reduce_pct,
                             increase_eve, increase_pct, spikes):
     p = buy_arr.copy().astype(float)
@@ -580,59 +608,46 @@ def run_seasonal(season_key, arrival_h, departure_h,
     _heat_kw = (bat_heat_w / 1000.0) if is_winter_season else 0.0
     _parasitic_kw = _aux_kw + _heat_kw
 
-    # ---------------------------------------------------------
-    # WEEKEND 48H CASE (unchanged)
+# ---------------------------------------------------------
+    # LONG WEEKEND: Fri arrival_h → Mon departure_h
+    # Tiled from seasonal weekday + weekend averages
     # ---------------------------------------------------------
     if is_48h:
-        buy48  = np.concatenate([buy, buy])
-        v2gp48 = compose_v2gp_price(buy48, exempt_ct=0.0)
-        buy48_mpc = _apply_mpc_distortions(buy48, reduce_night, reduce_night_pct,
-                                            increase_eve, increase_eve_pct, price_spikes)
-        W      = 48
-        tru_w  = get_tru_1h_trace(tru_cycle, W, v2g.dt_h) + _parasitic_kw
-
-        hours_d = np.arange(W) * v2g.dt_h
-        plug_d  = np.ones(W)
-        buy_d   = buy48_mpc
+        buy_long, hours_d = load_seasonal_longweekend_profile(
+            tuple(months), arrival_h, departure_h)
+        v2gp_long    = compose_v2gp_price(buy_long, exempt_ct=0.0)
+        buy_long_mpc = _apply_mpc_distortions(buy_long, reduce_night, reduce_night_pct,
+                                               increase_eve, increase_eve_pct, price_spikes)
+        W     = len(buy_long)
+        tru_w = get_tru_1h_trace(tru_cycle, W, v2g.dt_h) + _parasitic_kw
+        plug_d = np.ones(W)
+        buy_d  = buy_long_mpc
 
         results = []
 
-        Pc, Pd, soc = run_A_dumb(v2g, buy48, v2gp48, W, E_init, tru_w)
+        Pc, Pd, soc = run_A_dumb(v2g, buy_long, v2gp_long, W, E_init, tru_w)
         results.append(make_kpi("A - Dumb", v2g, Pc, Pd, soc,
-                                buy48, v2gp48, E_init,
+                                buy_long, v2gp_long, E_init,
                                 is_weekend_48=True, tru_w=tru_w))
-
         if do_B:
-            Pc, Pd, soc = run_B_smart(v2g, buy48, v2gp48, E_init, tru_w)
+            Pc, Pd, soc = run_B_smart(v2g, buy_long, v2gp_long, E_init, tru_w)
             results.append(make_kpi("B - Smart (no V2G)", v2g, Pc, Pd, soc,
-                                    buy48, v2gp48, E_init,
+                                    buy_long, v2gp_long, E_init,
                                     is_weekend_48=True, tru_w=tru_w))
-
         if do_C:
-            Pc, Pd, soc = run_C_milp(v2g, buy48, v2gp48, E_init, tru_w)
+            Pc, Pd, soc = run_C_milp(v2g, buy_long, v2gp_long, E_init, tru_w)
             results.append(make_kpi("C - MILP Day-Ahead", v2g, Pc, Pd, soc,
-                                    buy48, v2gp48, E_init,
+                                    buy_long, v2gp_long, E_init,
                                     is_weekend_48=True, tru_w=tru_w))
-
         if do_D:
-            Pc, Pd, soc = run_D_mpc(v2g, buy48_mpc, v2gp48, E_init, tru_w)
+            Pc, Pd, soc = run_D_mpc(v2g, buy_long_mpc, v2gp_long, E_init, tru_w)
             results.append(make_kpi("D - MPC (receding)", v2g, Pc, Pd, soc,
-                                    buy48, v2gp48, E_init,
+                                    buy_long, v2gp_long, E_init,
                                     is_weekend_48=True, tru_w=tru_w))
 
-        results_kpi = [{
-            **r,
-            "net_cost":    r["net_cost"]/2,
-            "charge_cost": r["charge_cost"]/2,
-            "v2g_rev":     r["v2g_rev"]/2,
-            "tru_cost":    r["tru_cost"]/2,
-            "total_cost":  r["total_cost"]/2,
-            "v2g_kwh":     r["v2g_kwh"]/2,
-            "charge_kwh":  r["charge_kwh"]/2
-        } for r in results]
-
-        rc = compute_reefer_costs(tru_w[:24], buy[:24], v2g.dt_h)
-        return results, results_kpi, buy_d, plug_d, hours_d, is_wknd, is_48h, tru_w, rc
+        # KPIs = total cost for the whole stay (no per-day division)
+        rc = compute_reefer_costs(tru_w, buy_long, v2g.dt_h)
+        return results, results, buy_d, plug_d, hours_d, is_wknd, False, tru_w, rc, True
 
 # ---------------------------------------------------------
 
@@ -727,7 +742,7 @@ def run_seasonal(season_key, arrival_h, departure_h,
 
     rc = compute_reefer_costs(tru_w_act, buy_w_act, v2g.dt_h)
 
-    return results, results, buy_d, plug_d, hours_d, is_wknd, is_48h, tru_d, rc
+    return results, results, buy_d, plug_d, hours_d, is_wknd, is_48h, tru_d, rc, False
 
 @st.cache_data(show_spinner=False)
 def run_specific_date(date_str, arrival_h, departure_h,
@@ -740,15 +755,68 @@ def run_specific_date(date_str, arrival_h, departure_h,
                       price_spikes=()):
 
     ts = pd.Timestamp(date_str)
-    is_wknd  = ts.dayofweek >= 5
+    is_wknd        = ts.dayofweek >= 5
+    is_friday      = ts.dayofweek == 4
     is_winter_date = ts.month in WINTER_M
-    v2g = V2GParams(soc_departure_pct=soc_departure_pct)
+    v2g    = V2GParams(soc_departure_pct=soc_departure_pct)
     E_init = v2g.usable_capacity_kWh * soc_pct / 100.0
-
-    # Parasitic loads
-    _aux_kw      = aux_power_w / 1000.0
-    _heat_kw     = (bat_heat_w / 1000.0) if is_winter_date else 0.0
+    _aux_kw       = aux_power_w / 1000.0
+    _heat_kw      = (bat_heat_w / 1000.0) if is_winter_date else 0.0
     _parasitic_kw = _aux_kw + _heat_kw
+    
+    # -------------------------------------------------------
+    # Friday = Fri arrival_h → Mon departure_h (3-night stay)
+    # -------------------------------------------------------
+    if is_friday:
+        day_dates = [
+            date_str,
+            (ts + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+            (ts + pd.Timedelta(days=2)).strftime("%Y-%m-%d"),
+            (ts + pd.Timedelta(days=3)).strftime("%Y-%m-%d"),
+        ]
+        day_prices = []
+        for dd in day_dates:
+            try:
+                day_prices.append(load_date_profile(dd))
+            except ValueError:
+                # Fallback: same weekday/weekend slot from prior year
+                fb = (pd.Timestamp(dd) - pd.Timedelta(days=364)).strftime("%Y-%m-%d")
+                day_prices.append(load_date_profile(fb))
+        a      = round(arrival_h)
+        d_slot = round(departure_h)
+        buy_long = np.concatenate([
+            day_prices[0][a:],
+            day_prices[1],
+            day_prices[2],
+            day_prices[3][:d_slot],
+        ])
+        hours_d = np.arange(a, a + len(buy_long), dtype=float)
+        W = len(buy_long)
+        v2gp_long    = compose_v2gp_price(buy_long, exempt_ct=0.0)
+        buy_long_mpc = _apply_mpc_distortions(buy_long, reduce_night, reduce_night_pct,
+                                               increase_eve, increase_eve_pct, price_spikes)
+        tru_w  = get_tru_1h_trace(tru_cycle, W, v2g.dt_h) + _parasitic_kw
+        plug_d = np.ones(W)
+
+        results = []
+        Pc, Pd, soc = run_A_dumb(v2g, buy_long, v2gp_long, W, E_init, tru_w)
+        results.append(make_kpi("A - Dumb", v2g, Pc, Pd, soc,
+                                buy_long, v2gp_long, E_init, is_weekend_48=True, tru_w=tru_w))
+        if do_B:
+            Pc, Pd, soc = run_B_smart(v2g, buy_long, v2gp_long, E_init, tru_w)
+            results.append(make_kpi("B - Smart (no V2G)", v2g, Pc, Pd, soc,
+                                    buy_long, v2gp_long, E_init, is_weekend_48=True, tru_w=tru_w))
+        if do_C:
+            Pc, Pd, soc = run_C_milp(v2g, buy_long, v2gp_long, E_init, tru_w)
+            results.append(make_kpi("C - MILP Day-Ahead", v2g, Pc, Pd, soc,
+                                    buy_long, v2gp_long, E_init, is_weekend_48=True, tru_w=tru_w))
+        if do_D:
+            Pc, Pd, soc = run_D_mpc(v2g, buy_long_mpc, v2gp_long, E_init, tru_w)
+            results.append(make_kpi("D - MPC (receding)", v2g, Pc, Pd, soc,
+                                    buy_long, v2gp_long, E_init, is_weekend_48=True, tru_w=tru_w))
+        rc = compute_reefer_costs(tru_w, buy_long, v2g.dt_h)
+        return (results, buy_long_mpc, plug_d, hours_d,
+                True, False, False, tru_w, rc, True)
 
     # -------------------------------------------------------
     # Weekend = simple 24h plug-in, abnormality NOT applied
@@ -796,7 +864,7 @@ def run_specific_date(date_str, arrival_h, departure_h,
         rc = compute_reefer_costs(tru_w, buy_w, v2g.dt_h)
 
         return (results, buy_d, plug_d, hours_d,
-                is_wknd, is_48h, is_wknd_fullday, tru_d, rc)
+                is_wknd, is_48h, is_wknd_fullday, tru_d, rc, False)
 
     # -------------------------------------------------------
     # Weekday abnormality handling (arrival/departure deviation)
@@ -921,7 +989,7 @@ def run_specific_date(date_str, arrival_h, departure_h,
     # Return everything
     # -------------------------------------------------------
     return (results, buy_d, plug_d, hours_d,
-            is_wknd, is_48h, is_wknd_fullday, tru_d, rc)
+            is_wknd, is_48h, is_wknd_fullday, tru_d, rc, False)
 
 
 # =============================================================================
@@ -967,7 +1035,7 @@ def run_annual_all_days(
 
         try:
             (results, buy_d, _plug, _hours,
-             _is_wknd, _is_48h, _is_wknd_fd, _tru_d, _rc) = run_specific_date(
+             _is_wknd, _is_48h, _is_wknd_fd, _tru_d, _rc, _lw) = run_specific_date(
                 date_str, arrival_h, departure_h,
                 soc_init, float(soc_dep),
                 tru_cycle, do_B, do_C, do_D,
@@ -1474,7 +1542,7 @@ if abs(arrival_dev_h) > 1e-12 or abs(departure_dev_h) > 1e-12:
 #  KPI TABLE HELPER
 # =============================================================================
 
-def show_kpi_table(results, fixed_price, tru_cycle, rc, label="", buy_d=None):
+def show_kpi_table(results, fixed_price, tru_cycle, rc, label="", buy_d=None, total_stay=False):
     if buy_d is not None and len(buy_d) > 0:
         avg_spot_eur  = float(np.mean(buy_d))
         avg_allin_eur = float(np.mean(to_allin_ct(buy_d, _fixed_net_ct, _vat_rate))) / 100.0
@@ -1491,14 +1559,13 @@ def show_kpi_table(results, fixed_price, tru_cycle, rc, label="", buy_d=None):
     def _build_rows(reg):
         ref_A         = results[0]
         F_charge_cost = ref_A["charge_kwh"] * fixed_price
-
+        unit = "€/stay" if total_stay else "€/d"
         rows = [{
-            "Scenario"                  : f"F - Fixed Price",
-            "Charge (€/d)"              : f"{F_charge_cost:.3f}",
-            "V2G Rev (€/d)"             : "0.000",
-            "Net (€/d)"                 : f"{F_charge_cost:.3f}"
+            "Scenario"              : "F - Fixed Price",
+            f"Charge ({unit})"      : f"{F_charge_cost:.3f}",
+            f"V2G Rev ({unit})"     : "0.000",
+            f"Net ({unit})"         : f"{F_charge_cost:.3f}"
         }]
-
         for r in results:
             if r["label"].startswith("A"):
                 charge_cost = r["charge_kwh"] * fixed_price
@@ -1522,13 +1589,13 @@ def show_kpi_table(results, fixed_price, tru_cycle, rc, label="", buy_d=None):
                     + r["v2g_kwh"] * exempt_eur)
             net = charge_cost - v2g_rev
             rows.append({
-                "Scenario"     : (r["label"]
-                                .replace(" (no V2G)","")
-                                .replace(" Day-Ahead","")
-                                .replace(" (receding)","")),
-                "Charge (€/d)" : f"{charge_cost:.3f}",
-                "V2G Rev (€/d)": f"{v2g_rev:.3f}",
-                "Net (€/d)"    : f"{net:.3f}"
+                "Scenario"          : (r["label"]
+                                    .replace(" (no V2G)","")
+                                    .replace(" Day-Ahead","")
+                                    .replace(" (receding)","")),
+                f"Charge ({unit})"  : f"{charge_cost:.3f}",
+                f"V2G Rev ({unit})" : f"{v2g_rev:.3f}",
+                f"Net ({unit})"     : f"{net:.3f}"
             })
         return rows
 
@@ -1573,8 +1640,9 @@ if mode == "Specific Date":
     color_hex = "#1565C0" if is_winter else "#E65100"
 
     st.subheader(f"Specific Date: {day_label}")
+    is_friday_sd = pd.Timestamp(specific_date).dayofweek == 4
     st.caption(
-        f"{'Weekend — full 24h plugged-in' if is_wknd else 'Weekday — overnight window'}  |  "
+        f"{'Friday — Fri→Mon long weekend' if is_friday_sd else ('Weekend — full 24h plugged-in' if is_wknd else 'Weekday — overnight window')}  |  "
         f"{'Winter' if is_winter else 'Summer'} pricing  |  "
         f"Arrival SoC: {soc_init}%"
     )
@@ -1582,7 +1650,7 @@ if mode == "Specific Date":
     with st.spinner(f"Computing {day_label}..."):
         try:
             (results, buy_d, plug_d, hours_d,
-             is_wknd_r, is_48h, is_wknd_fullday, tru_d, rc) = run_specific_date(
+             is_wknd_r, is_48h, is_wknd_fullday, tru_d, rc, is_lw_sd) = run_specific_date(
                 specific_date, arr_h, dep_h,
                 float(soc_init), float(soc_dep),
                 tru_cycle, do_B, do_C, do_D,
@@ -1603,17 +1671,18 @@ if mode == "Specific Date":
         hours_d, buy_d, plug_d, results,
         arr_h, dep_h, is_48h, is_wknd_fullday,
         do_B, do_C, do_D, tru_d,
-        fixed_net_ct=_fixed_net_ct, vat_rate=_vat_rate
+        fixed_net_ct=_fixed_net_ct, vat_rate=_vat_rate,
+        is_long_weekend=is_lw_sd,
     )
     st.markdown("---")
-    show_kpi_table(results, fixed_price, tru_cycle, rc, buy_d=buy_d)
+    show_kpi_table(results, fixed_price, tru_cycle, rc, buy_d=buy_d, total_stay=is_lw_sd)
 
 else:
     res_w = None
     with st.spinner("Computing Winter Weekday..."):
         try:
             (res_w, res_w_kpi, buy_d_w, plug_d_w, hours_d_w,
-             is_wknd_w, is_48h_w, tru_d_w, rc_w) = run_seasonal(
+             is_wknd_w, is_48h_w, tru_d_w, rc_w, _lw_w) = run_seasonal(
                 "winter_weekday", arr_h, dep_h,
                 float(soc_w), float(soc_dep),
                 tru_cycle, do_B, do_C, do_D,
@@ -1654,7 +1723,7 @@ else:
     with st.spinner("Computing Summer Weekday..."):
         try:
             (res_s, res_s_kpi, buy_d_s, plug_d_s, hours_d_s,
-             is_wknd_s, is_48h_s, tru_d_s, rc_s) = run_seasonal(
+             is_wknd_s, is_48h_s, tru_d_s, rc_s, _lw_s) = run_seasonal(
                 "summer_weekday", arr_h, dep_h,
                 float(soc_s), float(soc_dep),
                 tru_cycle, do_B, do_C, do_D,
@@ -1697,7 +1766,7 @@ else:
         with st.spinner(f"Computing {lbl}..."):
             try:
                 (res_we, res_we_kpi, buy_d_we, plug_d_we, hours_d_we,
-                 _, is_48h_we, tru_d_we, rc_we) = run_seasonal(
+                 _, is_48h_we, tru_d_we, rc_we, is_lw_we) = run_seasonal(
                     sk, arr_h, dep_h, float(soc_init), float(soc_dep),
                     tru_cycle, do_B, do_C, do_D,
                     aux_power_w=aux_power_w,
@@ -1717,10 +1786,11 @@ else:
             hours_d_we, buy_d_we, plug_d_we, res_we,
             arr_h, dep_h, is_48h_we, False,
             do_B, do_C, do_D, tru_d_we,
-            fixed_net_ct=_fixed_net_ct, vat_rate=_vat_rate
+            fixed_net_ct=_fixed_net_ct, vat_rate=_vat_rate,
+            is_long_weekend=is_lw_we,
         )
         st.markdown("---")
-        show_kpi_table(res_we, fixed_price, tru_cycle, rc_we, lbl, buy_d=buy_d_we)
+        show_kpi_table(res_we, fixed_price, tru_cycle, rc_we, lbl, buy_d=buy_d_we, total_stay=True)
         st.markdown("---")
 
     # ── Annual computation removed because make_annual_graphs was removed ──
