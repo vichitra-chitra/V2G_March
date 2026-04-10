@@ -11,10 +11,9 @@ from v2g import (
     run_A_dumb, run_B_smart, run_C_milp, run_D_mpc,
     make_kpi,
     realize_planned_window_under_actual_times,
-    expand_to_minutes,
+    expand_to_minutes,compose_v2gp_price
 )
 
-from io import BytesIO
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -361,7 +360,10 @@ def make_soc_chart(v2g, hours_d, plug_d,
     def _minsoc(result):
         E0  = result['E_init_pct'] * v2g.usable_capacity_kWh / 100.0
         Pc, Pd = result['Pc_w'], result['Pd_w']
-        tru = result.get('tru_w', None)  # Fetch the TRU trace needed for max-power estimation
+        tru = result.get('tru_w', None)
+        # Guard: if tru is stored as full 24-slot display array, slice to window length
+        if tru is not None and len(tru) != len(Pc):
+            tru = tru[:len(Pc)]
         if len(Pc) == 0:
             return np.array([arr_h0]), np.array([result['E_init_pct']])
         t_m, _, _, soc_p = expand_to_minutes(v2g, np.asarray(Pc), np.asarray(Pd), E0, tru)
@@ -568,7 +570,7 @@ def run_seasonal(season_key, arrival_h, departure_h,
     }
     months, is_wknd, is_48h = months_map[season_key]
     buy  = load_seasonal_profile(tuple(months), is_wknd)
-    v2gp = buy.copy()
+    v2gp = compose_v2gp_price(buy, exempt_ct=0.0)   # current reg: spot only, no exemption
     v2g  = V2GParams(soc_departure_pct=soc_departure_pct)
     E_init = v2g.usable_capacity_kWh * soc_pct / 100.0
 
@@ -583,7 +585,7 @@ def run_seasonal(season_key, arrival_h, departure_h,
     # ---------------------------------------------------------
     if is_48h:
         buy48  = np.concatenate([buy, buy])
-        v2gp48 = buy48.copy()
+        v2gp48 = compose_v2gp_price(buy48, exempt_ct=0.0)
         buy48_mpc = _apply_mpc_distortions(buy48, reduce_night, reduce_night_pct,
                                             increase_eve, increase_eve_pct, price_spikes)
         W      = 48
@@ -591,7 +593,7 @@ def run_seasonal(season_key, arrival_h, departure_h,
 
         hours_d = np.arange(W) * v2g.dt_h
         plug_d  = np.ones(W)
-        buy_d   = buy48
+        buy_d   = buy48_mpc
 
         results = []
 
@@ -658,11 +660,12 @@ def run_seasonal(season_key, arrival_h, departure_h,
     buy_w_act  = buy[win_act]
     v2gp_w_act = v2gp[win_act]
     tru_w_act  = get_tru_1h_trace(tru_cycle, W_act, v2g.dt_h) + _parasitic_kw
-    buy_w_act_mpc = _apply_mpc_distortions(buy, reduce_night, reduce_night_pct,
-                                            increase_eve, increase_eve_pct, price_spikes)[win_act]
+    buy_dist = _apply_mpc_distortions(buy, reduce_night, reduce_night_pct,
+                                      increase_eve, increase_eve_pct, price_spikes)
+    buy_w_act_mpc = buy_dist[win_act]
 
-    # ── Display: gold band = ACTUAL plug-in window
-    buy_d, plug_d, hours_d = build_wd_display(v2g, buy, arrival_act_h, departure_act_h)
+    # ── Display: distorted prices for chart price line + KPI cost evaluation
+    buy_d, plug_d, hours_d = build_wd_display(v2g, buy_dist, arrival_act_h, departure_act_h)
 
     # TRU display: reefer only draws grid power while physically plugged in
     tru_d = np.zeros(v2g.n_slots)
@@ -752,14 +755,15 @@ def run_specific_date(date_str, arrival_h, departure_h,
     # -------------------------------------------------------
     if is_wknd:
         buy = load_date_profile(date_str)
-        v2gp = buy.copy()
+        v2gp = compose_v2gp_price(buy, exempt_ct=0.0)
         W = 24
 
         buy_w = buy
         v2gp_w = v2gp
         tru_w = get_tru_1h_trace(tru_cycle, W, v2g.dt_h) + _parasitic_kw
 
-        buy_d = buy
+        buy_d = _apply_mpc_distortions(buy, reduce_night, reduce_night_pct,
+                                       increase_eve, increase_eve_pct, price_spikes)
         plug_d = np.ones(24)
         hours_d = np.arange(24) * v2g.dt_h
         tru_d = tru_w
@@ -785,9 +789,7 @@ def run_specific_date(date_str, arrival_h, departure_h,
                                     buy_w, v2gp_w, E_init, arr, dep, tru_w=tru_w))
 
         if do_D:
-            buy_w_mpc = _apply_mpc_distortions(buy_w, reduce_night, reduce_night_pct,
-                                               increase_eve, increase_eve_pct, price_spikes)
-            Pc, Pd, soc = run_D_mpc(v2g, buy_w_mpc, v2gp_w, E_init, tru_w)
+            Pc, Pd, soc = run_D_mpc(v2g, buy_d, v2gp_w, E_init, tru_w)
             results.append(make_kpi("D - MPC (receding)", v2g, Pc, Pd, soc,
                                     buy_w, v2gp_w, E_init, arr, dep, tru_w=tru_w))
 
@@ -814,7 +816,7 @@ def run_specific_date(date_str, arrival_h, departure_h,
 
     # Load 48h demand
     buy_48 = load_two_day_profile(date_str)
-    v2gp_48 = buy_48.copy()
+    v2gp_48 = compose_v2gp_price(buy_48, exempt_ct=0.0)
 
     # Slot builder helper (planned vs actual)
     def _slots_48(arr_h, dep_h):
@@ -837,12 +839,13 @@ def run_specific_date(date_str, arrival_h, departure_h,
     buy_w_act = buy_48[slots_act]
     v2gp_w_act = v2gp_48[slots_act]
     tru_w_act = get_tru_1h_trace(tru_cycle, len(slots_act), v2g.dt_h) + _parasitic_kw
-    buy_w_act_mpc = _apply_mpc_distortions(buy_48, reduce_night, reduce_night_pct,
-                                            increase_eve, increase_eve_pct, price_spikes)[slots_act]
+    buy_48_dist = _apply_mpc_distortions(buy_48, reduce_night, reduce_night_pct,
+                                         increase_eve, increase_eve_pct, price_spikes)
+    buy_w_act_mpc = buy_48_dist[slots_act]
 
     # 24h display window: 12:00 -> next 12:00
     ROLL = round(12.0 / v2g.dt_h)
-    buy_d = buy_48[ROLL:ROLL + 24]
+    buy_d = buy_48_dist[ROLL:ROLL + 24]
     hours_d = np.arange(24) * v2g.dt_h + 12.0
 
     dep_on_chart = (departure_act_h + 24.0) if departure_act_h < 12.0 else departure_act_h
@@ -931,39 +934,28 @@ def run_annual_all_days(
     soc_w, soc_s, soc_dep,
     tru_cycle, do_B, do_C, do_D,
     fixed_net_ct, vat_rate,
-    v2g_double_ct, v2g_exempt_ct, vat_fut_rate,
+    v2g_exempt_ct, vat_fut_rate,
     fixed_price_eur,
 ):
-    """
-    Runs optimisation for every available date in the 2025 CSV individually.
-    Winter = Oct-Mar (months 10,11,12,1,2,3).
-    Summer = Apr-Sep (months 4,5,6,7,8,9).
-    Weekdays : overnight window arrival_h -> departure_h next morning.
-    Weekends : full 24h plugged-in.
-    Missing dates silently skipped.
-    F benchmark uses Scenario A charge_kwh x fixed_price_eur (no V2G).
-    Charge cost uses all-in price (spot + fixed fees + VAT).
-    V2G rev current : max(0, v2g_kwh x avg_spot - v2g_kwh x double_tax x (1+VAT)).
-    V2G rev future  : v2g_kwh x avg_spot + v2g_kwh x exempt_ct x (1+VAT_fut).
-    Annual = raw sum of all valid days (no averaging).
-    """
     df_all    = _load_csv_raw(CSV_PATH)
     all_dates = sorted(df_all["date"].unique())
 
     sc_keys = ["A"]
-    if do_B:
-        sc_keys.append("B")
-    if do_C:
-        sc_keys.append("C")
-    if do_D:
-        sc_keys.append("D")
+    if do_B: sc_keys.append("B")
+    if do_C: sc_keys.append("C")
+    if do_D: sc_keys.append("D")
 
-    double_tax_eur = v2g_double_ct / 100.0
+    # Current reg: double-tax = 0 (V2G_RECOVERABLE_CURRENT_CT)
+    double_tax_eur = V2G_RECOVERABLE_CURRENT_CT / 100.0
     exempt_eur     = v2g_exempt_ct / 100.0
+    # Future buy price: fixed levies reduced by exempt amount
+    fixed_net_fut_ct = fixed_net_ct - v2g_exempt_ct
 
-    acc = {sc: {"charge_cost": 0.0, "v2g_rev_cur": 0.0, "v2g_rev_fut": 0.0}
+    acc = {sc: {"charge_cost": 0.0, "charge_cost_fut": 0.0,
+                "v2g_rev_cur": 0.0, "v2g_rev_fut": 0.0}
            for sc in sc_keys}
-    acc["F"] = {"charge_cost": 0.0, "v2g_rev_cur": 0.0, "v2g_rev_fut": 0.0}
+    acc["F"] = {"charge_cost": 0.0, "charge_cost_fut": 0.0,
+                "v2g_rev_cur": 0.0, "v2g_rev_fut": 0.0}
 
     n_valid = 0
 
@@ -981,49 +973,52 @@ def run_annual_all_days(
                 tru_cycle, do_B, do_C, do_D,
             )
         except Exception:
-            continue  # skip missing / broken dates silently
+            continue
 
-        avg_spot_eur  = float(np.mean(buy_d))
-        avg_allin_eur = float(np.mean(
-            to_allin_ct(buy_d, fixed_net_ct, vat_rate))) / 100.0
+        avg_spot_eur      = float(np.mean(buy_d))
+        avg_allin_eur     = float(np.mean(to_allin_ct(buy_d, fixed_net_ct, vat_rate))) / 100.0
+        avg_allin_fut_eur = float(np.mean(to_allin_ct(buy_d, fixed_net_fut_ct, vat_rate))) / 100.0
 
         result_A = results[0]
+        acc["F"]["charge_cost"]     += result_A["charge_kwh"] * fixed_price_eur
+        acc["F"]["charge_cost_fut"] += result_A["charge_kwh"] * fixed_price_eur
 
-        # F benchmark: A's charge_kwh at fixed tariff, no V2G
-        acc["F"]["charge_cost"] += result_A["charge_kwh"] * fixed_price_eur
-
-        # Scenarios A ... D
         for i, sc in enumerate(sc_keys):
-            r           = results[i]
-            charge_cost = r["charge_kwh"] * avg_allin_eur
+            r = results[i]
+            if sc == "A":
+                charge_cost     = r["charge_kwh"] * fixed_price_eur
+                charge_cost_fut = r["charge_kwh"] * fixed_price_eur
+            else:
+                charge_cost     = r["charge_kwh"] * avg_allin_eur
+                charge_cost_fut = r["charge_kwh"] * avg_allin_fut_eur
+
             v2g_rev_cur = max(0.0,
                 r["v2g_kwh"] * avg_spot_eur
-                - r["v2g_kwh"] * double_tax_eur * (1.0 + vat_rate))
-            v2g_rev_fut = (
-                r["v2g_kwh"] * avg_spot_eur
-                + r["v2g_kwh"] * exempt_eur * (1.0 + vat_fut_rate))
+                - r["v2g_kwh"] * double_tax_eur)
 
-            acc[sc]["charge_cost"] += charge_cost
-            acc[sc]["v2g_rev_cur"] += v2g_rev_cur
-            acc[sc]["v2g_rev_fut"] += v2g_rev_fut
+            v2g_rev_fut = max(0.0,
+                r["v2g_kwh"] * avg_spot_eur
+                + r["v2g_kwh"] * exempt_eur)
+
+            acc[sc]["charge_cost"]     += charge_cost
+            acc[sc]["charge_cost_fut"] += charge_cost_fut
+            acc[sc]["v2g_rev_cur"]     += v2g_rev_cur
+            acc[sc]["v2g_rev_fut"]     += v2g_rev_fut
 
         n_valid += 1
 
     out_scenarios = ["F"] + sc_keys
     out = {"n_days": n_valid, "scenarios": out_scenarios}
     for sc in out_scenarios:
-        cc     = acc[sc]["charge_cost"]
-        vr_cur = acc[sc]["v2g_rev_cur"]
-        vr_fut = acc[sc]["v2g_rev_fut"]
         out[sc] = {
-            "charge_cost": cc,
-            "v2g_rev_cur": vr_cur,
-            "v2g_rev_fut": vr_fut,
-            "net_cur":     cc - vr_cur,
-            "net_fut":     cc - vr_fut,
+            "charge_cost":     acc[sc]["charge_cost"],
+            "charge_cost_fut": acc[sc]["charge_cost_fut"],
+            "v2g_rev_cur":     acc[sc]["v2g_rev_cur"],
+            "v2g_rev_fut":     acc[sc]["v2g_rev_fut"],
+            "net_cur":         acc[sc]["charge_cost"]     - acc[sc]["v2g_rev_cur"],
+            "net_fut":         acc[sc]["charge_cost_fut"] - acc[sc]["v2g_rev_fut"],
         }
     return out
-
 
 # =============================================================================
 #  SESSION STATE DEFAULTS
@@ -1129,19 +1124,18 @@ def render_input_panel():
             
             cfg["do_D"] = st.checkbox(
                 "D -- MPC receding horizon", bool(cfg["do_D"]), key="form_do_D")
-            if cfg["do_D"]:
-                st.markdown("##### MPC Price Distortions")
-                cfg["price_reduce_night"] = st.checkbox(
-                    "Reduce 00:00–05:00 prices", bool(cfg.get("price_reduce_night", False)), key="form_rn")
-                if cfg["price_reduce_night"]:
-                    cfg["price_reduce_night_pct"] = st.number_input(
-                        "Reduction %", 1, 99, int(cfg.get("price_reduce_night_pct", 20)), key="form_rn_pct")
-                cfg["price_increase_eve"] = st.checkbox(
-                    "Increase 16:00–22:00 prices", bool(cfg.get("price_increase_eve", False)), key="form_ie")
-                if cfg["price_increase_eve"]:
-                    cfg["price_increase_eve_pct"] = st.number_input(
-                        "Increase %", 1, 200, int(cfg.get("price_increase_eve_pct", 20)), key="form_ie_pct")
-                st.caption("Distortions apply only to MPC (D). B and C use original day-ahead prices.")
+            st.markdown("##### MPC Price Distortions")
+            cfg["price_reduce_night"] = st.checkbox(
+                "Reduce 00:00–05:00 prices", bool(cfg.get("price_reduce_night", False)), key="form_rn")
+            if cfg["price_reduce_night"]:
+                cfg["price_reduce_night_pct"] = st.number_input(
+                    "Reduction %", -100, 100, int(cfg.get("price_reduce_night_pct", 20)), key="form_rn_pct")
+            cfg["price_increase_eve"] = st.checkbox(
+                "Increase 16:00–22:00 prices", bool(cfg.get("price_increase_eve", False)), key="form_ie")
+            if cfg["price_increase_eve"]:
+                cfg["price_increase_eve_pct"] = st.number_input(
+                    "Increase %", -100, 200, int(cfg.get("price_increase_eve_pct", 20)), key="form_ie_pct")
+            st.caption("Distortions apply only to MPC (D). B and C use original day-ahead prices.")
 
         with c3:
             st.subheader("Reefer (TRU) at Depot")
@@ -1329,26 +1323,6 @@ def render_input_panel():
             st.session_state.show_output = True
             st.rerun()
             
-    if cfg.get("do_D", False):
-        st.markdown("#### ⚡ MPC Real-Time Price Spikes")
-        st.caption("MPC reacts to these; MILP and Smart use original prices.")
-        spikes = st.session_state.price_spikes
-        to_remove = None
-        for i, sp in enumerate(spikes):
-            cs1, cs2, cs3 = st.columns([2, 2, 1])
-            spikes[i]["hour"] = cs1.number_input("Hour", 0, 23, int(sp["hour"]), key=f"sp_h_{i}")
-            spikes[i]["mult"] = cs2.number_input("× Multiplier", 0.0, 3.0, float(sp["mult"]),
-                                                  step=0.1, format="%.1f", key=f"sp_m_{i}")
-            if cs3.button("✕", key=f"sp_rm_{i}"):
-                to_remove = i
-        if to_remove is not None:
-            st.session_state.price_spikes.pop(to_remove)
-            st.rerun()
-        if st.button("＋ Add Price Spike"):
-            st.session_state.price_spikes.append({"hour": 3, "mult": 2.0})
-            st.rerun()
-
-
 # =============================================================================
 #  ROUTING
 # =============================================================================
@@ -1519,27 +1493,39 @@ def show_kpi_table(results, fixed_price, tru_cycle, rc, label="", buy_d=None):
         F_charge_cost = ref_A["charge_kwh"] * fixed_price
 
         rows = [{
-            "Scenario"                  : f"F - Fixed Price @ {fixed_price:.2f} €/kWh",
+            "Scenario"                  : f"F - Fixed Price",
             "Charge (€/d)"              : f"{F_charge_cost:.3f}",
             "V2G Rev (€/d)"             : "0.000",
             "Net (€/d)"                 : f"{F_charge_cost:.3f}"
         }]
 
         for r in results:
-            charge_cost = r["charge_kwh"] * avg_allin_eur
+            if r["label"].startswith("A"):
+                charge_cost = r["charge_kwh"] * fixed_price
+            else:
+                if reg == "future":
+                    exempt_buy_eur = (_v2g_exempt_ct / 100.0)
+                    reduced_fixed_ct = _fixed_net_ct - exempt_buy_eur * 100.0
+                    avg_allin_fut_eur = float(np.mean(
+                        to_allin_ct(buy_d, reduced_fixed_ct, _vat_rate))) / 100.0 if buy_d is not None and len(buy_d) > 0 else avg_allin_eur
+                    charge_cost = r["charge_kwh"] * avg_allin_fut_eur
+                else:
+                    charge_cost = r["charge_kwh"] * avg_allin_eur
+
             if reg == "current":
                 v2g_rev = max(0.0,
                     r["v2g_kwh"] * avg_spot_eur
-                    - r["v2g_kwh"] * double_tax_eur * (1.0 + _vat_rate))
+                    - r["v2g_kwh"] * double_tax_eur)
             else:
-                v2g_rev = (r["v2g_kwh"] * avg_spot_eur
-                           + r["v2g_kwh"] * exempt_eur * (1.0 + _vat_rate))
+                v2g_rev = max(0.0,
+                    r["v2g_kwh"] * avg_spot_eur
+                    + r["v2g_kwh"] * exempt_eur)
             net = charge_cost - v2g_rev
             rows.append({
                 "Scenario"     : (r["label"]
-                                  .replace(" (no V2G)","")
-                                  .replace(" Day-Ahead","")
-                                  .replace(" (receding)","")),
+                                .replace(" (no V2G)","")
+                                .replace(" Day-Ahead","")
+                                .replace(" (receding)","")),
                 "Charge (€/d)" : f"{charge_cost:.3f}",
                 "V2G Rev (€/d)": f"{v2g_rev:.3f}",
                 "Net (€/d)"    : f"{net:.3f}"
@@ -1549,16 +1535,15 @@ def show_kpi_table(results, fixed_price, tru_cycle, rc, label="", buy_d=None):
     hdr = f"**Charging KPI{' — ' + label if label else ''}**"
     st.markdown(hdr)
 
-    tab_cur, tab_fut = st.tabs([
-        "📋 Current Regulation (2025)",
-        "🔮 Future Regulation (MiSpeL)"
-    ])
+    col_cur, col_fut = st.columns(2)
 
-    with tab_cur:
+    with col_cur:
+        st.markdown("📋 **Current Regulation (2025)**")
         st.dataframe(pd.DataFrame(_build_rows("current")),
                      use_container_width=True, hide_index=True)
 
-    with tab_fut:
+    with col_fut:
+        st.markdown("🔮 **Future Regulation (MiSpeL)**")
         st.dataframe(pd.DataFrame(_build_rows("future")),
                      use_container_width=True, hide_index=True)
 
@@ -1574,7 +1559,6 @@ def show_kpi_table(results, fixed_price, tru_cycle, rc, label="", buy_d=None):
              f"EUR {rc['cost_diesel'] - rc['cost_dynamic']:+.3f}"],
         ], columns=["Metric", "Value"]),
         use_container_width=True, hide_index=True)
-
 
 # =============================================================================
 #  MAIN DISPLAY
@@ -1743,15 +1727,17 @@ else:
     # If you ever want to restore the annual calculation, it must be indented 
     # OUTSIDE the weekend `for` loop, aligned with `st.subheader("KPI Tables")` below.
 
+if mode != "Specific Date":
     st.subheader("KPI Tables")
-    tab_specs =[]
-    if res_w is not None:
-        tab_specs.append(("Winter Weekday", res_w, rc_w, buy_d_w))
-    if res_s is not None:
-        tab_specs.append(("Summer Weekday", res_s, rc_s, buy_d_s))
-
-    if tab_specs:
-        tab_objs = st.tabs([t[0] for t in tab_specs])
-        for tab_obj, (lbl, res, rc, buy_d_tab) in zip(tab_objs, tab_specs):
-            with tab_obj:
-                show_kpi_table(res, fixed_price, tru_cycle, rc, lbl, buy_d=buy_d_tab)
+    res_w_exists = "res_w" in dir() and res_w is not None
+    res_s_exists = "res_s" in dir() and res_s is not None
+    if res_w_exists and res_s_exists:
+        col_w, col_s = st.columns(2)
+        with col_w:
+            show_kpi_table(res_w, fixed_price, tru_cycle, rc_w, "Winter Weekday", buy_d=buy_d_w)
+        with col_s:
+            show_kpi_table(res_s, fixed_price, tru_cycle, rc_s, "Summer Weekday", buy_d=buy_d_s)
+    elif res_w_exists:
+        show_kpi_table(res_w, fixed_price, tru_cycle, rc_w, "Winter Weekday", buy_d=buy_d_w)
+    elif res_s_exists:
+        show_kpi_table(res_s, fixed_price, tru_cycle, rc_s, "Summer Weekday", buy_d=buy_d_s)

@@ -53,7 +53,7 @@ class V2GParams:
     discharge_power_kW   : float = 22.0
     eta_charge           : float = 0.92
     eta_discharge        : float = 0.92
-    deg_cost_eur_kwh     : float = 0.0
+    deg_cost_eur_kwh     : float = 0.01
     dt_h                 : float = 1
     n_slots              : int   = 24
 
@@ -127,6 +127,13 @@ def compose_all_in_price(spot_eur_kwh, tariff=None):
     net      = np.asarray(spot_eur_kwh, dtype=float) + fixed_ct / 100.0
     return net * (1.0 + tariff["VAT_pc"] / 100.0)
 
+def compose_v2gp_price(spot_eur_kwh, exempt_ct=0.0, vat=0.19):
+    """
+    Net revenue per kWh discharged back to grid (EUR/kWh).
+    exempt_ct: levies exempted on export (ct/kWh), e.g. 8.68 future MiSpeL.
+    Current regulation = 0.0 exempt → v2gp < buy_w (V2G loses money at flat rates).
+    """
+    return np.asarray(spot_eur_kwh, dtype=float) + exempt_ct / 100.0
 
 def compute_reefer_costs(tru_w, buy_w, dt_h,
                           fixed_price=FIXED_PRICE_EUR_KWH,
@@ -455,7 +462,9 @@ def solve_milp(v2g, buy_w, v2gp_w, E_init, E_fin, allow_discharge=True, tru_w=No
     ie  = np.arange(2*W, 3*W)
     izc = np.arange(3*W, 4*W)
     izd = np.arange(4*W, 5*W)
-    nv  = 5 * W
+    iyc = np.arange(5*W, 6*W)   # charge transition
+    iyd = np.arange(6*W, 7*W)   # discharge transition
+    nv  = 7 * W
 
     if tru_w is not None and len(tru_w) == W:
         p_c_eff = np.maximum(0.0, v2g.charge_power_kW - np.asarray(tru_w))
@@ -463,14 +472,12 @@ def solve_milp(v2g, buy_w, v2gp_w, E_init, E_fin, allow_discharge=True, tru_w=No
         p_c_eff = np.full(W, v2g.charge_power_kW)
 
     c = np.zeros(nv)
-    c[ic]  = buy_w * dt
+    c[ic]  = (buy_w + v2g.deg_cost_eur_kwh) * dt          # wear on charging
     if allow_discharge:
-        c[id_] = -v2gp_w * dt
-    # Tie-breaking penalty per active charging slot.
-    # 1e-7 base: only activates when price difference is < ~0.0001 EUR/MWh for any
-    # realistic charge amount — cannot override real price signals, only breaks exact ties.
-    # Time-ramp 1e-9*t: among tied slots, prefers earlier ones (front-loads charging).
-    c[izc] += 1e-7 + np.arange(W) * 1e-9
+        c[id_] = -(v2gp_w - v2g.deg_cost_eur_kwh) * dt    # wear on discharging
+    ALPHA  = 1e-4          # EUR per mode-switch; negligible vs real price signals
+    c[iyc] = ALPHA
+    c[iyd] = ALPHA
 
     lb = np.zeros(nv)
     ub = np.full(nv, np.inf)
@@ -478,31 +485,36 @@ def solve_milp(v2g, buy_w, v2gp_w, E_init, E_fin, allow_discharge=True, tru_w=No
     ub[id_] = v2g.discharge_power_kW if allow_discharge else 0.0
     lb[ie]  = v2g.E_min
     ub[ie]  = v2g.E_max
-    lb[izc] = 0.0
-    ub[izc] = 1.0
-    lb[izd] = 0.0
-    ub[izd] = 1.0
+    lb[izc] = 0.; ub[izc] = 1.
+    lb[izd] = 0.; ub[izd] = 1.
+    lb[iyc] = 0.; ub[iyc] = 1.
+    lb[iyd] = 0.; ub[iyd] = 1.
     integ = np.zeros(nv)
     integ[izc] = 1
     integ[izd] = 1
+    integ[iyc] = 1
+    integ[iyd] = 1
 
-    nr = 4*W + 1
+    # Rows: 4W (original) + 1 (SoC final) + 4*(W-1) (transition)
+    nr = 4*W + 1 + 4*(W - 1)
     A  = lil_matrix((nr, nv))
     lo = np.full(nr, -np.inf)
     hi = np.zeros(nr)
 
+    # SoC dynamics (rows 0..W-1) + big-M power (rows W..3W-1) + mutex (rows 3W..4W-1)
     for t in range(W):
         A[t, ie[t]]  =  1.0
         A[t, ic[t]]  = -v2g.eta_charge * dt
         A[t, id_[t]] =  1.0 / v2g.eta_discharge * dt
-        rhs = E_init if t == 0 else 0.0
         if t > 0:
             A[t, ie[t-1]] = -1.0
-        lo[t] = hi[t] = rhs
+        rhs = E_init if t == 0 else 0.0
+        lo[t] = rhs - 1e-6
+        hi[t] = rhs + 1e-6
 
     for t in range(W):
         A[W+t,   ic[t]]  =  1.0
-        A[W+t,   izc[t]] = -p_c_eff[t]  # tight big-M = actual available power
+        A[W+t,   izc[t]] = -p_c_eff[t]
         A[2*W+t, id_[t]] =  1.0
         A[2*W+t, izd[t]] = -v2g.discharge_power_kW
         A[3*W+t, izc[t]] =  1.0
@@ -510,9 +522,26 @@ def solve_milp(v2g, buy_w, v2gp_w, E_init, E_fin, allow_discharge=True, tru_w=No
         hi[W+t] = hi[2*W+t] = 0.0
         hi[3*W+t] = 1.0
 
+    # Final SoC row
     A[4*W, ie[W-1]] = 1.0
     lo[4*W] = E_fin
     hi[4*W] = v2g.E_max
+
+    # Transition constraints: y[t] >= zc[t] - zc[t-1]  and  y[t] >= zc[t-1] - zc[t]
+    r = 4*W + 1
+    for t in range(1, W):
+        # iyc[t] >= izc[t] - izc[t-1]  →  izc[t] - izc[t-1] - iyc[t] <= 0
+        A[r,   izc[t]] =  1.; A[r,   izc[t-1]] = -1.; A[r,   iyc[t]] = -1.
+        hi[r]  = 0.; lo[r]  = -np.inf
+        # iyc[t] >= izc[t-1] - izc[t]  →  -izc[t] + izc[t-1] - iyc[t] <= 0
+        A[r+1, izc[t]] = -1.; A[r+1, izc[t-1]] =  1.; A[r+1, iyc[t]] = -1.
+        hi[r+1] = 0.; lo[r+1] = -np.inf
+        # same for discharge
+        A[r+2, izd[t]] =  1.; A[r+2, izd[t-1]] = -1.; A[r+2, iyd[t]] = -1.
+        hi[r+2] = 0.; lo[r+2] = -np.inf
+        A[r+3, izd[t]] = -1.; A[r+3, izd[t-1]] =  1.; A[r+3, iyd[t]] = -1.
+        hi[r+3] = 0.; lo[r+3] = -np.inf
+        r += 4
 
     res = milp(c,
                constraints=LinearConstraint(csc_matrix(A), lo, hi),
@@ -522,7 +551,6 @@ def solve_milp(v2g, buy_w, v2gp_w, E_init, E_fin, allow_discharge=True, tru_w=No
     if not res.success:
         raise RuntimeError(f"MILP failed: {res.status!r} {res.message!r}")
     return np.clip(res.x[ic], 0, None), np.clip(res.x[id_], 0, None), res.x[ie]
-
 
 # =============================================================================
 #  8. SCENARIO RUNNERS
