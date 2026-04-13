@@ -38,6 +38,15 @@ V2G_RECOVERABLE_FUTURE = {
 }
 V2G_RECOVERABLE_FUTURE_CT = sum(V2G_RECOVERABLE_FUTURE.values())
 
+# Future A: Netzentgelt exempt — confirmed EnWG §118 Abs.6, effective Jan 2026
+# Buy price reduced by 6.63 ct on re-buy after V2G export. V2G rev = spot only.
+FUTURE_A_EXEMPT_CT = 6.63
+
+# Future B: All levies except Konzessionsabgabe exempt — requires depot PV + EnFG §21
+# Netzentgelt + Stromsteuer (PV users only) + KWKG + Offshore + §19NEV
+# Konzessionsabgabe (1.992 ct) has NO exemption path for any consumer.
+FUTURE_B_EXEMPT_CT = 6.63 + 2.05 + 0.446 + 0.941 + 1.559   # = 11.626 ct
+
 def to_allin_ct(spot_eur_kwh: np.ndarray,
                 fixed_net_ct: float = None,
                 vat: float = None) -> np.ndarray:
@@ -51,7 +60,7 @@ CSV_PATH = "2025_Electricity_Price.csv"
 
 st.set_page_config(
     page_title="S.KOe COOL -- V2G Optimisation",
-    page_icon="⚡",
+    page_icon="",
     layout="wide",
 )
 
@@ -678,6 +687,7 @@ def run_seasonal(season_key, arrival_h, departure_h,
     buy_dist = _apply_mpc_distortions(buy, reduce_night, reduce_night_pct,
                                       increase_eve, increase_eve_pct, price_spikes)
     buy_w_act_mpc = buy_dist[win_act]
+    v2gp_w_act_mpc = compose_v2gp_price(buy_dist[win_act], exempt_ct=0.0)
 
     # ── Display: distorted prices for chart price line + KPI cost evaluation
     buy_d, plug_d, hours_d = build_wd_display(v2g, buy_dist, arrival_act_h, departure_act_h)
@@ -735,7 +745,7 @@ def run_seasonal(season_key, arrival_h, departure_h,
     # No pre-committed plan → adapts automatically to late or early arrival.
     # Always runs on ACTUAL window; no realize step is needed.
     if do_D:
-        Pc, Pd, soc = run_D_mpc(v2g, buy_w_act_mpc, v2gp_w_act, E_init, tru_w_act)
+        Pc, Pd, soc = run_D_mpc(v2g, buy_w_act_mpc, v2gp_w_act_mpc, E_init, tru_w_act)
         results.append(make_kpi("D - MPC (receding)", v2g, Pc, Pd, soc,
                                 buy_w_act, v2gp_w_act, E_init,
                                 arr_act, dep_act, tru_w=tru_w_act))
@@ -910,6 +920,7 @@ def run_specific_date(date_str, arrival_h, departure_h,
     buy_48_dist = _apply_mpc_distortions(buy_48, reduce_night, reduce_night_pct,
                                          increase_eve, increase_eve_pct, price_spikes)
     buy_w_act_mpc = buy_48_dist[slots_act]
+    v2gp_w_act_mpc = compose_v2gp_price(buy_48_dist[slots_act], exempt_ct=0.0)
 
     # 24h display window: 12:00 -> next 12:00
     ROLL = round(12.0 / v2g.dt_h)
@@ -977,7 +988,7 @@ def run_specific_date(date_str, arrival_h, departure_h,
 
     # D - MPC (adapts to actual)
     if do_D:
-        Pc, Pd, soc = run_D_mpc(v2g, buy_w_act_mpc, v2gp_w_act, E_init, tru_w_act)
+        Pc, Pd, soc = run_D_mpc(v2g, buy_w_act_mpc, v2gp_w_act_mpc, E_init, tru_w_act)
         results.append(make_kpi("D - MPC (receding)", v2g, Pc, Pd, soc,
                                 buy_w_act, v2gp_w_act, E_init,
                                 arr, dep, tru_w=tru_w_act))
@@ -1057,16 +1068,19 @@ def run_annual_all_days(
                 charge_cost     = r["charge_kwh"] * fixed_price_eur
                 charge_cost_fut = r["charge_kwh"] * fixed_price_eur
             else:
-                charge_cost     = r["charge_kwh"] * avg_allin_eur
-                charge_cost_fut = r["charge_kwh"] * avg_allin_fut_eur
+                vat_gross = 1.0 + vat_rate
+                charge_cost = (
+                    r["charge_cost"] * vat_gross
+                    + r["charge_kwh"] * fixed_net_ct / 100.0 * vat_gross
+                )
+                charge_cost_fut = (
+                    r["charge_cost"] * vat_gross
+                    + r["charge_kwh"] * fixed_net_fut_ct / 100.0 * vat_gross
+                )
 
-            v2g_rev_cur = max(0.0,
-                r["v2g_kwh"] * avg_spot_eur
-                - r["v2g_kwh"] * double_tax_eur)
-
-            v2g_rev_fut = max(0.0,
-                r["v2g_kwh"] * avg_spot_eur
-                + r["v2g_kwh"] * exempt_eur)
+            _v2g_rev_base = r.get("v2g_rev", r["v2g_kwh"] * avg_spot_eur)
+            v2g_rev_cur = max(0.0, _v2g_rev_base - r["v2g_kwh"] * double_tax_eur)
+            v2g_rev_fut = max(0.0, _v2g_rev_base + r["v2g_kwh"] * exempt_eur)
 
             acc[sc]["charge_cost"]     += charge_cost
             acc[sc]["charge_cost_fut"] += charge_cost_fut
@@ -1116,8 +1130,6 @@ DEFAULTS = {
     "departure_dev_h": 0.0,
     "aux_power_w": 400,
     "bat_heat_w":  100,
-    "fut_network_fee_ct":  6.63,
-    "fut_elec_tax_ct":     2.05,
 }
 
 if "cfg" not in st.session_state:
@@ -1284,27 +1296,24 @@ def render_input_panel():
                 key="form_do_swe")
 
             st.markdown("---")
-            st.markdown("##### Future V2G charges")
-            cfg["fut_network_fee_ct"] = st.number_input(
-                "Network fee exempt (ct/kWh)",
-                value=float(cfg.get("fut_network_fee_ct", 6.63)),
-                min_value=0.0, max_value=15.0, step=0.01, format="%.3f")
-            cfg["fut_elec_tax_ct"] = st.number_input(
-                "Elec. tax exempt (ct/kWh)",
-                value=float(cfg.get("fut_elec_tax_ct", 2.05)),
-                min_value=0.0, max_value=10.0, step=0.01, format="%.3f")
+            st.markdown("##### Regulatory scenarios")
+            st.caption(
+                "**Current (2025):** All 6 levies apply - full double taxation.\n\n"
+                "**Future A :** Netzentgelt exemption (EnWG §118 Abs.6, Jan 2026).\n\n"
+                "**Future B :** All levies except Konzessionsabgabe exempt"
+            )
             
         
 
             # ── ADD THIS block inside the st.form, just before the Submit button ─────
         # ── System Parameters (read-only reference) ──────────────────────
-        with st.expander("📋 System Parameters & Pre-defined Values", expanded=False):
+        with st.expander(" System Parameters & Pre-defined Values", expanded=False):
             st.markdown("These values are fixed in the model. They are shown here "
                         "for transparency — no input needed.")
             col_sp1, col_sp2, col_sp3 = st.columns(3)
 
             with col_sp1:
-                st.markdown("**🔋 Battery (S.KOe COOL)**")
+                st.markdown("** Battery (S.KOe COOL)**")
                 st.caption("Total capacity: **70 kWh**")
                 st.caption("Usable capacity: **60 kWh**")
                 st.caption("Charge power: **22 kW**")
@@ -1312,10 +1321,9 @@ def render_input_panel():
                 st.caption("Charge efficiency η: **0.92**")
                 st.caption("Discharge efficiency η: **0.92**")
                 st.caption("Cold-chain SoC floor: **20 %**")
-                st.caption("Degradation cost: **€0.00/kWh** (not yet active)")
 
             with col_sp2:
-                st.markdown("**❄️ TRU Reefer Cycle Power**")
+                st.markdown("** TRU Reefer Cycle Power**")
                 st.caption("Continuous — High: **7.6 kW** for 1,717 s")
                 st.caption("Continuous — Low:  **0.7 kW** for 292 s")
                 st.caption("Continuous avg: **~6.6 kW**")
@@ -1326,20 +1334,16 @@ def render_input_panel():
                 st.caption("Hi-res simulation: **10-second** intervals → averaged to 1h")
 
             with col_sp3:
-                st.markdown("**⚡ Fixed Diesel Benchmark**")
+                st.markdown("** Fixed Diesel Benchmark**")
                 st.caption("Diesel price: **€1.80/L**")
                 st.caption("Diesel energy: **9.8 kWh/L**")
                 st.caption("Genset efficiency: **30%**")
-                st.markdown("**📅 Seasonality**")
-                st.caption("Winter: **Oct–Mar** (months 1,2,3,10,11,12)")
-                st.caption("Summer: **Apr–Sep** (months 4,5,6,7,8,9)")
-                st.markdown("**🔧 Optimisation**")
-                st.caption("MILP solver: **scipy.optimize.milp** (HiGHS)")
-                st.caption("Time limit per solve: **60 s**")
-                st.caption("Price resolution: **hourly** (SMARD DE/LU 2025)")
+                st.markdown("** Seasonality**")
+                st.caption("Winter: **Oct–Mar**")
+                st.caption("Summer: **Apr–Sep**")
 
         # ── Methodology (mirrored from bottom of results page) ────────────
-        with st.expander("📐 Methodology & Assumptions", expanded=False):
+        with st.expander(" Methodology & Assumptions", expanded=False):
             _fn_disp  = FIXED_NET_CT
             _vat_disp = VAT_RATE
             _fut_disp = V2G_RECOVERABLE_FUTURE_CT
@@ -1348,11 +1352,9 @@ def render_input_panel():
             st.markdown(f"""
 **Price data:** SMARD DE/LU hourly day-ahead spot prices (2025).
 
-**All-in depot price:** `(spot + {_fn_disp:.3f} ct/kWh taxes & levies) × {1+_vat_disp:.2f} VAT`
-
 **Scenario A — Dumb:** Greedy charge from arrival until target SoC reached. No price awareness.
 
-**Scenario B — Smart:** MILP, charge-only (`allow_discharge=False`). Schedules charging at cheapest hours while meeting departure SoC.
+**Scenario B — Smart:** MILP, charge-only. Schedules charging at cheapest hours while meeting departure SoC.
 
 **Scenario C — MILP Day-Ahead:** Full MILP with V2G. Optimises both charge and discharge over the full overnight window using perfect price foresight.
 
@@ -1360,17 +1362,15 @@ def render_input_panel():
 
 **Scenario F — Fixed Tariff Benchmark:** Applies a flat rate of €{_fp_disp:.2f}/kWh to Scenario A's charge volume. No V2G.
 
-**Current regulation V2G cost:** Re-applied Netzentgelt + Stromsteuer on each exported kWh (double taxation).
+**Current regulation V2G cost:** double taxation.
 
-**Future regulation (MiSpeL):** Exported kWh receives fee exemption of {_fut_disp:.3f} ct/kWh (×VAT). **Pending EU state aid approval** — BNetzA 2025.
+**Future regulation (MiSpeL):** Exported kWh receives fee exemption.
 
 **Cold-chain floor:** SoC ≥ 20 % hard MILP constraint (cold-chain integrity — highest priority).
 
-**Departure SoC target:** ≥ {_dep_disp} % at end of overnight window.
+**Departure SoC target:** ≥ 100 % at end of overnight window.
 
 **Battery:** 70 kWh total / 60 kWh usable. Charge/discharge: 22 kW AC bidirectional.
-
-**MILP slot-use penalty:** 1×10⁻⁴ EUR per active charging slot (consolidates charging into contiguous blocks; negligible effect on costs).
             """)
         
         # ── Submit ─────────────────────────────────────────────────────────────
@@ -1429,7 +1429,6 @@ specific_date = cfg.get("specific_date", "2025-01-15")
 _fixed_net_ct  = FIXED_NET_CT
 _vat_rate      = VAT_RATE
 _v2g_double_ct = V2G_RECOVERABLE_CURRENT_CT   # currently 0.0 per your module-level constant
-_v2g_exempt_ct = cfg.get("fut_network_fee_ct", 6.63) + cfg.get("fut_elec_tax_ct", 2.05)
 _vat_fut_rate  = VAT_RATE                      # future VAT same as current unless you add a separate constant
 
 # ── Sidebar quick-edit ────────────────────────────────────────────────────────
@@ -1506,11 +1505,6 @@ with st.spinner("Loading price data..."):
     try:
         df_info = _load_csv_raw(CSV_PATH)
         n_days  = len(df_info) // 96
-        st.success(
-            f"2025 SMARD DE/LU spot prices  |  {n_days} days  |  "
-            f"Mode: **{mode}**"
-            + (f"  |  Date: **{specific_date}**" if mode == "Specific Date" else "")
-        )
     except Exception as e:
         st.error(f"Could not load CSV: {e}")
         st.stop()
@@ -1528,92 +1522,147 @@ m5.metric("Mode", "Seasonal avg" if mode == "Seasonal Average"
                   else f"Date: {specific_date}")
 st.markdown("---")
 
-if abs(arrival_dev_h) > 1e-12 or abs(departure_dev_h) > 1e-12:
-    st.info(
-        "Abnormality active for weekday runs: "
-        f"planned arrival/departure = {fmt_hhmm(arr_h)} / {fmt_hhmm(dep_h)}, "
-        f"actual arrival/departure = {fmt_hhmm((arr_h + arrival_dev_h) % 24)} / "
-        f"{fmt_hhmm((dep_h + departure_dev_h) % 24)}. "
-        "Smart/MILP are planned on the nominal window and realized on the actual window; "
-        "MPC adapts to the actual window."
-    )
-
 # =============================================================================
 #  KPI TABLE HELPER
 # =============================================================================
 
+def _render_compact_table(df):
+    html = df.to_html(index=False, border=0, classes='_ckpi')
+    st.markdown(
+        "<style>._ckpi{border-collapse:collapse;font-size:13px}"
+        "._ckpi th,._ckpi td{text-align:center;padding:3px 12px;"
+        "border:1px solid #ddd;white-space:nowrap}"
+        "._ckpi th{background:#f0f2f6;font-weight:600}</style>" + html,
+        unsafe_allow_html=True)
+    
 def show_kpi_table(results, fixed_price, tru_cycle, rc, label="", buy_d=None, total_stay=False):
     if buy_d is not None and len(buy_d) > 0:
-        avg_spot_eur  = float(np.mean(buy_d))
-        avg_allin_eur = float(np.mean(to_allin_ct(buy_d, _fixed_net_ct, _vat_rate))) / 100.0
+        avg_spot_eur = float(np.mean(buy_d))
     else:
         ref = results[0]
-        avg_spot_eur  = (ref["charge_cost"] / ref["charge_kwh"]
-                         if ref["charge_kwh"] > 0.01 else 0.10)
-        avg_allin_eur = float(np.mean(
-            to_allin_ct(np.array([avg_spot_eur]), _fixed_net_ct, _vat_rate))) / 100.0
+        avg_spot_eur = (ref["charge_cost"] / ref["charge_kwh"]
+                        if ref["charge_kwh"] > 0.01 else 0.10)
 
-    double_tax_eur = _v2g_double_ct / 100.0
-    exempt_eur     = _v2g_exempt_ct / 100.0
+    unit = "€/stay" if total_stay else "€/d"
+    ref_A = results[0]
 
-    def _build_rows(reg):
-        ref_A         = results[0]
-        F_charge_cost = ref_A["charge_kwh"] * fixed_price
-        unit = "€/stay" if total_stay else "€/d"
-        rows = [{
-            "Scenario"              : "F - Fixed Price",
-            f"Charge ({unit})"      : f"{F_charge_cost:.3f}",
-            f"V2G Rev ({unit})"     : "0.000",
-            f"Net ({unit})"         : f"{F_charge_cost:.3f}"
-        }]
-        for r in results:
-            if r["label"].startswith("A"):
-                charge_cost = r["charge_kwh"] * fixed_price
-            else:
-                if reg == "future":
-                    exempt_buy_eur = (_v2g_exempt_ct / 100.0)
-                    reduced_fixed_ct = _fixed_net_ct - exempt_buy_eur * 100.0
-                    avg_allin_fut_eur = float(np.mean(
-                        to_allin_ct(buy_d, reduced_fixed_ct, _vat_rate))) / 100.0 if buy_d is not None and len(buy_d) > 0 else avg_allin_eur
-                    charge_cost = r["charge_kwh"] * avg_allin_fut_eur
-                else:
-                    charge_cost = r["charge_kwh"] * avg_allin_eur
+    def _charge_cost_allin(r, exempt_ct):
+        """
+        Actual slot-weighted all-in charge cost.
+        r["charge_cost"] = sum(Pc[t] * spot[t] * dt) in EUR — preserves WHEN charging happened.
+        Fixed levies (net fees, taxes) are uniform per kWh so added separately.
+        Result: (spot_cost × VAT_gross) + (kWh × remaining_fixed_levies × VAT_gross)
+        """
+        if r["charge_kwh"] < 1e-9:
+            return 0.0
+        fn = _fixed_net_ct - exempt_ct          # ct/kWh of levies still applied
+        vat_gross = 1.0 + _vat_rate
+        return (r["charge_cost"] * vat_gross
+                + r["charge_kwh"] * fn / 100.0 * vat_gross)
 
-            if reg == "current":
-                v2g_rev = max(0.0,
-                    r["v2g_kwh"] * avg_spot_eur
-                    - r["v2g_kwh"] * double_tax_eur)
-            else:
-                v2g_rev = max(0.0,
-                    r["v2g_kwh"] * avg_spot_eur
-                    + r["v2g_kwh"] * exempt_eur)
-            net = charge_cost - v2g_rev
-            rows.append({
-                "Scenario"          : (r["label"]
-                                    .replace(" (no V2G)","")
-                                    .replace(" Day-Ahead","")
-                                    .replace(" (receding)","")),
-                f"Charge ({unit})"  : f"{charge_cost:.3f}",
-                f"V2G Rev ({unit})" : f"{v2g_rev:.3f}",
-                f"Net ({unit})"     : f"{net:.3f}"
-            })
-        return rows
+    def _build_row(r, exempt_ct, is_fixed=False):
+        if is_fixed:
+            charge  = ref_A["charge_kwh"] * fixed_price
+            v2g_rev = 0.0
+        else:
+            charge  = _charge_cost_allin(r, exempt_ct)
+            v2g_rev = max(0.0, r.get("v2g_rev", r["v2g_kwh"] * avg_spot_eur))
+        return charge, v2g_rev, charge - v2g_rev
 
-    hdr = f"**Charging KPI{' — ' + label if label else ''}**"
-    st.markdown(hdr)
+    # Build scenario list: F first, then A/B/C/D from results
+    scenario_labels = ["F — Fixed Price"] + [
+        r["label"]
+        .replace(" (no V2G)", "")
+        .replace(" Day-Ahead", "")
+        .replace(" (receding)", "")
+        for r in results
+    ]
 
-    col_cur, col_fut = st.columns(2)
+    rows = []
+    for i, sc_label in enumerate(scenario_labels):
+        is_fixed = (i == 0)
+        r = ref_A if is_fixed else results[i - 1]
+        c_cur, v_cur, n_cur = _build_row(r, 0.0,                  is_fixed)
+        c_fa,  v_fa,  n_fa  = _build_row(r, FUTURE_A_EXEMPT_CT,   is_fixed)
+        c_fb,  v_fb,  n_fb  = _build_row(r, FUTURE_B_EXEMPT_CT,   is_fixed)
+        rows.append((sc_label,
+                     c_cur, v_cur, n_cur,
+                     c_fa,  v_fa,  n_fa,
+                     c_fb,  v_fb,  n_fb))
 
-    with col_cur:
-        st.markdown("📋 **Current Regulation (2025)**")
-        st.dataframe(pd.DataFrame(_build_rows("current")),
-                     use_container_width=True, hide_index=True)
+    ch = f"Charge ({unit})"
+    vr = f"V2G Rev ({unit})"
+    nc = f"Net Cost ({unit})"
 
-    with col_fut:
-        st.markdown("🔮 **Future Regulation (MiSpeL)**")
-        st.dataframe(pd.DataFrame(_build_rows("future")),
-                     use_container_width=True, hide_index=True)
+    # ── Build combined HTML table ──────────────────────────────────────────
+    tbody_rows = ""
+    for (sc_label, c_cur, v_cur, n_cur,
+                   c_fa,  v_fa,  n_fa,
+                   c_fb,  v_fb,  n_fb) in rows:
+        tbody_rows += (
+            f"<tr>"
+            f"<td style='text-align:left;font-weight:600;white-space:nowrap'>{sc_label}</td>"
+            f"<td>{c_cur:.3f}</td><td>{v_cur:.3f}</td>"
+            f"<td style='font-weight:600'>{n_cur:.3f}</td>"
+            f"<td>{c_fa:.3f}</td><td>{v_fa:.3f}</td>"
+            f"<td style='font-weight:600'>{n_fa:.3f}</td>"
+            f"<td>{c_fb:.3f}</td><td>{v_fb:.3f}</td>"
+            f"<td style='font-weight:600'>{n_fb:.3f}</td>"
+            f"</tr>"
+        )
 
+    table_html = f"""
+<style>
+.kpi_combined {{
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 12px;
+    margin-top: 6px;
+}}
+.kpi_combined th, .kpi_combined td {{
+    border: 1px solid #d0d0d0;
+    padding: 5px 10px;
+    text-align: center;
+    white-space: nowrap;
+}}
+.kpi_combined thead tr:first-child th {{
+    font-size: 13px;
+    padding: 7px 10px;
+}}
+.kpi_combined th {{ background: #f0f2f6; font-weight: 600; }}
+.kpi_combined tbody tr:hover td {{ background: #eef4ff; }}
+.kpi_combined th.cur {{ background: #e8eaf6; }}
+.kpi_combined th.fa  {{ background: #e3f2fd; }}
+.kpi_combined th.fb  {{ background: #f3e5f5; }}
+</style>
+<table class='kpi_combined'>
+<thead>
+  <tr>
+    <th rowspan='2' style='text-align:left'>Scenario</th>
+    <th colspan='3' class='cur'> Current (2025)<br>
+        <span style='font-weight:400;font-size:11px'>All 6 levies on re-buy</span></th>
+    <th colspan='3' class='fa'> Future A — confirmed<br>
+        <span style='font-weight:400;font-size:11px'>Netzentgelt exempt (−6.63 ct)</span></th>
+    <th colspan='3' class='fb'> Future B — theoretical<br>
+        <span style='font-weight:400;font-size:11px'>All except Konzessionsabgabe exempt (−11.63 ct)</span></th>
+  </tr>
+  <tr>
+    <th class='cur'>{ch}</th><th class='cur'>{vr}</th><th class='cur'>{nc}</th>
+    <th class='fa'>{ch}</th><th class='fa'>{vr}</th><th class='fa'>{nc}</th>
+    <th class='fb'>{ch}</th><th class='fb'>{vr}</th><th class='fb'>{nc}</th>
+  </tr>
+</thead>
+<tbody>
+{tbody_rows}
+</tbody>
+</table>
+"""
+
+    st.markdown(f"**Charging KPI{' — ' + label if label else ''}**")
+    st.markdown(table_html, unsafe_allow_html=True)
+    st.markdown("")  # spacing after table
+
+    # ── TRU / Reefer cost block (unchanged) ──────────────────────────────
     if tru_cycle != "OFF" and rc["E_kWh"] > 0.01:
         st.markdown("**Reefer + Aux + Heating Energy Cost**")
         st.dataframe(pd.DataFrame([
@@ -1624,8 +1673,7 @@ def show_kpi_table(results, fixed_price, tru_cycle, rc, label="", buy_d=None, to
             ["Diesel (L/d)",                              f"{rc['diesel_liters']:.2f} L"],
             ["Grid vs diesel saving (EUR/d)",
              f"EUR {rc['cost_diesel'] - rc['cost_dynamic']:+.3f}"],
-        ], columns=["Metric", "Value"]),
-        use_container_width=True, hide_index=True)
+        ], columns=["Metric", "Value"]))
 
 # =============================================================================
 #  MAIN DISPLAY
@@ -1802,11 +1850,9 @@ if mode != "Specific Date":
     res_w_exists = "res_w" in dir() and res_w is not None
     res_s_exists = "res_s" in dir() and res_s is not None
     if res_w_exists and res_s_exists:
-        col_w, col_s = st.columns(2)
-        with col_w:
-            show_kpi_table(res_w, fixed_price, tru_cycle, rc_w, "Winter Weekday", buy_d=buy_d_w)
-        with col_s:
-            show_kpi_table(res_s, fixed_price, tru_cycle, rc_s, "Summer Weekday", buy_d=buy_d_s)
+        show_kpi_table(res_w, fixed_price, tru_cycle, rc_w, "Winter Weekday", buy_d=buy_d_w)
+        st.markdown("---")
+        show_kpi_table(res_s, fixed_price, tru_cycle, rc_s, "Summer Weekday", buy_d=buy_d_s)
     elif res_w_exists:
         show_kpi_table(res_w, fixed_price, tru_cycle, rc_w, "Winter Weekday", buy_d=buy_d_w)
     elif res_s_exists:

@@ -24,8 +24,8 @@ REEFER_DEFAULTS = {
 
 GERMAN_TARIFF = {
     "ConcessionFee_ct":    1.992,
-    "OffshoreGridLevy_ct": 0.816,
-    "CHPLevy_ct":          0.277,
+    "OffshoreGridLevy_ct": 0.941,
+    "CHPLevy_ct":          0.446,
     "ElectricityTax_ct":   2.05,
     "NEV19Levy_ct":        1.559,
     "NetworkUsageFees_ct": 6.63,
@@ -617,18 +617,24 @@ def run_D_mpc(v2g, buy_w, v2gp_w, E_init, tru_w=None,
         tw_t = tru_w[t:] if tru_w is not None else None
         # tru for tomorrow — zeros if not available
         if buy_tomorrow is not None:
-            tru_tomorrow = np.zeros(24) if tru_w is None else get_tru_1h_trace("Continuous", 24, v2g.dt_h)
+            tru_tomorrow = np.zeros(24) if tru_w is None else np.full(24, float(np.mean(tru_w)))
             tw_t = np.concatenate([tw_t, tru_tomorrow]) if tw_t is not None else None
 
+        # Feasibility guard: relax E_fin if remaining capacity cannot physically reach it
+        p_c_eff_rem = (np.maximum(0.0, v2g.charge_power_kW - np.asarray(tw_t[:len(buy_fc)]))
+                       if tw_t is not None else np.full(len(buy_fc), v2g.charge_power_kW))
+        max_achievable = s + float(np.sum(p_c_eff_rem * v2g.eta_charge * dt))
+        E_fin_feasible = min(v2g.E_fin, max_achievable - 1e-3)
+
         Pcw, Pdw, _ = solve_milp(v2g, buy_fc, v2gp_fc,
-                                  s, v2g.E_fin,
+                                  s, E_fin_feasible,
                                   allow_discharge=True, tru_w=tw_t)
 
         pc = float(np.clip(Pcw[0], 0, v2g.charge_power_kW))
         pd = float(np.clip(Pdw[0], 0, v2g.discharge_power_kW))
 
         if pc > 1e-6 and pd > 1e-6:
-            pc, pd = (0.0, pd) if v2gp_w[t] > buy_w[t] else (pc, 0.0)
+            pc, pd = (0.0, pd) if v2gp_w[t] >= buy_w[t] else (pc, 0.0)
 
         s = float(np.clip(
             s + pc * v2g.eta_charge * dt - pd / v2g.eta_discharge * dt,
@@ -1023,7 +1029,7 @@ def main():
             buy_w = compose_all_in_price(spot_price_w, tariff=GERMAN_TARIFF)
 
             # 3. DISCHARGING PRICE (V2G): Spot price + future export levies
-            v2gp_w = buy_w  
+            v2gp_w = spot_price_w  
 
             # --- RUN DUMB ALGORITHM ---
             Pc_A, Pd_A, soc_A = run_A_dumb(v2g, buy_w, v2gp_w, W, E_init)
