@@ -1,5 +1,5 @@
 import streamlit as st
-import altair as alt
+import altair as alt # For Graphs
 
 from v2g import (
     V2GParams, WINTER_M, SUMMER_M, SC_COL,
